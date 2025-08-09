@@ -87,10 +87,12 @@ class ScanFolderWidget:
         search_exp = re.compile(search_term, re.IGNORECASE)
 
         found = []
-        for file in input_folder.iterdir():
+        # Recursively scan the folder for matching files
+        for file in input_folder.rglob("*"):
             if not file.is_file():
                 continue
-            if file.suffix == ".meta":
+            # Skip metadata sidecar files (case-insensitive)
+            if file.suffix.lower() == ".meta":
                 continue
             match = search_exp.search(str(file.name))
             if not match:
@@ -118,7 +120,7 @@ class ScanFolderWidget:
             value = item.value
             if not value:
                 continue
-            suffix = item.path.suffix
+            suffix = item.path.suffix.lower()
             if suffix in [".usd", ".usda", ".usdc"]:
                 mesh_paths.append(str(item.path))
             elif suffix in _SUPPORTED_TEXTURE_EXTENSIONS:

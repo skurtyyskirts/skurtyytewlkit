@@ -241,7 +241,8 @@ class TextureImporter(_ContextBaseUSD):
         # Make sure the context has a clean, valid stage
         await context.new_stage_async()
 
-        # Create prims for the textures and link the assets in the attributes
+        # Create prims for the textures and link the assets in the attributes.
+        # This will also stamp linkage metadata (base_hash) on the shader prim customData
         await _create_prims_and_link_assets(schema_data.computed_context, imported_files)
 
         # Run the check plugins
