@@ -1,7 +1,8 @@
-How to run (research artifacts)
+How to run (research + Task 2 ingestion)
 
 Prerequisites
-- Windows or Linux with Git.
+- Windows or Linux with Git and Python 3.10+.
+- Pillow for image work: `pip install Pillow`.
 
 Steps
 1) Open `artifacts/research_summary.md` and `artifacts/compatibility_report.md` to review links and decisions.
@@ -10,8 +11,13 @@ Steps
    - `git clone https://github.com/NVIDIA-Omniverse/kit-extension-sample-scatter`
    - Review its `exts/omni.example.ui_scatter_tool` folder and `extension.toml`.
 
-Expected outputs
-- Documents in `artifacts/` summarizing official extensions, licenses, and recommended integration approach.
+Run Task 2 prototype ingestion
+- Example:
+  - `python tools/custom/prototype_ingest.py --ingest-dir assets --out-dir extensions/omniscatter/data/prototypes --apply-to-builds`
+- Expected outputs:
+  - USD prototypes and thumbnails under `extensions/omniscatter/data/prototypes/`.
+  - `prototypes_index.json` written there.
+  - If `_build/release` or `_build/debug` exist, files are replicated into `.../extensions/omniscatter/data/prototypes/` in each build.
 
 Verification checklist
 - Verify these primary links:

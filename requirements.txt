@@ -1,0 +1,3 @@
+Pillow==10.3.0
+pxr==0.24.5; platform_system!="Windows"  # optional, use Omniverse USD in-app on Windows
+
