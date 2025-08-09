@@ -277,6 +277,8 @@ current_dict.update(
             "color": _WHITE_30,
         },
         "Button.Image::teleport": {"image_url": _get_icons("teleport")},
+        "Button.Image::scatter": {"image_url": _get_icons("axis-arrow"), "color": _WHITE_60},
+        "Button.Image::scatter:hovered": {"image_url": _get_icons("axis-arrow"), "color": _WHITE_100},
         "Button.Image::ShowValidation": {
             "image_url": _get_icons("v-box"),
             "color": _WHITE_20,
