@@ -224,6 +224,50 @@ class TestTextureImporterUnit(omni.kit.test.AsyncTestCase):
         await self.__run_create_prims_and_link_assets(TextureTypes.ROUGHNESS)
         await self.__run_create_prims_and_link_assets(TextureTypes.OTHER)
 
+    async def test_create_prims_and_link_assets_stamps_customdata_with_base_hash(self):
+        # Arrange
+        stage_mock = Mock()
+        context_name_mock = "ctx"
+        imported_file_path = OmniUrl("C:/Test/Diffuse.png")
+        imported_files = [(imported_file_path, TextureTypes.DIFFUSE)]
+
+        material_shader_mock = Mock()
+        shader_path_mock = material_shader_mock.GetPath.return_value
+        shader_custom_data = {}
+        material_shader_mock.GetCustomData.return_value = shader_custom_data
+
+        input_prop_path = shader_path_mock.AppendProperty.return_value
+
+        with (
+            patch.object(omni.usd, "get_context") as get_context_mock,
+            patch.object(omni.usd, "get_stage_next_free_path") as get_free_path_mock,
+            patch.object(omni.kit.commands, "execute") as command_mock,
+            patch.object(omni.usd, "get_shader_from_material") as get_shader_mock,
+            patch("omni.flux.asset_importer.widget.texture_import_list.utils._path_utils.read_metadata") as read_metadata_mock,
+        ):
+            get_context_mock.return_value.get_stage.return_value = stage_mock
+            get_free_path_mock.return_value = "/TextureImporter/Looks/Mat"
+            get_shader_mock.return_value = material_shader_mock
+
+            # Metadata present on ingested texture
+            base_hash = "abc123"
+            read_metadata_mock.return_value = base_hash
+
+            # Act
+            await _create_prims_and_link_assets(context_name_mock, imported_files)
+
+        # Assert
+        # Ensure ChangeProperty and CreateMdlMaterialPrim were called
+        self.assertTrue(command_mock.call_count >= 2)
+        # Ensure we stamped the customData with expected key and mapping
+        material_shader_mock.SetCustomData.assert_called_once()
+        data_arg = material_shader_mock.SetCustomData.call_args[0][0]
+        self.assertIn("remix:ingest:texture_inputs_base_hash", data_arg)
+        mapping = data_arg["remix:ingest:texture_inputs_base_hash"]
+        # input attribute path should be used as key
+        self.assertIn(str(input_prop_path), mapping)
+        self.assertEqual(mapping[str(input_prop_path)], base_hash)
+
     async def test_exit_should_return_success(self):
         # Arrange
         schema_data = Mock()

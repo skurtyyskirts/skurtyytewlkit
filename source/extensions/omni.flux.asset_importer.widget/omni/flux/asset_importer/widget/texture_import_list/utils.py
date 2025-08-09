@@ -22,6 +22,8 @@ from omni.flux.asset_importer.core.data_models import TEXTURE_TYPE_INPUT_MAP as 
 from omni.flux.asset_importer.core.data_models import TextureTypes as _TextureTypes
 from omni.flux.asset_importer.core.utils import get_texture_sets as _get_texture_sets
 from omni.flux.utils.common.omni_url import OmniUrl as _OmniUrl
+from omni.flux.utils.common import path_utils as _path_utils
+from omni.flux.validator.factory import BASE_HASH_KEY as _BASE_HASH_KEY
 from pxr import Sdf, Tf
 
 
@@ -73,6 +75,8 @@ async def create_prims_and_link_assets(
         material_prim = stage.GetPrimAtPath(prim_path)
         material_shader_prim = omni.usd.get_shader_from_material(material_prim, get_prim=True)
 
+        # Collect linkage info: map input attribute -> asset base_hash (if available)
+        input_to_hash: dict[str, str] = {}
         for imported_path, imported_type in imported_types:
             input_path = material_shader_prim.GetPath().AppendProperty(_TEXTURE_TYPE_INPUT_MAP.get(imported_type))
 
@@ -108,4 +112,15 @@ async def create_prims_and_link_assets(
                     type_to_create_if_not_exist=Sdf.ValueTypeNames.Int,
                     usd_context_name=context_name,
                 )
+
+            # Record metadata linkages if the ingested texture has base_hash
+            base_hash = _path_utils.read_metadata(str(imported_path), _BASE_HASH_KEY)
+            if base_hash:
+                input_to_hash[str(input_path)] = base_hash
+
+        # Stamp linkage onto shader prim as customData to aid external tools (e.g., scatter brush)
+        if input_to_hash:
+            shader_data = dict(material_shader_prim.GetCustomData())
+            shader_data["remix:ingest:texture_inputs_base_hash"] = input_to_hash
+            material_shader_prim.SetCustomData(shader_data)
     return material_paths
