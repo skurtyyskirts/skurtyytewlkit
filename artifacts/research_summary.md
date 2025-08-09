@@ -29,6 +29,9 @@ Primary findings (authoritative sources)
   - Why it matters: Official surface placement tool demonstrating brush UX; informs our brush radius/density/erase UX and event handling.
   - License: Documentation only (implementation not open-sourced).
 
+Screenshots
+- See Paint Tool and Scatter Tool pages for UI screenshots (not embedded here to respect doc licensing).
+
 - Title: Scatter Examples (Omniverse Replicator)
   - URL: https://docs.omniverse.nvidia.com/extensions/latest/ext_replicator/advanced_scattering.html
   - Excerpt: “Scatter objects on surfaces with collision avoidance… multi-surface scattering, density controls.”
