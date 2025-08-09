@@ -277,6 +277,7 @@ current_dict.update(
             "color": _WHITE_30,
         },
         "Button.Image::teleport": {"image_url": _get_icons("teleport")},
+        "Button.Image::scatter_brush": {"image_url": _get_icons("brush"), "color": _WHITE_60},
         "Button.Image::ShowValidation": {
             "image_url": _get_icons("v-box"),
             "color": _WHITE_20,
@@ -942,7 +943,7 @@ current_dict.update(
         "Rectangle::MenuBurgerFloatingBackground": {"background_color": 0x0},
         "Rectangle::MenuBurgerBackground:hovered": {"background_color": _BLUE_HOVERED},
         "Rectangle::MenuBurgerBackground:selected": {"background_color": _BLUE_SELECTED},
-        "ScrollingFrame::PropertiesPaneSection": {"background_color": 0x0, "secondary_color": 0x12FFFFFF},
+        "ScrollingFrame::PropertiesPaneSection": {"background_color": 0x0, "secondary_color": _WHITE_10},
         "ScrollingFrame::TreePanelBackground": {"background_color": 0x0},
         "ScrollingFrame::WelcomePad": {"background_color": 0x0, "secondary_color": _WHITE_10},
         "ScrollingFrame::WelcomePadItem": {"background_color": 0x0, "secondary_color": _WHITE_10},
@@ -1025,6 +1026,7 @@ current_dict.update(
             "font_size": 16,
             "font": ui.url.nvidia_md,
         },
+        "Button.Image::ScatterBrush": {"image_url": _get_icons("scatter_brush")},
     }
 )
 style.default = current_dict
