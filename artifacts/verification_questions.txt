@@ -1,0 +1,7 @@
+Please confirm or provide:
+1) The RTX-Remix (app) version/build you want to target (exact Kit/Remix version string).
+2) The default ingestion output directory path(s) to scan for prototypes.
+3) Whether MDL-only materials are required for prototypes in your Remix build (vs allowing UsdPreviewSurface).
+4) Preferred license headers/NOTICE text for new extension files (company/project attribution).
+5) GPU used for baseline performance measurement (e.g., RTX 4090).
+

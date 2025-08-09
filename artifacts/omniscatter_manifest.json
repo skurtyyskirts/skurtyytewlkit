@@ -1,0 +1,9 @@
+{
+  "name": "omniscatter",
+  "version": "0.1.0-research",
+  "author": "RTX-Remix Omniscatter Agent",
+  "tested_gpu": "RTX 4090 (target)",
+  "required_kit_version": ">=105.0",
+  "notes": "Research artifacts only; implementation to follow in subsequent tasks."
+}
+
