@@ -316,8 +316,21 @@ class FileTexturePicker(_FilePicker):
     def _open_explorer(self, button, file_path):
         if button != 0:
             return
+        # Open containing folder in a cross-platform way
+        import sys
+        import subprocess
+
         path = Path(file_path)
-        os.startfile(path.parent if path.is_file() else path)
+        target = path.parent if path.is_file() else path
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.run(["explorer", str(target)], check=False)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(target)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(target)], check=False)
+        except Exception:  # noqa
+            carb.log_warn(f"Unable to open explorer for: {target}")
 
     def _on_navigate_to(
         self, path, value_model: "_UsdAttributeValueModel", element_current_idx: int

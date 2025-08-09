@@ -38,8 +38,12 @@ from .tools.layer import ViewportToolsLayer
 from .tools.teleport import create_button_instance as _create_teleporter_toolbar_button_group
 from .tools.teleport import delete_button_instance as _delete_teleporter_toolbar_button_group
 from .tools.teleport import teleporter_factory as _teleporter_factory
-from .tools.scatter_brush import create_button_instance as _create_scatter_toolbar_button_group
-from .tools.scatter_brush import delete_button_instance as _delete_scatter_toolbar_button_group
+from .tools.scatter_brush import (
+    create_button_instance as _create_scatter_toolbar_button_group,
+)
+from .tools.scatter_brush import (
+    delete_button_instance as _delete_scatter_toolbar_button_group,
+)
 from .tools.scatter_brush import scatter_brush_factory as _scatter_brush_factory
 
 if TYPE_CHECKING:
@@ -106,7 +110,7 @@ class TrexViewportSharedExtension(omni.ext.IExt):
         self.__registered.append(RegisterScene(_manipulator_camera_default, "omni.kit.viewport.manipulator.Camera"))
         self.__registered.append(RegisterScene(_prim_transform_manipulator, "omni.kit.lss.viewport.manipulator.prim"))
         self.__registered.append(RegisterScene(_teleporter_factory, "omni.kit.lss.viewport.tools.teleport"))
-        self.__registered.append(RegisterScene(_scatter_brush_factory, "omni.kit.lss.viewport.tools.scatter"))
+        self.__registered.append(RegisterScene(_scatter_brush_factory, "omni.kit.lss.viewport.tools.scatter_brush"))
 
         # self.__registered.append(
         #     RegisterScene(_grid_default_factory, "omni.kit.viewport.scene.SimpleGrid")
@@ -133,19 +137,21 @@ class TrexViewportSharedExtension(omni.ext.IExt):
         self.__teleport_button_group = _create_teleporter_toolbar_button_group()
         toolbar.add_widget(self.__teleport_button_group, 12)
         self.__scatter_button_group = _create_scatter_toolbar_button_group()
-        toolbar.add_widget(self.__scatter_button_group, 13)
+        toolbar.add_widget(self.__scatter_button_group, 12)
 
     def __remove_tools(self):
-        if self.__teleport_button_group:
+        if self.__teleport_button_group or self.__scatter_button_group:
             toolbar = _get_toolbar_instance()
+        if self.__teleport_button_group:
             toolbar.remove_widget(self.__teleport_button_group)
             self.__teleport_button_group.clean()
             _delete_teleporter_toolbar_button_group()
+            self.__teleport_button_group = None
         if self.__scatter_button_group:
-            toolbar = _get_toolbar_instance()
             toolbar.remove_widget(self.__scatter_button_group)
             self.__scatter_button_group.clean()
             _delete_scatter_toolbar_button_group()
+            self.__scatter_button_group = None
 
     def __unregister_scenes(self, registered):
         for item in registered:
