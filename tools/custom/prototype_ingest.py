@@ -35,7 +35,6 @@ import dataclasses
 import json
 import os
 import re
-import sys
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -129,7 +128,6 @@ def _write_plane_usdpreview(out_usd: Path, basecolor_tex: Optional[Path], normal
     if HAVE_USD:
         stage = Usd.Stage.CreateNew(str(out_usd))
         stage.SetDefaultPrim(UsdGeom.Xform.Define(stage, "/World").GetPrim())
-        world = UsdGeom.Xform.Get(stage, "/World")
         mesh = UsdGeom.Mesh.Define(stage, "/World/proto")
         points = [
             Gf.Vec3f(-0.5, 0.0, -0.5),
