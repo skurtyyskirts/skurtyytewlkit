@@ -42,6 +42,8 @@ from lightspeed.trex.hotkeys import TrexHotkeyEvent
 from lightspeed.trex.hotkeys import get_global_hotkey_manager as _get_global_hotkey_manager
 from pxr import Gf, Sdf, Usd, UsdGeom
 from omni.kit.widget.toolbar.widget_group import WidgetGroup
+from lightspeed.layer_manager.core import LayerManagerCore as _LayerManagerCore
+from lightspeed.layer_manager.core import LayerType as _LayerType
 
 try:
     # Optional utility that enforces authoring in mod/replacement layer and creates anchors per mesh
@@ -339,6 +341,13 @@ class ScatterBrush:
         # Ensure asset is ingested (or part of capture, which is always allowed)
         if not _is_asset_ingested(asset_path):
             return
+        # Ensure we are authoring on the replacement (mod) layer to avoid capture edits
+        try:
+            _LayerManagerCore(self._viewport_api.usd_context_name).set_edit_target_layer(
+                _LayerType.replacement, do_undo=False
+            )
+        except Exception:
+            pass
         # Author as PointInstancer under a per-anchor parent; anchor is the mesh hash scope if available
         # Try to anchor under the picked mesh root; fall back to global parent scope
         mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
