@@ -100,6 +100,28 @@ class Setup:
         self._context = omni.usd.get_context(context_name)
         self._layer_manager = _LayerManagerCore(context_name=context_name)
 
+    def _ensure_mod_edit_target(self) -> Sdf.Layer:
+        """Ensure the replacement (mod) layer is the current edit target and return it."""
+        replacement_layer = self._layer_manager.get_layer(_LayerType.replacement)
+        if replacement_layer is None:
+            raise ValueError("No Replacement layer found. Import or create a mod layer before authoring.")
+        self._layer_manager.set_edit_target_layer(_LayerType.replacement, do_undo=False)
+        return replacement_layer
+
+    def _apply_remix_categories(self, prim_paths: list[str], categories: list[str] | None):
+        """Optionally apply Remix category attributes to the given prim paths on the mod layer."""
+        if not categories:
+            return
+        valid_prefix = "remix_category:"
+        # Make sure we're authoring on the replacement layer
+        try:
+            self._ensure_mod_edit_target()
+        except Exception:
+            pass
+        for category in categories:
+            if isinstance(category, str) and category.startswith(valid_prefix):
+                self.add_attribute(prim_paths, category, True, False, Sdf.ValueTypeNames.Bool)
+
     # DATA MODEL FUNCTIONS
 
     def select_prim_paths_with_data_model(self, body: SetSelectionPathParamModel):
@@ -157,6 +179,8 @@ class Setup:
     ) -> ReferenceResponseModel:
         with omni.kit.undo.group():
             stage = self._context.get_stage()
+            # Always author on the replacement (mod) layer
+            self._ensure_mod_edit_target()
             edit_target_layer = stage.GetEditTarget().GetLayer()
 
             introducing_prim, references = AssetReplacementsValidators.get_prim_references(
@@ -190,6 +214,18 @@ class Setup:
                 create_if_remix_ref=False,
             )
 
+            # Optionally apply Remix categories
+            try:
+                self._apply_remix_categories([str(child_prim_path)], getattr(body, "remix_categories", None))
+            except Exception:
+                pass
+
+        # Persist changes for save/reload cycles
+        try:
+            self._layer_manager.save_layer(_LayerType.replacement)
+        except Exception:
+            pass
+
         return ReferenceResponseModel(
             reference_paths=[(str(child_prim_path), (str(reference.assetPath), edit_target_layer.identifier))]
         )
@@ -199,6 +235,8 @@ class Setup:
     ) -> ReferenceResponseModel:
         with omni.kit.undo.group():
             stage = self._context.get_stage()
+            # Always author on the replacement (mod) layer
+            self._ensure_mod_edit_target()
             edit_target_layer = stage.GetEditTarget().GetLayer()
             introducing_prim, _ = AssetReplacementsValidators.get_prim_references(params.prim_path, self._context_name)
 
@@ -209,6 +247,18 @@ class Setup:
                 self.get_ref_default_prim_tag(),
                 edit_target_layer,
             )
+
+            # Optionally apply Remix categories
+            try:
+                self._apply_remix_categories([str(child_prim_path)], getattr(body, "remix_categories", None))
+            except Exception:
+                pass
+
+        # Persist changes for save/reload cycles
+        try:
+            self._layer_manager.save_layer(_LayerType.replacement)
+        except Exception:
+            pass
 
         return ReferenceResponseModel(
             reference_paths=[(str(child_prim_path), (str(reference.assetPath), edit_target_layer.identifier))]
@@ -665,6 +715,13 @@ class Setup:
 
         detail_message = ""
 
+        # Ensure all authoring below happens on the replacement (mod) layer
+        try:
+            self._ensure_mod_edit_target()
+            layer = stage.GetEditTarget().GetLayer()
+        except Exception:
+            pass
+
         # it can happen that we added the same reference multiple time. But USD can't do that.
         # As a workaround, we had to create a xform child and add the reference to it.
         prim = stage.GetPrimAtPath(prim_path)
@@ -795,6 +852,11 @@ class Setup:
         intro_layer: Sdf.Layer,
         remove_if_remix_ref: bool = True,
     ):
+        # Ensure we remove on the replacement (mod) layer
+        try:
+            self._ensure_mod_edit_target()
+        except Exception:
+            pass
         edit_target_layer = stage.GetEditTarget().GetLayer()
         # When removing a reference on a different layer, the deleted assetPath should be relative to edit target layer,
         # not introducing layer
@@ -853,6 +915,12 @@ class Setup:
         for path in paths:
             prim = stage.GetPrimAtPath(path)
             parent_prims.append(prim.GetParent())
+
+        # Ensure deletion and cleanup occur on the replacement (mod) layer
+        try:
+            self._ensure_mod_edit_target()
+        except Exception:
+            pass
 
         with omni.kit.undo.group():
             omni.kit.commands.execute(
@@ -913,6 +981,11 @@ class Setup:
         new_ref_prim_path = Sdf.Path() if new_ref_prim_path == _DEFAULT_PRIM_TAG else Sdf.Path(new_ref_prim_path)
         new_ref = Sdf.Reference(assetPath=new_ref_asset_path.replace("\\", "/"), primPath=new_ref_prim_path)
 
+        # Ensure we replace on the replacement (mod) layer
+        try:
+            self._ensure_mod_edit_target()
+        except Exception:
+            pass
         edit_target_layer = stage.GetEditTarget().GetLayer()
         # When replacing a reference on a different layer, the replaced assetPath should be relative to
         # edit target layer, not introducing layer
@@ -993,6 +1066,11 @@ class Setup:
 
     def add_attribute(self, paths: list[str], attribute_name: str, value=None, prev_val=None, val_type=None):
         stage = self._context.get_stage()
+        # Ensure attributes are authored on the replacement layer
+        try:
+            self._ensure_mod_edit_target()
+        except Exception:
+            pass
         for path in paths:
             attr_path = Sdf.Path(path).AppendProperty(attribute_name)
             prop = stage.GetPropertyAtPath(attr_path)

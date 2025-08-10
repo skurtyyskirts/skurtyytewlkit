@@ -211,6 +211,12 @@ class AppendReferenceRequestModel(BaseServiceModel):
     force: bool = Field(
         default=False, description="Whether to force use the reference or validate the ingestion status"
     )
+    remix_categories: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional list of Remix category attribute names (e.g. 'remix_category:world_ui') to set on created prims."
+        ),
+    )
 
     @model_validator(mode="after")
     @classmethod
