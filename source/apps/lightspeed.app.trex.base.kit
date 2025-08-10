@@ -16,29 +16,30 @@ This base experience regroup all extensions shared between all NVIDIA RTX Remix 
 # The Main UI App
 "omni.kit.uiapp" = {}
 "lightspeed.dependencies" = { order = -15000}  # Try to load the splash screen
-
+ 
 # PIP Archives
 "lightspeed.pip_archive" = { order = -10003 }  # Load before `omni.flux` pip_archives to ensure we override the pip deps
 "omni.flux.internal_pip_archive" = { order = -10002 }  # Load before `lightspeed.hydra.remix.core` to ensure we override the pip deps
 "omni.flux.pip_archive" = { order = -10001 }  # Load after `omni.flux.internal_pip_archive` to avoid trumping numpy version for ai tools
-
+ 
 # Trex shared extensions
 "lightspeed.hydra.remix.core" = { order = -10000 }
 "lightspeed.trex.contexts" = {} # contexts used for each Flux App
 "lightspeed.trex.app.resources" = {order = -1000}  # should start first because of "default_resources_ext"
 "lightspeed.trex.app.setup" = { order = 1000 } # layout setup, we are running that at the end
 "lightspeed.trex.app.style" = { order = -100 }  # global style
-
+"lightspeed.trex.packaging_rollout.window" = {}  # Packaging & Rollout UI
+ 
 # Windows
 "omni.kit.window.title" = {}
 # Windows only extensions. For all of them set exact=true to not be included into generated version lock.
 # That will break linux otherwise, as version lock is platform agnostic currently.
 [dependencies."filter:platform"."windows-x86_64"]
 "omni.kit.window.modifier.titlebar" = { version = "105.2.16", exact = true }
-
+ 
 # Allow MDL paths to resolve
 "omni.kit.material.library" = {}
-
+ 
 # Micro-Services
 "lightspeed.trex.service.core" = {}
 "lightspeed.trex.mcp.core" = {}
