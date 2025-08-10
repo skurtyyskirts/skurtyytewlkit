@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass
 import contextlib
 from typing import TYPE_CHECKING, Callable, Optional
+import random
+import math
 
 import carb
 import omni.kit.commands
@@ -42,6 +44,7 @@ from pxr import Gf, Sdf, Usd, UsdGeom
 from omni.kit.widget.toolbar.widget_group import WidgetGroup
 
 from .teleport import PointMousePicker  # reuse picker and screen->NDC mapping
+from .point_instancer_authoring import InstanceSpec, ensure_point_instancer, append_instances
 
 if TYPE_CHECKING:
     from omni.kit.widget.viewport.api import ViewportAPI
@@ -53,6 +56,17 @@ class BrushSettings:
     min_interval_ms: int = 120  # place at most every N ms when dragging
     group_parent_name: str = "ScatterBrush"
     create_type: str = "Xform"  # default prim type when scattering
+    # New settings relevant to instancing
+    asset_set_key: str = "Default"
+    prototype_paths: list[str] | None = None  # list of prototype root prim paths
+    author_orientations: bool = True
+    author_scales: bool = True
+    # Randomization controls
+    seed: int = 12345
+    yaw_min_degrees: float = 0.0
+    yaw_max_degrees: float = 360.0
+    scale_min: Gf.Vec3f = Gf.Vec3f(1.0, 1.0, 1.0)
+    scale_max: Gf.Vec3f = Gf.Vec3f(1.0, 1.0, 1.0)
 
 
 _scatter_button_group: ScatterBrushButtonGroup | None = None
@@ -156,6 +170,10 @@ class ScatterBrush:
         self._picker = PointMousePicker(self._viewport_api, self.__viewport_frame, self._on_pick)
         self._last_place_time_ms: int = 0
         self._pending_pick: bool = False
+        self._erase_mode: bool = False
+
+        # Random generator for deterministic strokes
+        self._rng = random.Random(self._settings.seed)
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -192,6 +210,12 @@ class ScatterBrush:
     def set_active(self, value: bool):
         self._active = bool(value)
 
+    def set_erase_mode(self, value: bool):
+        self._erase_mode = bool(value)
+
+    def toggle_mode(self):
+        self._erase_mode = not self._erase_mode
+
     async def _run_loop(self):
         # periodic sampler; when active and LMB is pressed, request a pick under mouse
         input_interface = carb.input.acquire_input_interface()
@@ -227,9 +251,13 @@ class ScatterBrush:
             return
         self._last_place_time_ms = now_ms
         try:
-            self._place_at_world_position(Gf.Vec3d(position[0], position[1], position[2]))
+            world = Gf.Vec3d(position[0], position[1], position[2])
+            if self._erase_mode:
+                self._erase_at_world_position(world)
+            else:
+                self._place_at_world_position(world)
         except Exception:  # noqa
-            carb.log_warn("Scatter brush placement failed")
+            carb.log_warn("Scatter brush action failed")
 
     def _ensure_group_parent(self, stage: Usd.Stage) -> Usd.Prim:
         # try default prim, else /World
@@ -259,28 +287,62 @@ class ScatterBrush:
         stage = self._viewport_api.stage
         with omni.kit.undo.group():
             parent_prim = self._ensure_group_parent(stage)
-            parent_to_world = (
-                UsdGeom.Xformable(parent_prim).ComputeParentToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+            # Ensure a PointInstancer for the current asset set under the parent
+            pi_prim = ensure_point_instancer(
+                parent_prim,
+                self._settings.asset_set_key,
+                self._settings.prototype_paths,
             )
-            local_translation = parent_to_world.Transform(world_pos)
 
-            # Create child prim under parent and set local translation
-            child_path = omni.usd.get_stage_next_free_path(
-                stage, str(parent_prim.GetPath().AppendPath("item")), False
+            # Transform world position into instancer local space
+            instancer_inv_local_to_world = (
+                UsdGeom.Xformable(pi_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
             )
-            omni.kit.commands.execute(
-                "CreatePrimCommand",
-                prim_path=child_path,
-                prim_type=self._settings.create_type,
-                select_new_prim=False,
-                context_name=self._viewport_api.usd_context_name,
+            local_translation = instancer_inv_local_to_world.Transform(world_pos)
+
+            # Compute per-instance orientation and scale
+            orientation = None
+            scale = None
+            if self._settings.author_orientations:
+                # Random yaw around world up (Y axis)
+                yaw_deg = self._rng.uniform(self._settings.yaw_min_degrees, self._settings.yaw_max_degrees)
+                half_rad = (yaw_deg * 3.141592653589793 / 180.0) * 0.5
+                s, c = (math.sin(half_rad), math.cos(half_rad))
+                # Quath(w, (x,y,z)) where (x,y,z) is axis*sin(theta/2); yaw around Y axis
+                orientation = Gf.Quath(float(c), Gf.Vec3h(0.0, float(s), 0.0))
+            if self._settings.author_scales:
+                sx = self._rng.uniform(self._settings.scale_min[0], self._settings.scale_max[0])
+                sy = self._rng.uniform(self._settings.scale_min[1], self._settings.scale_max[1])
+                sz = self._rng.uniform(self._settings.scale_min[2], self._settings.scale_max[2])
+                scale = Gf.Vec3f(float(sx), float(sy), float(sz))
+
+            # Choose prototype index 0 by default (caller can set prototype_paths)
+            instance = InstanceSpec(
+                position=Gf.Vec3f(local_translation[0], local_translation[1], local_translation[2]),
+                orientation=orientation,
+                scale=scale,
+                prototype_path=(Sdf.Path(self._settings.prototype_paths[0]) if self._settings.prototype_paths else None),
             )
-            omni.kit.commands.execute(
-                "TransformPrimSRT",
-                path=child_path,
-                new_translation=Gf.Vec3d(*local_translation),
-                usd_context_name=self._viewport_api.usd_context_name,
+
+            append_instances(pi_prim, [instance])
+
+    def _erase_at_world_position(self, world_pos: Gf.Vec3d):
+        # Find the current PI for this asset set under our parent and remove within radius
+        stage = self._viewport_api.stage
+        parent_prim = self._ensure_group_parent(stage)
+        pi_path = Sdf.Path(str(parent_prim.GetPath())).AppendPath(f"PI_{self._settings.asset_set_key}")
+        pi_prim = stage.GetPrimAtPath(pi_path)
+        if not pi_prim.IsValid() or not pi_prim.IsA(UsdGeom.PointInstancer):
+            return
+        from .point_instancer_authoring import remove_instances_in_radius
+
+        with omni.kit.undo.group():
+            # Transform world position into instancer local space
+            instancer_inv_local_to_world = (
+                UsdGeom.Xformable(pi_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).GetInverse()
             )
+            local = instancer_inv_local_to_world.Transform(world_pos)
+            remove_instances_in_radius(pi_prim, Gf.Vec3f(local[0], local[1], local[2]), self._settings.radius or 0.5)
 
 
 def scatter_brush_factory(desc: dict[str, object]):
