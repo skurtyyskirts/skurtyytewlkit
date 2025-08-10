@@ -10,8 +10,6 @@ keywords = ["remix", "scatter", "brush", "tools"]
 
 [dependencies]
 "omni.ui" = {}
-"carb" = {}
-"carb.settings" = {}
 "omni.kit.hotkeys.core" = {}
 "omni.flux.utils.common" = {}
 "omni.flux.utils.widget" = {}
@@ -25,18 +23,19 @@ name = "lightspeed.trex.tools.scatter_brush"
 
 [settings]
 # Persisted defaults for scatter brush UI
-exts."lightspeed.trex.tools.scatter_brush".enabled = false
-exts."lightspeed.trex.tools.scatter_brush".asset_usd_path = ""
-exts."lightspeed.trex.tools.scatter_brush".brush_radius = 0.25
-exts."lightspeed.trex.tools.scatter_brush".spacing = 0.5
-exts."lightspeed.trex.tools.scatter_brush".density = 8.0
-exts."lightspeed.trex.tools.scatter_brush".random_scale_min = 0.9
-exts."lightspeed.trex.tools.scatter_brush".random_scale_max = 1.1
-exts."lightspeed.trex.tools.scatter_brush".random_yaw = true
-exts."lightspeed.trex.tools.scatter_brush".align_to_normals = true
-exts."lightspeed.trex.tools.scatter_brush".max_surface_angle_deg = 45.0
-exts."lightspeed.trex.tools.scatter_brush".seed = 1337
-exts."lightspeed.trex.tools.scatter_brush".erase_mode = false
-exts."lightspeed.trex.tools.scatter_brush".category = ""
+[settings.exts."lightspeed.trex.tools.scatter_brush"]
+enabled = false
+asset_usd_path = ""
+brush_radius = 0.25
+spacing = 0.5
+density = 8.0
+random_scale_min = 0.9
+random_scale_max = 1.1
+random_yaw = true
+align_to_normals = true
+max_surface_angle_deg = 45.0
+seed = 1337
+erase_mode = false
+category = ""
 # Optional index path for pre-ingested prototypes
-exts."lightspeed.trex.tools.scatter_brush".prototypes_index = ""
+prototypes_index = ""

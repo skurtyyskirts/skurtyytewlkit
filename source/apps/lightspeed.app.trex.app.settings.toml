@@ -27,7 +27,14 @@ legacy_mode = false
 compatibility_mode=false
 
 [app.exts]
-folders.'++' = ["${app}/../exts", "${app}/../extscache", "${app}/../apps"]
+folders.'++' = [
+    "${app}/../exts",
+    "${app}/../extscache",
+    "${app}/../apps",
+    # Also search local source during development, so local extensions resolve when running from _build
+    "${app}/../../../../source/extensions",
+    "${app}/../../../../source/apps",
+]
 
 [app.viewport]
 grid.trackCamera = true
