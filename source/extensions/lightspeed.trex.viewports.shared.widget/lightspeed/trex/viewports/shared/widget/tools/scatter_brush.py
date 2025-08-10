@@ -34,6 +34,8 @@ import carb
 import omni.kit.commands
 import omni.kit.undo
 import omni.ui as ui
+from omni.ui import scene as sc
+import omni.ui.color as cl
 import omni.usd
 from lightspeed.trex.app.style import style
 from lightspeed.trex.hotkeys import TrexHotkeyEvent
@@ -42,6 +44,10 @@ from pxr import Gf, Sdf, Usd, UsdGeom
 from omni.kit.widget.toolbar.widget_group import WidgetGroup
 
 from .teleport import PointMousePicker  # reuse picker and screen->NDC mapping
+from .stroke_engine import BrushStrokeSettings as _BrushStrokeSettings
+from .stroke_engine import HitSample as _HitSample
+from .stroke_engine import StrokeEngine as _StrokeEngine
+from .stroke_engine import StrokePointerEvent as _StrokePointerEvent
 
 if TYPE_CHECKING:
     from omni.kit.widget.viewport.api import ViewportAPI
@@ -149,13 +155,16 @@ class ScatterBrush:
         self._viewport_api = viewport_api
         self._settings = BrushSettings()
 
-        # overlay frame (same pattern as Teleporter) for coordinate conversions if needed later
+        # overlay frame (same pattern as Teleporter) for coordinate conversions and overlay drawing
         self.__viewport_frame = ui.Frame()
 
         self._active: bool = False
-        self._picker = PointMousePicker(self._viewport_api, self.__viewport_frame, self._on_pick)
-        self._last_place_time_ms: int = 0
-        self._pending_pick: bool = False
+        # Stroke engine converts pointer into samples
+        self._stroke_engine = _StrokeEngine(self._viewport_api, self.__viewport_frame, on_sample=self._on_sample)
+        # Debug: keep a short history of samples for drawing
+        self._recent_samples: list[_HitSample] = []
+        # Scene overlay root for debug drawing
+        self._overlay_root = sc.Transform()
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -168,13 +177,17 @@ class ScatterBrush:
             TrexHotkeyEvent.F, lambda: None
         )
 
-        # Background loop to sample mouse while active
+        # Background loop to read mouse and feed stroke engine
         self._task: Optional[asyncio.Task] = asyncio.ensure_future(self._run_loop())
 
     def destroy(self):
         with contextlib.suppress(Exception):
             if self._task:
                 self._task.cancel()
+        self._recent_samples.clear()
+        if self._overlay_root:
+            self._overlay_root.clear()
+            self._overlay_root = None
 
     # Required for compatibility with scene layer
     @property
@@ -193,43 +206,59 @@ class ScatterBrush:
         self._active = bool(value)
 
     async def _run_loop(self):
-        # periodic sampler; when active and LMB is pressed, request a pick under mouse
+        # periodic reader; translates mouse state to pointer events for stroke engine
         input_interface = carb.input.acquire_input_interface()
         import omni.appwindow as _appwindow
 
         app_window = _appwindow.get_default_app_window()
         mouse = app_window.get_mouse()
+        was_down = False
         while True:
             await asyncio.sleep(0.03)
             if not self._active:
                 continue
-            # Only act if left mouse button is pressed
-            if input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) <= 0:
-                continue
-            # Avoid overlapping pick requests
-            if self._pending_pick:
-                continue
-            self._pending_pick = True
-            try:
-                # Pick at current mouse position
-                self._picker.pick()
-            finally:
-                # _on_pick will run async context via callback; small delay allows callback to schedule
-                await asyncio.sleep(0)
-                self._pending_pick = False
+            # Mouse state
+            lmb = input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) > 0
+            pos_x, pos_y = input_interface.get_mouse_coords_pixel(mouse)
+            dpi_scale = ui.Workspace.get_dpi_scale()
+            sx, sy = pos_x / dpi_scale, pos_y / dpi_scale
+            now_ms = int(time.time() * 1000)
+            if lmb and not was_down:
+                self._stroke_engine.on_pointer_event(_StrokePointerEvent("down", sx, sy, int(carb.input.MouseInput.LEFT_BUTTON), now_ms))
+            elif lmb and was_down:
+                self._stroke_engine.on_pointer_event(_StrokePointerEvent("move", sx, sy, int(carb.input.MouseInput.LEFT_BUTTON), now_ms))
+            elif (not lmb) and was_down:
+                self._stroke_engine.on_pointer_event(_StrokePointerEvent("up", sx, sy, int(carb.input.MouseInput.LEFT_BUTTON), now_ms))
+            was_down = lmb
 
-    def _on_pick(self, _path: str, position: carb.Double3 | None, _pixels: carb.Uint2):
-        # place object if rate-limited and valid position
-        if position is None:
+    def _on_sample(self, sample: _HitSample):
+        # Debug: capture for overlay; perform placement on valid hits
+        self._recent_samples.append(sample)
+        if len(self._recent_samples) > 64:
+            self._recent_samples = self._recent_samples[-64:]
+        self._refresh_overlay()
+        if sample.world_position is None:
             return
-        now_ms = int(time.time() * 1000)
-        if now_ms - self._last_place_time_ms < self._settings.min_interval_ms:
-            return
-        self._last_place_time_ms = now_ms
         try:
-            self._place_at_world_position(Gf.Vec3d(position[0], position[1], position[2]))
-        except Exception:  # noqa
+            self._place_at_world_position(sample.world_position)
+        except Exception:
             carb.log_warn("Scatter brush placement failed")
+
+    def _refresh_overlay(self):
+        if not self._overlay_root:
+            return
+        # Rebuild simple crosses at recent sample positions
+        self._overlay_root.clear()
+        size = 0.15
+        with self._overlay_root:
+            for s in self._recent_samples[-32:]:
+                if not s.world_position:
+                    continue
+                p = s.world_position
+                x, y, z = float(p[0]), float(p[1]), float(p[2])
+                sc.Line((x - size, y, z), (x + size, y, z), color=cl.yellow, thickness=2.0)
+                sc.Line((x, y - size, z), (x, y + size, z), color=cl.yellow, thickness=2.0)
+                sc.Line((x, y, z - size), (x, y, z + size), color=cl.yellow, thickness=2.0)
 
     def _ensure_group_parent(self, stage: Usd.Stage) -> Usd.Prim:
         # try default prim, else /World
