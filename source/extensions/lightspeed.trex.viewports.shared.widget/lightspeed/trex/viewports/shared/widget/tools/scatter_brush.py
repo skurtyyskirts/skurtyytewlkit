@@ -52,21 +52,22 @@ if TYPE_CHECKING:
 @dataclass
 class BrushSettings:
     # UI-exposed settings (read from carb.settings on demand)
-    radius: float = 0.25
+    brush_radius: float = 0.25
     spacing: float = 0.25
     density: float = 1.0
-    random_yaw_min_deg: float = -15.0
-    random_yaw_max_deg: float = 15.0
-    uniform_scale_min: float = 1.0
-    uniform_scale_max: float = 1.0
-    align_to_normal: bool = False  # HdRemix query doesn't return normals; keep optional
-    offset_along_normal: float = 0.0
+    random_yaw: bool = True
+    random_scale_min: float = 1.0
+    random_scale_max: float = 1.0
+    align_to_normals: bool = False  # TODO: Composer aligns to surface normals; HdRemix query lacks normals. Compute normals via scene query.
+    max_surface_angle_deg: float = 45.0
+    seed: int = 1337
+    erase_mode: bool = False
+    # Current asset to scatter (absolute or project-relative USD path)
+    asset_usd_path: str | None = None
 
     # Core behavior
     min_interval_ms: int = 120  # place at most every N ms when dragging
     group_parent_name: str = "ScatterAnchors"
-    # Current asset to scatter (absolute or project-relative USD path)
-    asset_path: str | None = None
 
 
 _scatter_button_group: ScatterBrushButtonGroup | None = None
@@ -172,9 +173,9 @@ class ScatterBrush:
         self._viewport_api = viewport_api
         self._settings = BrushSettings()
         # Settings bridge: allow another extension to set current asset and parameters in carb.settings
-        # These keys are intentionally simple; UI agent will write to them.
+        # These keys mirror the UI extension model in lightspeed.trex.tools.scatter_brush
         self._settings_iface = carb.settings.get_settings()
-        self._settings_prefix = "/exts/lightspeed.trex.scatter_brush"
+        self._settings_prefix = 'exts."lightspeed.trex.tools.scatter_brush"'
 
         # overlay frame (same pattern as Teleporter) for coordinate conversions if needed later
         self.__viewport_frame = ui.Frame()
@@ -183,6 +184,8 @@ class ScatterBrush:
         self._picker = PointMousePicker(self._viewport_api, self.__viewport_frame, self._on_pick)
         self._last_place_time_ms: int = 0
         self._pending_pick: bool = False
+        self._left_mouse_was_down: bool = False
+        self._random = __import__("random").Random(self._settings.seed)
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -230,8 +233,17 @@ class ScatterBrush:
             await asyncio.sleep(0.03)
             if not self._active:
                 continue
-            # Only act if left mouse button is pressed
-            if input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) <= 0:
+            is_down = input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) > 0
+            if is_down and not self._left_mouse_was_down:
+                # Begin stroke: seed RNG for deterministic stroke
+                try:
+                    seed = int(self._settings_iface.get(f"{self._settings_prefix}.seed") or self._settings.seed)
+                except Exception:
+                    seed = self._settings.seed
+                # TODO: Composer seeds per-stroke deterministically. We add time entropy to avoid identical strokes.
+                self._random.seed(seed ^ int(time.time() * 1000))
+            self._left_mouse_was_down = is_down
+            if not is_down:
                 continue
             # Avoid overlapping pick requests
             if self._pending_pick:
@@ -246,7 +258,7 @@ class ScatterBrush:
                 self._pending_pick = False
 
     def _on_pick(self, path: str, position: carb.Double3 | None, _pixels: carb.Uint2):
-        # place object if rate-limited and valid position
+        # place or erase if rate-limited and valid position
         if position is None:
             return
         now_ms = int(time.time() * 1000)
@@ -254,7 +266,13 @@ class ScatterBrush:
             return
         self._last_place_time_ms = now_ms
         try:
-            self._place_at_world_position(Gf.Vec3d(position[0], position[1], position[2]), path)
+            world = Gf.Vec3d(position[0], position[1], position[2])
+            # Erase or Paint according to UI setting
+            erase = bool(self._settings_iface.get(f"{self._settings_prefix}.erase_mode") or self._settings.erase_mode)
+            if erase:
+                self._erase_at_world_position(world, path)
+            else:
+                self._place_at_world_position(world, path)
         except Exception:  # noqa
             carb.log_warn("Scatter brush placement failed")
 
@@ -299,7 +317,7 @@ class ScatterBrush:
     def _place_at_world_position(self, world_pos: Gf.Vec3d, picked_path: str):
         stage = self._viewport_api.stage
         # Resolve selected asset from settings; only proceed if present
-        asset_path = self._settings_iface.get_as_string(self._settings_prefix + "/asset_path") or self._settings.asset_path
+        asset_path = self._settings_iface.get(f"{self._settings_prefix}.asset_usd_path") or self._settings.asset_usd_path
         if not asset_path:
             return
         # Ensure asset is ingested (or part of capture, which is always allowed)
@@ -348,6 +366,7 @@ class ScatterBrush:
             pi_geom = UsdGeom.PointInstancer(pi)
             rel = pi_geom.GetPrototypesRel()
             rel.SetTargets([proto_root])
+            # TODO: Composer supports multi-prototype sets with per-asset weights. Current MVP uses one PI per asset.
         return pi
 
     def _append_instance(self, pi_prim: Usd.Prim, local_translation: Gf.Vec3d) -> None:
@@ -358,34 +377,106 @@ class ScatterBrush:
         proto_indices = list(pi.GetProtoIndicesAttr().Get(time_code) or [])
         orientations_attr = pi.GetOrientationsAttr()
         scales_attr = pi.GetScalesAttr()
+        ids_attr = pi.GetIdsAttr()
         orientations = list(orientations_attr.Get(time_code) or [])
         scales = list(scales_attr.Get(time_code) or [])
+        ids = list(ids_attr.Get(time_code) or [])
 
         # Compute randomized yaw and scale
-        yaw_min = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_min_deg") or self._settings.random_yaw_min_deg
-        yaw_max = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_max_deg") or self._settings.random_yaw_max_deg
-        scale_min = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_min") or self._settings.uniform_scale_min
-        scale_max = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_max") or self._settings.uniform_scale_max
+        try:
+            rand_yaw_enabled = bool(self._settings_iface.get(f"{self._settings_prefix}.random_yaw"))
+        except Exception:
+            rand_yaw_enabled = self._settings.random_yaw
+        try:
+            scale_min = float(self._settings_iface.get(f"{self._settings_prefix}.random_scale_min"))
+        except Exception:
+            scale_min = self._settings.random_scale_min
+        try:
+            scale_max = float(self._settings_iface.get(f"{self._settings_prefix}.random_scale_max"))
+        except Exception:
+            scale_max = self._settings.random_scale_max
 
-        import random, math
-
-        yaw_deg = random.uniform(yaw_min, yaw_max)
+        import math
+        rnd = getattr(self, "_random", None)
+        if rnd is None:
+            import random as _random_mod
+            rnd = _random_mod
+        yaw_deg = (rnd.uniform(-180.0, 180.0) if rand_yaw_enabled else 0.0)
         yaw_rad = math.radians(yaw_deg)
         # Quaternion around Z for MVP (assuming up=Z in Remix capture)
+        # TODO: Align to surface normal when available; HdRemix picking lacks normals, compute via hit prim geometry.
         q = Gf.Quatf(float(math.cos(yaw_rad * 0.5)), Gf.Vec3f(0.0, 0.0, float(math.sin(yaw_rad * 0.5))))
 
-        s = random.uniform(scale_min, scale_max)
+        s = float(rnd.uniform(scale_min, scale_max))
 
         positions.append(Gf.Vec3f(local_translation))
         proto_indices.append(0)
         orientations.append(q)
         scales.append(Gf.Vec3f(s, s, s))
+        # Stable ids: append monotonic id
+        next_id = (max(ids) + 1) if ids else 1
+        ids.append(int(next_id))
 
         # Write back arrays
         pi.GetPositionsAttr().Set(positions)
         pi.GetProtoIndicesAttr().Set(proto_indices)
         orientations_attr.Set(orientations)
         scales_attr.Set(scales)
+        ids_attr.Set(ids)
+
+    def _erase_at_world_position(self, world_pos: Gf.Vec3d, picked_path: str) -> None:
+        stage = self._viewport_api.stage
+        # Determine anchor scope to search for PIs
+        mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+        parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
+        # Brush radius
+        try:
+            radius = float(self._settings_iface.get(f"{self._settings_prefix}.brush_radius") or self._settings.brush_radius)
+        except Exception:
+            radius = self._settings.brush_radius
+        # Transform world position into each PI's local space and remove instances within radius
+        with omni.kit.undo.group():
+            for child in parent_prim.GetChildren():
+                if not child.IsA(UsdGeom.PointInstancer):
+                    continue
+                pi = UsdGeom.PointInstancer(child)
+                tc = Usd.TimeCode.Default()
+                # Compute world->pi local transform
+                try:
+                    world_to_pi = UsdGeom.Xformable(child).ComputeParentToWorldTransform(tc).GetInverse()
+                except Exception:
+                    world_to_pi = Gf.Matrix4d(1.0)
+                local = world_to_pi.Transform(world_pos)
+                positions = list(pi.GetPositionsAttr().Get(tc) or [])
+                if not positions:
+                    continue
+                proto_indices = list(pi.GetProtoIndicesAttr().Get(tc) or [])
+                orientations = list(pi.GetOrientationsAttr().Get(tc) or [])
+                scales = list(pi.GetScalesAttr().Get(tc) or [])
+                ids_attr = pi.GetIdsAttr()
+                ids = list(ids_attr.Get(tc) or [])
+                # Build new arrays excluding instances within radius
+                keep = []
+                for i, p in enumerate(positions):
+                    d = (Gf.Vec3f(p) - Gf.Vec3f(local)).GetLength()
+                    if d > radius:
+                        keep.append(i)
+                if len(keep) == len(positions):
+                    continue
+                new_positions = [positions[i] for i in keep]
+                new_proto = [proto_indices[i] for i in keep]
+                new_orient = [orientations[i] for i in keep] if orientations else []
+                new_scales = [scales[i] for i in keep] if scales else []
+                new_ids = [ids[i] for i in keep] if ids else []
+                pi.GetPositionsAttr().Set(new_positions)
+                pi.GetProtoIndicesAttr().Set(new_proto)
+                if orientations:
+                    pi.GetOrientationsAttr().Set(new_orient)
+                if scales:
+                    pi.GetScalesAttr().Set(new_scales)
+                if ids:
+                    ids_attr.Set(new_ids)
+                # TODO: Composer supports soft-erase via invisibleIds; consider using pi.GetInvisibleIdsAttr() for non-destructive erase.
 
     def _ensure_anchor_under_mesh(self, stage: Usd.Stage, mesh_root: Sdf.Path) -> Usd.Prim:
         """Create or return an anchor Xform under the mesh root in the replacement layer.
