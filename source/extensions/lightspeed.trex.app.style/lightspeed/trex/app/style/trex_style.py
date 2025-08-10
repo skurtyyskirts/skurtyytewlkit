@@ -20,7 +20,9 @@
 import asyncio
 
 import carb
+import omni.kit.app
 import omni.kit.imgui
+import omni.usd
 import omni.ui as ui
 from omni.flux.utils.widget.resources import get_fonts as _get_fonts
 from omni.flux.utils.widget.resources import get_icons as _get_icons
@@ -34,10 +36,14 @@ from omni.ui import constant as fl
 @omni.usd.handle_exception
 async def __override_imgui_style():
     """Wait 3 frames or it will crash"""
+    app = omni.kit.app.get_app()
+    if app is None:
+        return
     for _ in range(3):
-        await omni.kit.app.get_app().next_update_async()
+        await app.next_update_async()
     imgui = omni.kit.imgui.acquire_imgui()
-    imgui.push_style_color(omni.kit.imgui.StyleColor.WindowShadow, carb.Float4(0.0, 0.0, 0.0, 0.0))
+    if imgui is not None:
+        imgui.push_style_color(omni.kit.imgui.StyleColor.WindowShadow, carb.Float4(0.0, 0.0, 0.0, 0.0))
 
 
 asyncio.ensure_future(__override_imgui_style())
@@ -1029,4 +1035,6 @@ current_dict.update(
         "Button.Image::ScatterBrush": {"image_url": _get_icons("scatter_brush")},
     }
 )
-style.default = current_dict
+# Avoid reassigning style.default to prevent type casting issues on some Kit builds
+# where the setter expects a specific internal style dict type.
+# Updating the existing default dict in-place is sufficient.

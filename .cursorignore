@@ -1,2 +1,5 @@
 _*/
 !_build/*/*/exts/*
+!_build/*/*/apps/**
+!_build/*/*/kit/**
+!_build/*/*/logs/**

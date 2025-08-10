@@ -18,9 +18,11 @@
 import functools
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, List, Tuple
+import os
 
 import omni.client
+import carb
 import omni.usd
 from lightspeed.common.constants import GAME_READY_ASSETS_FOLDER as _GAME_READY_ASSETS_FOLDER
 from lightspeed.common.constants import REMIX_CAPTURE_FOLDER as _REMIX_CAPTURE_FOLDER
@@ -34,6 +36,8 @@ from lightspeed.trex.replacement.core.shared.layers import AssetReplacementLayer
 from lightspeed.trex.selection_tree.shared.widget import SetupUI as _SelectionTreeWidget
 from lightspeed.trex.utils.common.prim_utils import is_instance as _is_instance
 from lightspeed.trex.utils.widget import TrexMessageDialog as _TrexMessageDialog
+from lightspeed.common import constants as _constants
+from lightspeed.trex.utils.common.asset_utils import is_asset_ingested as _is_asset_ingested
 from omni import ui
 from omni.flux.bookmark_tree.model.usd import UsdBookmarkCollectionModel as _UsdBookmarkCollectionModel
 from omni.flux.bookmark_tree.widget import BookmarkTreeWidget as _BookmarkTreeWidget
@@ -55,6 +59,7 @@ class CollapsiblePanels(Enum):
     MATERIAL_PROPERTIES = 3
     MESH_PROPERTIES = 4
     SELECTION = 5
+    SCATTER_BRUSH = 6
 
 
 class AssetReplacementsPane:
@@ -78,6 +83,9 @@ class AssetReplacementsPane:
             "_selection_collapsable_frame": None,
             "_mesh_properties_collapsable_frame": None,
             "_material_properties_collapsable_frame": None,
+            "_scatter_collapsable_frame": None,
+            "_scatter_assets": None,
+            "_scatter_asset_combo": None,
             "_sub_tree_selection_changed": None,
             "_sub_go_to_ingest_tab1": None,
             "_sub_go_to_ingest_tab2": None,
@@ -176,6 +184,102 @@ class AssetReplacementsPane:
                             )
 
                             ui.Spacer(height=ui.Pixel(16))
+
+                            # Scatter Brush settings panel
+                            self._scatter_collapsable_frame = _PropertyCollapsableFrameWithInfoPopup(
+                                "SCATTER BRUSH",
+                                info_text=(
+                                    "Scatter pre-ingested assets with a brush.\n"
+                                    "- Select a USD asset from your project's assets/ingested folder.\n"
+                                    "- Use the toolbar brush button to paint into the viewport.\n"
+                                ),
+                                collapsed=False,
+                            )
+                            self._collapsible_frame_states[CollapsiblePanels.SCATTER_BRUSH] = True
+                            with self._scatter_collapsable_frame:
+                                with ui.VStack(spacing=6, style={"margin": 4}):
+                                    ui.Label("Asset (ingested)", style_type_name_override="PropertiesWidgetLabel")
+                                    self._scatter_assets = self._scan_ingested_assets()
+                                    names = [name for name, _ in self._scatter_assets] or ["<no ingested USD assets found>"]
+                                    self._scatter_asset_combo = ui.ComboBox(
+                                        0, *names, style_type_name_override="PropertiesWidgetField"
+                                    )
+                                    self._scatter_asset_combo.model.add_value_changed_fn(
+                                        self._on_scatter_asset_changed
+                                    )
+
+                                    ui.Spacer(height=ui.Pixel(4))
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Radius", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        radius = ui.FloatDrag(0.25, min=0.0, max=100.0, step=0.05,
+                                                              style_type_name_override="PropertiesWidgetField")
+                                        radius.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/radius", radius.model.as_float)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Spacing", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        spacing = ui.FloatDrag(0.25, min=0.0, max=100.0, step=0.05,
+                                                               style_type_name_override="PropertiesWidgetField")
+                                        spacing.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/spacing", spacing.model.as_float)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Density", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        density = ui.FloatDrag(1.0, min=0.01, max=50.0, step=0.1,
+                                                              style_type_name_override="PropertiesWidgetField")
+                                        density.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/density", density.model.as_float)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Yaw Min", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        yaw_min = ui.FloatDrag(-15.0, min=-180.0, max=180.0, step=1.0,
+                                                              style_type_name_override="PropertiesWidgetField")
+                                        yaw_min.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/random_yaw_min_deg", yaw_min.model.as_float)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Yaw Max", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        yaw_max = ui.FloatDrag(15.0, min=-180.0, max=180.0, step=1.0,
+                                                              style_type_name_override="PropertiesWidgetField")
+                                        yaw_max.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/random_yaw_max_deg", yaw_max.model.as_float)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Scale Min", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        smin = ui.FloatDrag(1.0, min=0.01, max=10.0, step=0.05,
+                                                            style_type_name_override="PropertiesWidgetField")
+                                        smin.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/uniform_scale_min", smin.model.as_float)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Scale Max", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        smax = ui.FloatDrag(1.0, min=0.01, max=10.0, step=0.05,
+                                                            style_type_name_override="PropertiesWidgetField")
+                                        smax.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/uniform_scale_max", smax.model.as_float)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Align Normal", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        align = ui.CheckBox(False)
+                                        align.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/align_to_normal", align.model.as_bool)
+                                        )
+                                    with ui.HStack(spacing=6):
+                                        ui.Label("Normal Offset", width=ui.Pixel(80),
+                                                 style_type_name_override="PropertiesWidgetLabel")
+                                        offset = ui.FloatDrag(0.0, min=-1.0, max=1.0, step=0.01,
+                                                             style_type_name_override="PropertiesWidgetField")
+                                        offset.model.add_value_changed_fn(
+                                            lambda *_: self._set_setting("/offset_along_normal", offset.model.as_float)
+                                        )
 
                             self._bookmarks_collapsable_frame = _PropertyCollapsableFrameWithInfoPopup(
                                 "BOOKMARKS",
@@ -321,6 +425,7 @@ class AssetReplacementsPane:
 
         self._refresh_mesh_properties_widget()
         self._refresh_material_properties_widget()
+        self._apply_initial_scatter_settings()
 
     def __on_collapsable_frame_changed(
         self, collapsible_panel_type, widget, collapsed, refresh_fn: Callable[[], Any] = None
@@ -334,6 +439,75 @@ class AssetReplacementsPane:
     @property
     def selection_tree_widget(self):
         return self._selection_tree_widget
+
+    # -------- Scatter helpers --------
+    def _settings_iface(self):
+        return carb.settings.get_settings()
+
+    def _settings_prefix(self) -> str:
+        return "/exts/lightspeed.trex.scatter_brush"
+
+    def _set_setting(self, key_suffix: str, value: Any):
+        try:
+            self._settings_iface().set(self._settings_prefix() + key_suffix, value)
+        except Exception:  # noqa
+            pass
+
+    def _apply_initial_scatter_settings(self):
+        # Ensure defaults exist to avoid None reads in the tool
+        defaults = {
+            "/radius": 0.25,
+            "/spacing": 0.25,
+            "/density": 1.0,
+            "/random_yaw_min_deg": -15.0,
+            "/random_yaw_max_deg": 15.0,
+            "/uniform_scale_min": 1.0,
+            "/uniform_scale_max": 1.0,
+            "/align_to_normal": False,
+            "/offset_along_normal": 0.0,
+        }
+        for k, v in defaults.items():
+            if self._settings_iface().get(self._settings_prefix() + k) is None:
+                self._set_setting(k, v)
+        # Also set current asset if any
+        if self._scatter_assets:
+            self._on_scatter_asset_changed()
+
+    def _on_scatter_asset_changed(self, *_):
+        if not self._scatter_assets or self._scatter_asset_combo is None:
+            return
+        idx = int(self._scatter_asset_combo.model.get_value_as_int())
+        idx = max(0, min(idx, len(self._scatter_assets) - 1))
+        _, path = self._scatter_assets[idx]
+        self._set_setting("/asset_path", path)
+
+    def _scan_ingested_assets(self) -> List[Tuple[str, str]]:
+        ctx = omni.usd.get_context(self._context_name)
+        stage_url = ctx.get_stage_url()
+        if not stage_url:
+            return []
+        # Project root is parent folder of stage file
+        root_url = omni.client.normalize_url(str(omni.client.Uri(stage_url).get_dirname()))
+        ingested_url = omni.client.combine_urls(root_url, _constants.REMIX_INGESTED_ASSETS_FOLDER)
+        results: List[Tuple[str, str]] = []
+
+        def walk(url: str):
+            res, entries = omni.client.list(url)
+            if res != omni.client.Result.OK:
+                return
+            for e in entries:
+                child = omni.client.combine_urls(url, e.relative_path)
+                if e.flags & omni.client.ItemFlags.CAN_HAVE_CHILDREN:
+                    walk(child)
+                elif e.flags & omni.client.ItemFlags.READABLE_FILE:
+                    lower = e.relative_path.lower()
+                    if any(lower.endswith(ext) for ext in _constants.USD_EXTENSIONS):
+                        if _is_asset_ingested(child):
+                            results.append((e.relative_path, child))
+        walk(ingested_url)
+        # Sort by name
+        results.sort(key=lambda t: t[0].lower())
+        return results
 
     def _get_selection_pin_name(self, for_materials: bool = False) -> str:
         """

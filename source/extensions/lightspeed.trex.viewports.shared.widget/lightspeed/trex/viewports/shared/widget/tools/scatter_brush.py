@@ -36,6 +36,8 @@ import omni.kit.undo
 import omni.ui as ui
 import omni.usd
 from lightspeed.trex.app.style import style
+from lightspeed.common import constants as _constants
+from lightspeed.trex.utils.common.asset_utils import is_asset_ingested as _is_asset_ingested
 from lightspeed.trex.hotkeys import TrexHotkeyEvent
 from lightspeed.trex.hotkeys import get_global_hotkey_manager as _get_global_hotkey_manager
 from pxr import Gf, Sdf, Usd, UsdGeom
@@ -49,10 +51,22 @@ if TYPE_CHECKING:
 
 @dataclass
 class BrushSettings:
-    radius: float = 0.0  # future use (jitter radius)
+    # UI-exposed settings (read from carb.settings on demand)
+    radius: float = 0.25
+    spacing: float = 0.25
+    density: float = 1.0
+    random_yaw_min_deg: float = -15.0
+    random_yaw_max_deg: float = 15.0
+    uniform_scale_min: float = 1.0
+    uniform_scale_max: float = 1.0
+    align_to_normal: bool = False  # HdRemix query doesn't return normals; keep optional
+    offset_along_normal: float = 0.0
+
+    # Core behavior
     min_interval_ms: int = 120  # place at most every N ms when dragging
-    group_parent_name: str = "ScatterBrush"
-    create_type: str = "Xform"  # default prim type when scattering
+    group_parent_name: str = "ScatterAnchors"
+    # Current asset to scatter (absolute or project-relative USD path)
+    asset_path: str | None = None
 
 
 _scatter_button_group: ScatterBrushButtonGroup | None = None
@@ -148,6 +162,10 @@ class ScatterBrush:
     def __init__(self, viewport_api: "ViewportAPI"):
         self._viewport_api = viewport_api
         self._settings = BrushSettings()
+        # Settings bridge: allow another extension to set current asset and parameters in carb.settings
+        # These keys are intentionally simple; UI agent will write to them.
+        self._settings_iface = carb.settings.get_settings()
+        self._settings_prefix = "/exts/lightspeed.trex.scatter_brush"
 
         # overlay frame (same pattern as Teleporter) for coordinate conversions if needed later
         self.__viewport_frame = ui.Frame()
@@ -218,7 +236,7 @@ class ScatterBrush:
                 await asyncio.sleep(0)
                 self._pending_pick = False
 
-    def _on_pick(self, _path: str, position: carb.Double3 | None, _pixels: carb.Uint2):
+    def _on_pick(self, path: str, position: carb.Double3 | None, _pixels: carb.Uint2):
         # place object if rate-limited and valid position
         if position is None:
             return
@@ -227,12 +245,12 @@ class ScatterBrush:
             return
         self._last_place_time_ms = now_ms
         try:
-            self._place_at_world_position(Gf.Vec3d(position[0], position[1], position[2]))
+            self._place_at_world_position(Gf.Vec3d(position[0], position[1], position[2]), path)
         except Exception:  # noqa
             carb.log_warn("Scatter brush placement failed")
 
     def _ensure_group_parent(self, stage: Usd.Stage) -> Usd.Prim:
-        # try default prim, else /World
+        # Create (or get) a scope for scatter anchors near the default prim
         default_prim = stage.GetDefaultPrim()
         if default_prim and default_prim.IsValid():
             parent_path = default_prim.GetPath()
@@ -240,47 +258,154 @@ class ScatterBrush:
             parent_path = Sdf.Path("/World")
             if not stage.GetPrimAtPath(parent_path).IsValid():
                 UsdGeom.Xform.Define(stage, parent_path)
-        group_path = omni.usd.get_stage_next_free_path(
-            stage, str(parent_path.AppendPath(self._settings.group_parent_name)), False
-        )
+        group_path = parent_path.AppendPath(self._settings.group_parent_name)
         prim = stage.GetPrimAtPath(group_path)
         if not prim.IsValid():
             omni.kit.commands.execute(
                 "CreatePrimCommand",
                 prim_path=group_path,
-                prim_type="Xform",
+                prim_type="Scope",
                 select_new_prim=False,
                 context_name=self._viewport_api.usd_context_name,
             )
             prim = stage.GetPrimAtPath(group_path)
         return prim
 
-    def _place_at_world_position(self, world_pos: Gf.Vec3d):
+    @staticmethod
+    def _mesh_root_from_path(prim_path: str) -> Sdf.Path | None:
+        import re
+        # constants.REGEX_MESH_PATH matches the mesh root path
+        pattern = re.compile(_constants.REGEX_MESH_PATH)
+        match = pattern.match(str(prim_path))
+        if match:
+            return Sdf.Path(match.group(0))
+        # Try trimming to parent until match
+        try_path = Sdf.Path(prim_path)
+        while try_path and try_path != Sdf.Path.absoluteRootPath:
+            if pattern.match(str(try_path)):
+                return try_path
+            try_path = try_path.GetParentPath()
+        return None
+
+    def _place_at_world_position(self, world_pos: Gf.Vec3d, picked_path: str):
         stage = self._viewport_api.stage
+        # Resolve selected asset from settings; only proceed if present
+        asset_path = self._settings_iface.get_as_string(self._settings_prefix + "/asset_path") or self._settings.asset_path
+        if not asset_path:
+            return
+        # Ensure asset is ingested (or part of capture, which is always allowed)
+        if not _is_asset_ingested(asset_path):
+            return
+        # Author as PointInstancer under a per-anchor parent; anchor is the mesh hash scope if available
         with omni.kit.undo.group():
-            parent_prim = self._ensure_group_parent(stage)
+            # Try to anchor under the picked mesh root; fall back to global parent scope
+            mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+            parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
             parent_to_world = (
                 UsdGeom.Xformable(parent_prim).ComputeParentToWorldTransform(Usd.TimeCode.Default()).GetInverse()
             )
             local_translation = parent_to_world.Transform(world_pos)
 
-            # Create child prim under parent and set local translation
-            child_path = omni.usd.get_stage_next_free_path(
-                stage, str(parent_prim.GetPath().AppendPath("item")), False
-            )
+            # Ensure a PointInstancer exists for the chosen asset
+            pi_prim = self._ensure_point_instancer(parent_prim, asset_path)
+            self._append_instance(pi_prim, local_translation)
+
+    def _ensure_point_instancer(self, parent_prim: Usd.Prim, asset_path: str) -> Usd.Prim:
+        stage = parent_prim.GetStage()
+        # One PI per asset to keep arrays simple for MVP. Name derived from asset basename
+        asset_name = str(asset_path).split("/")[-1].split(".")[0]
+        pi_path = parent_prim.GetPath().AppendPath(f"PI_{asset_name}")
+        pi = stage.GetPrimAtPath(pi_path)
+        if not pi.IsValid():
+            UsdGeom.PointInstancer.Define(stage, pi_path)
+            # Author prototype reference sub-prim once
+            proto_root = pi_path.AppendPath("Prototypes").AppendPath(asset_name)
+            if not stage.GetPrimAtPath(proto_root).IsValid():
+                omni.kit.commands.execute(
+                    "CreatePrimCommand",
+                    prim_path=proto_root,
+                    prim_type="Xform",
+                    select_new_prim=False,
+                    context_name=self._viewport_api.usd_context_name,
+                )
+                # Add reference to asset
+                omni.kit.commands.execute(
+                    "AddReference",
+                    stage=stage,
+                    prim_path=str(proto_root),
+                    reference=Sdf.Reference(assetPath=asset_path),
+                )
+            # Bind prototypes rel
+            pi_geom = UsdGeom.PointInstancer(pi)
+            rel = pi_geom.GetPrototypesRel()
+            rel.SetTargets([proto_root])
+        return pi
+
+    def _append_instance(self, pi_prim: Usd.Prim, local_translation: Gf.Vec3d) -> None:
+        pi = UsdGeom.PointInstancer(pi_prim)
+        time_code = Usd.TimeCode.Default()
+        # Read existing arrays
+        positions = list(pi.GetPositionsAttr().Get(time_code) or [])
+        proto_indices = list(pi.GetProtoIndicesAttr().Get(time_code) or [])
+        orientations_attr = pi.GetOrientationsAttr()
+        scales_attr = pi.GetScalesAttr()
+        orientations = list(orientations_attr.Get(time_code) or [])
+        scales = list(scales_attr.Get(time_code) or [])
+
+        # Compute randomized yaw and scale
+        yaw_min = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_min_deg") or self._settings.random_yaw_min_deg
+        yaw_max = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_max_deg") or self._settings.random_yaw_max_deg
+        scale_min = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_min") or self._settings.uniform_scale_min
+        scale_max = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_max") or self._settings.uniform_scale_max
+
+        import random, math
+
+        yaw_deg = random.uniform(yaw_min, yaw_max)
+        yaw_rad = math.radians(yaw_deg)
+        # Quaternion around Z for MVP (assuming up=Z in Remix capture)
+        q = Gf.Quatf(float(math.cos(yaw_rad * 0.5)), Gf.Vec3f(0.0, 0.0, float(math.sin(yaw_rad * 0.5))))
+
+        s = random.uniform(scale_min, scale_max)
+
+        positions.append(Gf.Vec3f(local_translation))
+        proto_indices.append(0)
+        orientations.append(q)
+        scales.append(Gf.Vec3f(s, s, s))
+
+        # Write back arrays
+        pi.GetPositionsAttr().Set(positions)
+        pi.GetProtoIndicesAttr().Set(proto_indices)
+        orientations_attr.Set(orientations)
+        scales_attr.Set(scales)
+
+    def _ensure_anchor_under_mesh(self, stage: Usd.Stage, mesh_root: Sdf.Path) -> Usd.Prim:
+        """Create or return an anchor Xform under the mesh root in the replacement layer.
+
+        The anchor is a child Xform with the Remix `IsRemixRef` attribute set to True so it
+        behaves like other Remix-authored references. We then place the point instancer as
+        a child of this anchor.
+        """
+        # Name the anchor deterministically
+        anchor_path = mesh_root.AppendPath("scatter_anchor")
+        prim = stage.GetPrimAtPath(anchor_path)
+        if not prim.IsValid():
             omni.kit.commands.execute(
                 "CreatePrimCommand",
-                prim_path=child_path,
-                prim_type=self._settings.create_type,
+                prim_path=str(anchor_path),
+                prim_type="Xform",
                 select_new_prim=False,
                 context_name=self._viewport_api.usd_context_name,
             )
+            prim = stage.GetPrimAtPath(anchor_path)
+            # Mark as Remix-created
             omni.kit.commands.execute(
-                "TransformPrimSRT",
-                path=child_path,
-                new_translation=Gf.Vec3d(*local_translation),
+                "CreateUsdAttributeOnPath",
+                attr_path=prim.GetPath().AppendProperty(_constants.IS_REMIX_REF_ATTR),
+                attr_type=Sdf.ValueTypeNames.Bool,
+                attr_value=True,
                 usd_context_name=self._viewport_api.usd_context_name,
             )
+        return prim
 
 
 def scatter_brush_factory(desc: dict[str, object]):

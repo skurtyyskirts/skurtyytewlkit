@@ -1,0 +1,24 @@
+{
+    "persistent": {
+        "app": {
+            "window": {
+                "uiStyle": "NvidiaDark"
+            },
+            "viewport": {
+                "pickingMode": "prims",
+                "noPadding": true,
+                "ui": {
+                    "background": {
+                        "opacity": 0.7,
+                        "brightness": 0.9
+                    }
+                }
+            }
+        },
+        "exts": {
+            "omni.kit.registry.nucleus": {
+                "userRegistries": {}
+            }
+        }
+    }
+}
