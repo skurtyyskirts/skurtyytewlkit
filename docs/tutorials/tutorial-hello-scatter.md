@@ -5,7 +5,7 @@ This short tutorial walks you through using the Scatter Brush in Trex with a tin
 ## Prerequisites
 
 - Built and launched the Toolkit (see `artifacts/how_to_run.md`)
-- Open the sample scene: `source/data/Kit/hello_scatter/hello_scatter.usda`
+- Open the sample scene: `source/data/Kit/hello_scatter/hello_scatter.usda` (also mirrored under `docs/samples/hello_scatter/hello_scatter.usda`)
 
 ## 1. Locate the Toolbar and Toggle the Scatter Brush
 
@@ -24,8 +24,8 @@ Behavior when active:
 ## 3. Prepare Prototypes (Ingest)
 
 This sample includes simple prototypes:
-- `extensions/omniscatter/data/prototypes/hello_scatter/proto_box.usda`
-- `extensions/omniscatter/data/prototypes/hello_scatter/proto_sphere.usda`
+- `extensions/omniscatter/data/prototypes/hello_scatter/proto_box.usda` (also mirrored under `docs/samples/hello_scatter/prototypes/proto_box.usda`)
+- `extensions/omniscatter/data/prototypes/hello_scatter/proto_sphere.usda` (also mirrored under `docs/samples/hello_scatter/prototypes/proto_sphere.usda`)
 
 If you want to generate thumbnails or ingest more assets, see:
 - `tools/custom/prototype_ingest.py`
