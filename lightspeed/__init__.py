@@ -1,0 +1,1 @@
+# lightspeed stub package for tests
