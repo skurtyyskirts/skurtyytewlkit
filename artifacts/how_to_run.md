@@ -25,4 +25,15 @@ Verification checklist
   2) kit-extension-sample-scatter (Apache-2.0): https://github.com/NVIDIA-Omniverse/kit-extension-sample-scatter
   3) Paint Tool extension docs: https://docs.omniverse.nvidia.com/extensions/latest/ext_paint-tool.html
 
+### Scatter Brush Micro-benchmarks
+
+- Tests include simple micro-benchmarks for batching and spatial hash:
+  - File: `tests/test_prototype_ingest.py`
+  - They are guarded to skip when Omniverse Kit modules are not present.
+- Settings knobs (tweak via Kit Settings or defaults):
+  - `/app/viewport/scatter/per_frame_max_instances`
+  - `/app/viewport/scatter/enable_throttle`, `/app/viewport/scatter/min_interval_ms`
+  - `/app/viewport/scatter/use_spatial_hash`, `/app/viewport/scatter/min_distance`, `/app/viewport/scatter/hash_cell_size`
+  - `/app/viewport/scatter/z_epsilon`, `/app/viewport/scatter/offset_along_view`
+
 

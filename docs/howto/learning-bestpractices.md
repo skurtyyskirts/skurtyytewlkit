@@ -153,3 +153,18 @@ Avoid intersecting light sources with other geometry, as this reduces sampling e
 
 ***
 <sub> Need to leave feedback about the RTX Remix Documentation?  [Click here](https://github.com/NVIDIAGameWorks/rtx-remix/issues/new?assignees=nvdamien&labels=documentation%2Cfeedback%2Ctriage&projects=&template=documentation_feedback.yml&title=%5BDocumentation+feedback%5D%3A+) </sub>
+
+## Scatter Brush Performance Notes
+
+- Batching: Brush authoring defers USD edits during a stroke. Edits are queued and flushed in batches each frame and fully at stroke end.
+- Per-frame budget: Tune with settings keys:
+  - `/app/viewport/scatter/per_frame_max_instances` (default: 10)
+  - `/app/viewport/scatter/enable_throttle` and `/app/viewport/scatter/min_interval_ms` (default: 120ms)
+- Spatial hash culling:
+  - `/app/viewport/scatter/use_spatial_hash` (default: true)
+  - `/app/viewport/scatter/min_distance` and `/app/viewport/scatter/hash_cell_size`
+- Z-fighting mitigation:
+  - `/app/viewport/scatter/z_epsilon` (default: 0.0005)
+  - `/app/viewport/scatter/offset_along_view` (default: true)
+
+Micro-benchmarks exist in tests to validate queue flushing and spatial hash acceptance remain sub-50ms in synthetic runs.
