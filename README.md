@@ -1,67 +1,65 @@
-# remix-toolkit
+# RTX Remix Toolkit — Scatter Brush (Docs & Demos)
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
-[![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/NVIDIAGameWorks/toolkit-remix/graphs/commit-activity)
+This repository includes user-facing documentation and a tiny sample project showcasing the new Scatter Brush tool in RTX Remix Toolkit (Trex).
 
-## Introduction
+- Left panel, toolbar toggle, and settings screenshots
+- “Hello Scatter” sample USD stage with two ingested prototypes
+- Step-by-step tutorial to try the tool end-to-end
+- Known limitations and troubleshooting
 
-The RTX Remix Toolkit is a robust modding tool tailored to enhance classic DirectX 8 and 9 games.
-Powered by NVIDIA Omniverse, this toolkit equips modders with advanced editing capabilities to elevate game assets.
-Seamlessly integrated with the RTX Remix Runtime, it facilitates injecting remastered assets back into gameplay,
-ensuring an enriched gaming experience.
+## Quick Links
 
-With the RTX Remix Toolkit, users can seamlessly swap original game assets with high-fidelity remastered counterparts,
-tweak lighting configurations, and leverage Generative AI for texture remastering. Streamlined for user-friendly
-operation, this toolkit empowers creators to craft visually captivating game scenes, eliminating the need for extensive
-technical know-how.
+- Getting started with Toolkit UI: `docs/toolkitinterface/remix-toolkitinterface-viewport.md`
+- “Hello Scatter” tutorial: `docs/tutorials/tutorial-hello-scatter.md`
+- Known limitations: `docs/howto/scatter-known-limitations.md`
+- Troubleshooting: `docs/howto/scatter-troubleshooting.md`
 
-## Pre-Requirements
+## UI Overview
 
-- [Git](https://www.git-scm.com/)
+### Where the Left Panel Lives
 
-## Build Instructions
+The left panel hosts Layers, Bookmarks, Selection History, and Properties panes used throughout Trex.
 
-1. Clone this repository
-2. Execute the build script:
-   ```
-   .\build.bat -r
-   ```
+![Stage Manager / Left Panels](docs/data/images/remix-toolkitinterface-stagemanager.png)
 
-### Additional notes
+See also: `docs/toolkitinterface/remix-toolkitinterface-layouttab.md`.
 
-- Utilize the `repo.bat` file to execute additional commands. Run the following command to view available tools:
-  ```
-  .\repo.bat -h
-  ```
+### Toolbar Toggle (Scatter Brush)
 
-## Getting Started
+The Scatter Brush is toggled from the viewport toolbar. When active, holding LMB places items at the mouse hit position.
 
-1. To launch the end-user version of the toolkit, execute the following file:
-   ```
-   .\_build\windows-x86_64\release\lightspeed.app.trex.bat
-   ```
-2. For the developer version of the toolkit with extra features conducive to development, launch:
-   ```
-   .\_build\windows-x86_64\release\lightspeed.app.trex_dev.bat
-   ```
-3. For launching specific sub-applications (e.g., Modding, Ingestion), directly run the corresponding files:
-   ```
-   _build\windows-x86_64\release\lightspeed.app.trex.ingestcraft.bat
-   ```
+![Viewport Toolbar Reference](docs/data/images/remix-viewport-001.png)
+
+- Button identifier: `scatter_brush`
+- Tooltip: “Scatter Brush (paint to place objects under the mouse)”
+
+### Settings
+
+Use viewport settings and preferences to adjust UI visibility and other options.
+
+![Reset and Preferences](docs/data/images/remix-viewport-017.png)
+![Viewport UI Settings](docs/data/images/remix-viewport-007.png)
+
+## Scatter Brush at a Glance
+
+- Toolbar: Toggle the scatter brush via the toolbar button labeled `Scatter Brush` (identifier: `scatter_brush`).
+- Behavior: When active, press and hold Left Mouse Button in the viewport to place items at the cursor hit position at a throttled rate.
+- Default output: Creates an `Xform` child under a parent group named `ScatterBrush` beneath the stage default prim or `/World`.
+
+## Sample: Hello Scatter
+
+Located at `source/data/Kit/hello_scatter`.
+
+- `hello_scatter.usda`: a tiny stage with a camera, light, ground plane, and a parent `ScatterBrush` group created on demand.
+- Two simple prototype assets (USD) used for ingestion demonstration live in `extensions/omniscatter/data/prototypes/hello_scatter/`.
+
+Follow the tutorial: `docs/tutorials/tutorial-hello-scatter.md`.
+
+## Building and Running
+
+- See `artifacts/how_to_run.md` or use the `build.sh` / `build.bat` in the repo root.
+- Once running, open the `hello_scatter.usda` from the Project or via File → Open.
 
 ## Contributing
 
-Before contributing to the RTX Remix project, please review the [contributor documentation](./docs_dev/CONTRIBUTING.md).
-
-For further queries, feel free to [create a GitHub issue](https://github.com/NVIDIAGameWorks/rtx-remix/issues/new/choose)
-or join the RTX Remix Showcase Discord server via [this link](https://discord.gg/c7J6gUhXMk), where fellow modders can assist you.
-
-## Additional Documentation
-
-- [RTX Remix Documentation](https://docs.omniverse.nvidia.com/kit/docs/rtx_remix/latest/)
-- [RTX Remix Toolkit Documentation](https://docs.omniverse.nvidia.com/kit/docs/rtx_remix/latest/docs/toolkitinterface/remix-toolkitinterface-launchscreen.html)
-- [RTX Remix Toolkit API](https://docs.omniverse.nvidia.com/kit/docs/rtx_remix/latest/docs/contributing/api.html)
-
-
-## Security
-- [Security](./SECURITY.md)
+Please see `docs_dev/CONTRIBUTING.md` and `docs/contributing/contributing-overview.md`.
