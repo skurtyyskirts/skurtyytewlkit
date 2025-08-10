@@ -142,3 +142,11 @@ nrc_session_log.txt
 
 # Ignore private shell scripts
 source/shell/open_project.*
+
+# Allow Hello Scatter sample and prototypes in docs and source
+!docs/samples/**
+!docs/samples/**/*.usda
+!source/data/Kit/hello_scatter/**
+!source/data/Kit/hello_scatter/**/*.usda
+!extensions/omniscatter/data/prototypes/hello_scatter/**
+!extensions/omniscatter/data/prototypes/hello_scatter/**/*.usda

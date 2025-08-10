@@ -1,0 +1,15 @@
+#usda 1.0
+(
+    defaultPrim = "ProtoBox"
+)
+
+def Xform "ProtoBox"
+{
+    def Cube "Cube"
+    {
+        float3 xformOp:translate = (0, 0.5, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        color3f[] primvars:displayColor = [(0.1, 0.5, 0.9)]
+        float size = 1
+    }
+}
