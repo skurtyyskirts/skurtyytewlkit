@@ -64,3 +64,10 @@ pickingMode = "prims"
 noPadding = true
 ui.background.opacity = 0.7
 ui.background.brightness = 0.9
+
+[settings.exts."omni.kit.registry.nucleus".registries]
+"@kit" = "omniverse://kit-extensions.ov.nvidia.com/exts/kit"
+
+[settings.exts."omni.kit.registry.nucleus".accounts."0"]
+read = "${env:OMNI_KIT_EXTENSIONS_USERNAME}:${env:OMNI_KIT_EXTENSIONS_KEY}"
+write = "${env:OMNI_KIT_EXTENSIONS_USERNAME}:${env:OMNI_KIT_EXTENSIONS_KEY}"
