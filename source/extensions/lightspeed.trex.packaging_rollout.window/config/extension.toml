@@ -1,0 +1,37 @@
+[package]
+# Semantic Versioning
+version = "0.1.0"
+authors =["RTX Remix Toolkit Team <remix-toolkit@nvidia.com>"]
+title = "Packaging & Rollout Tool"
+description = "First-class UI for packaging and rollout of RTX Remix mods"
+readme = "docs/README.md"
+category = "internal"
+keywords = ["remix", "packaging", "rollout", "tool", "window"]
+icon = "data/icon.svg"
+repository = "https://gitlab-master.nvidia.com/lightspeedrtx/lightspeed-kit/-/tree/main/source/extensions/lightspeed.trex.packaging_rollout.window"
+
+[dependencies]
+"lightspeed.trex.packaging.core" = {}
+"lightspeed.trex.app.style" = {}
+"omni.ui" = {}
+"omni.kit.widget.toolbar" = {}
+"omni.flux.utils.common" = {}
+"omni.flux.feature_flags.core" = {}
+
+# Feature flag for safe rollout
+[settings.exts."omni.flux.feature_flags.core".flags.packaging_rollout]
+display_name = "Packaging & Rollout Tool"
+tooltip = "Enable the Packaging & Rollout tool and toolbar button"
+value = false
+
+[[python.module]]
+name = "lightspeed.trex.packaging_rollout.window"
+
+[[test]]
+dependencies = [
+    "lightspeed.trex.tests.dependencies",
+]
+
+stdoutFailPatterns.exclude = [
+    "*[omni.kit.registry.nucleus.utils.common] Skipping deletion of:*",
+]
