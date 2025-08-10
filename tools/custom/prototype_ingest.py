@@ -43,6 +43,9 @@ from typing import Dict, List, Optional, Tuple
 try:
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
     HAVE_USD = True
+    # Detect our local pxr stub and treat as no-USD for functionality
+    if getattr(Usd, "_FAKE_PXR", False):  # type: ignore[attr-defined]
+        HAVE_USD = False
 except Exception:
     HAVE_USD = False
 

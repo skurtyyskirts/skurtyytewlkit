@@ -12,6 +12,9 @@ from typing import Dict, List, Optional, Tuple
 try:
     from pxr import Gf, Usd, UsdGeom, UsdShade  # type: ignore
     HAVE_USD = True
+    # Detect our local pxr stub and treat as no-USD for functionality
+    if getattr(Usd, "_FAKE_PXR", False):  # type: ignore[attr-defined]
+        HAVE_USD = False
 except Exception:  # pragma: no cover - exercised in environments without USD
     HAVE_USD = False
 
