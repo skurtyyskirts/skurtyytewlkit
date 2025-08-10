@@ -86,6 +86,15 @@ class ScatterBrushButtonGroup(WidgetGroup):
 
         # subscribe to model changes to propagate
         self._model.add_value_changed_fn(lambda *_: self._notify(self._model.get_value_as_bool()))
+        # bridge to settings for external observers
+        def _settings_bridge():
+            try:
+                carb.settings.get_settings().set(
+                    'exts."lightspeed.trex.tools.scatter_brush".enabled', bool(self._model.get_value_as_bool())
+                )
+            except Exception:
+                pass
+        self._model.add_value_changed_fn(lambda *_: _settings_bridge())
 
     def _notify(self, value: bool):
         for cb in list(self.__on_toggled):
