@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import carb
 import omni.ui as ui
 
 from lightspeed.common import constants as _constants
+import omni.client
+from lightspeed.trex.utils.common.asset_utils import is_asset_ingested as _is_asset_ingested
 from omni.flux.utils.widget.collapsable_frame import PropertyCollapsableFrameWithInfoPopup
 
 from .model import get_model
@@ -145,9 +147,39 @@ class ScatterBrushPane:
                 p = index_dir / p
             return str(p)
 
-        protos = self._model.load_prototypes()
-        index_path = self._model.get_prototypes_index_path()
-        index_dir = index_path.parent if index_path else None
+        # Enumerate only ingested USDs within the current project
+        protos: List[Dict[str, Any]] = []
+        index_dir = None
+
+        try:
+            import omni.usd
+            ctx = omni.usd.get_context()
+            stage_url = ctx.get_stage_url()
+            if stage_url:
+                root_url = omni.client.normalize_url(str(omni.client.Uri(stage_url).get_dirname()))
+                ingested_url = omni.client.combine_urls(root_url, _constants.REMIX_INGESTED_ASSETS_FOLDER)
+
+                def walk(url: str):
+                    res, entries = omni.client.list(url)
+                    if res != omni.client.Result.OK:
+                        return
+                    for e in entries:
+                        child = omni.client.combine_urls(url, e.relative_path)
+                        if e.flags & omni.client.ItemFlags.CAN_HAVE_CHILDREN:
+                            walk(child)
+                        elif e.flags & omni.client.ItemFlags.READABLE_FILE:
+                            lower = e.relative_path.lower()
+                            if any(lower.endswith(ext) for ext in _constants.USD_EXTENSIONS):
+                                # Convert URL to local path, if possible
+                                path = omni.client.break_url(child).path
+                                if path and _is_asset_ingested(path):
+                                    protos.append({"name": e.relative_path, "usd_path": path})
+
+                walk(ingested_url)
+                # Sort by name
+                protos.sort(key=lambda d: str(d.get("name") or d.get("usd_path")).lower())
+        except Exception as e:
+            carb.log_warn(f"ScatterBrushPane: failed to enumerate ingested assets: {e}")
 
         self._asset_container.clear()
         with self._asset_container:
@@ -156,23 +188,16 @@ class ScatterBrushPane:
                 return
             with ui.VStack(spacing=ui.Pixel(6)):
                 for rec in protos:
-                    name = str(rec.get("name") or rec.get("uuid") or "asset")
-                    usd_path = rec.get("usd_path") or rec.get("usd") or ""
+                    name = str(rec.get("name") or rec.get("usd_path") or "asset")
+                    usd_path = rec.get("usd_path") or ""
                     if not usd_path:
                         continue
-                    with ui.HStack(height=ui.Pixel(56)):
-                        # Thumbnail
-                        thumb_url = _resolve_thumb(index_dir, rec) if index_dir else None
-                        if thumb_url and Path(thumb_url).exists():
-                            ui.Image(thumb_url, width=ui.Pixel(56), height=ui.Pixel(56))
-                        else:
-                            ui.Rectangle(width=ui.Pixel(56), height=ui.Pixel(56))
+                    with ui.HStack(height=ui.Pixel(48)):
                         with ui.VStack():
                             ui.Label(name)
                             ui.Label(str(usd_path), name="PropertiesWidgetLabel")
                         # Select button
                         def _on_pick(this_usd=usd_path):
-                            # Persist relative to index dir as provided in index json
                             self._on_change(asset_usd_path=str(this_usd))
                         ui.Button("Select", clicked_fn=_on_pick)
 

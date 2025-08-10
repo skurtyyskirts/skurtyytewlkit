@@ -43,6 +43,12 @@ from lightspeed.trex.hotkeys import get_global_hotkey_manager as _get_global_hot
 from pxr import Gf, Sdf, Usd, UsdGeom
 from omni.kit.widget.toolbar.widget_group import WidgetGroup
 
+try:
+    # Optional utility that enforces authoring in mod/replacement layer and creates anchors per mesh
+    from tools.custom import mesh_anchor_resolver as _anchor_resolver  # type: ignore
+except Exception:  # pragma: no cover
+    _anchor_resolver = None  # type: ignore
+
 from .teleport import PointMousePicker  # reuse picker and screen->NDC mapping
 
 if TYPE_CHECKING:
@@ -174,7 +180,10 @@ class ScatterBrush:
         # Settings bridge: allow another extension to set current asset and parameters in carb.settings
         # These keys are intentionally simple; UI agent will write to them.
         self._settings_iface = carb.settings.get_settings()
-        self._settings_prefix = "/exts/lightspeed.trex.scatter_brush"
+        # Read primary settings from the Scatter Brush UI extension settings root to avoid drift
+        # Keep legacy fallback to the older prefix if needed
+        self._settings_prefix_tools = 'exts."lightspeed.trex.tools.scatter_brush"'
+        self._settings_prefix_legacy = "/exts/lightspeed.trex.scatter_brush"
 
         # overlay frame (same pattern as Teleporter) for coordinate conversions if needed later
         self.__viewport_frame = ui.Frame()
@@ -183,6 +192,8 @@ class ScatterBrush:
         self._picker = PointMousePicker(self._viewport_api, self.__viewport_frame, self._on_pick)
         self._last_place_time_ms: int = 0
         self._pending_pick: bool = False
+        self._mouse_was_down: bool = False
+        self._undo_group_open: bool = False
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -229,9 +240,28 @@ class ScatterBrush:
         while True:
             await asyncio.sleep(0.03)
             if not self._active:
+                # Close any open undo group if we became inactive
+                if self._undo_group_open:
+                    with contextlib.suppress(Exception):
+                        omni.kit.undo.end_group()
+                    self._undo_group_open = False
                 continue
+
+            mouse_down = input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) > 0
+            # Manage undo group across press lifecycle
+            if mouse_down and not self._mouse_was_down:
+                with contextlib.suppress(Exception):
+                    omni.kit.undo.begin_group()
+                self._undo_group_open = True
+            elif (not mouse_down) and self._mouse_was_down:
+                if self._undo_group_open:
+                    with contextlib.suppress(Exception):
+                        omni.kit.undo.end_group()
+                    self._undo_group_open = False
+            self._mouse_was_down = mouse_down
+
             # Only act if left mouse button is pressed
-            if input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) <= 0:
+            if not mouse_down:
                 continue
             # Avoid overlapping pick requests
             if self._pending_pick:
@@ -299,25 +329,37 @@ class ScatterBrush:
     def _place_at_world_position(self, world_pos: Gf.Vec3d, picked_path: str):
         stage = self._viewport_api.stage
         # Resolve selected asset from settings; only proceed if present
-        asset_path = self._settings_iface.get_as_string(self._settings_prefix + "/asset_path") or self._settings.asset_path
+        asset_path = (
+            self._settings_iface.get_as_string(self._settings_prefix_tools + ".asset_usd_path")
+            or self._settings_iface.get_as_string(self._settings_prefix_legacy + "/asset_path")
+            or self._settings.asset_path
+        )
         if not asset_path:
             return
         # Ensure asset is ingested (or part of capture, which is always allowed)
         if not _is_asset_ingested(asset_path):
             return
         # Author as PointInstancer under a per-anchor parent; anchor is the mesh hash scope if available
-        with omni.kit.undo.group():
-            # Try to anchor under the picked mesh root; fall back to global parent scope
-            mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+        # Try to anchor under the picked mesh root; fall back to global parent scope
+        mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+        parent_prim: Usd.Prim
+        if _anchor_resolver is not None and picked_path:
+            try:
+                anchor_path = _anchor_resolver.resolve_or_create_anchor_for_hit(str(picked_path), stage=stage)
+                parent_prim = stage.GetPrimAtPath(anchor_path)
+            except Exception:
+                parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
+        else:
             parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
-            parent_to_world = (
-                UsdGeom.Xformable(parent_prim).ComputeParentToWorldTransform(Usd.TimeCode.Default()).GetInverse()
-            )
-            local_translation = parent_to_world.Transform(world_pos)
 
-            # Ensure a PointInstancer exists for the chosen asset
-            pi_prim = self._ensure_point_instancer(parent_prim, asset_path)
-            self._append_instance(pi_prim, local_translation)
+        parent_to_world = (
+            UsdGeom.Xformable(parent_prim).ComputeParentToWorldTransform(Usd.TimeCode.Default()).GetInverse()
+        )
+        local_translation = parent_to_world.Transform(world_pos)
+
+        # Ensure a PointInstancer exists for the chosen asset
+        pi_prim = self._ensure_point_instancer(parent_prim, asset_path)
+        self._append_instance(pi_prim, local_translation)
 
     def _ensure_point_instancer(self, parent_prim: Usd.Prim, asset_path: str) -> Usd.Prim:
         stage = parent_prim.GetStage()
@@ -361,11 +403,27 @@ class ScatterBrush:
         orientations = list(orientations_attr.Get(time_code) or [])
         scales = list(scales_attr.Get(time_code) or [])
 
-        # Compute randomized yaw and scale
-        yaw_min = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_min_deg") or self._settings.random_yaw_min_deg
-        yaw_max = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_max_deg") or self._settings.random_yaw_max_deg
-        scale_min = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_min") or self._settings.uniform_scale_min
-        scale_max = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_max") or self._settings.uniform_scale_max
+        # Compute randomized yaw and scale (support both legacy and UI settings)
+        yaw_min = self._settings_iface.get_as_float(self._settings_prefix_legacy + "/random_yaw_min_deg") or self._settings.random_yaw_min_deg
+        yaw_max = self._settings_iface.get_as_float(self._settings_prefix_legacy + "/random_yaw_max_deg") or self._settings.random_yaw_max_deg
+        # If UI provides a simple random_yaw toggle, use a default range
+        try:
+            random_yaw_enabled = bool(self._settings_iface.get(self._settings_prefix_tools + ".random_yaw"))
+        except Exception:
+            random_yaw_enabled = True
+        if random_yaw_enabled and yaw_min == self._settings.random_yaw_min_deg and yaw_max == self._settings.random_yaw_max_deg:
+            yaw_min, yaw_max = -15.0, 15.0
+
+        scale_min = (
+            self._settings_iface.get_as_float(self._settings_prefix_tools + ".random_scale_min")
+            or self._settings_iface.get_as_float(self._settings_prefix_legacy + "/uniform_scale_min")
+            or self._settings.uniform_scale_min
+        )
+        scale_max = (
+            self._settings_iface.get_as_float(self._settings_prefix_tools + ".random_scale_max")
+            or self._settings_iface.get_as_float(self._settings_prefix_legacy + "/uniform_scale_max")
+            or self._settings.uniform_scale_max
+        )
 
         import random, math
 

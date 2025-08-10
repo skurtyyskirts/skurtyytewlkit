@@ -1,0 +1,8 @@
+<svg id="paint_asset_dark" xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40">
+  <g id="paint_group" transform="translate(2.324 0.412)">
+    <path id="Path_2752" data-name="Path 2752" d="M.659,0H9.881a.659.659,0,0,1,.659.659l-1.317,11.2c-.329,2.531-1.406,4.611-3.952,4.611S1.7,14.434,1.317,11.857L0,.659A.659.659,0,0,1,.659,0Z" transform="translate(26.908 4.957) rotate(45)" fill="#858585"/>
+    <path id="Path_2753" data-name="Path 2753" d="M9.848.8a2.983,2.983,0,0,0,2.3-.736c1.458.794,3.181,2.45,3.181,4.238,0,2.717-1.715,7.323-8.742,9.6-.336.034,8.847-4.094,5.232-11.752A11.684,11.684,0,0,1,6.057,13.974,5.51,5.51,0,0,1,0,13.12c4.079.365,4.632-2.938,4.632-8.82,0-1.617,1.353-3.37,2.787-4.3A5.257,5.257,0,0,0,9.848.8Z" transform="translate(11.257 13.834) rotate(45)" fill="#adadad"/>
+    <line id="Line_532" data-name="Line 532" x1="1.166" y2="10.498" transform="translate(30.505 11.987) rotate(45)" fill="none" stroke="#6f6f6f" stroke-linecap="round" stroke-width="3"/>
+  </g>
+  <rect id="background" width="40" height="40" rx="2" fill="none"/>
+</svg>

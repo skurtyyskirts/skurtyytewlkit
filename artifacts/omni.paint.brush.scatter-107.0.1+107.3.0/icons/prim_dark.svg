@@ -1,0 +1,27 @@
+<svg id="prim_dark" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="96" height="96" viewBox="0 0 96 96">
+  <defs>
+    <linearGradient id="linear-gradient" x1="0.367" y1="0.308" x2="-0.056" y2="0.385" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#0b0b0b" stop-opacity="0.761"/>
+      <stop offset="1" stop-color="#4d4d4d" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="linear-gradient-2" x1="0.743" y1="0.288" x2="0.5" y2="1" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#606060"/>
+      <stop offset="1" stop-color="#212121"/>
+    </linearGradient>
+    <linearGradient id="linear-gradient-3" x1="1" x2="-0.205" y2="1.157" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#a5a5a5"/>
+      <stop offset="1" stop-color="#3e3e3e"/>
+    </linearGradient>
+    <linearGradient id="linear-gradient-4" x1="0.85" y1="0.314" x2="0.254" y2="0.892" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#b4b4b4"/>
+      <stop offset="1" stop-color="#858585"/>
+    </linearGradient>
+  </defs>
+  <rect id="Icon_Base" width="96" height="96" fill="none"/>
+  <g id="Box" transform="translate(0 16.515)">
+    <path id="Path_4985" data-name="Path 4985" d="M28.68-6.781,90.328,7.087,59.693,22.682,1.127,10.865,7.238-3.65Z" transform="translate(-1.127 40.932)" fill="url(#linear-gradient)"/>
+    <path id="Path_2199" data-name="Path 2199" d="M0-.281,32.585,10.526V53.7L0,38.286Z" transform="translate(25.589 10.266)" fill="url(#linear-gradient-2)"/>
+    <path id="Path_2200" data-name="Path 2200" d="M32.585,0,0,10.314V53.74L32.585,38.326Z" transform="translate(58.174 10.226)" fill="url(#linear-gradient-3)"/>
+    <path id="Path_2201" data-name="Path 2201" d="M17.282,13.8-15.3,24.024,17.282,34.6,49.872,24.024Z" transform="translate(40.893 -13.798)" fill="url(#linear-gradient-4)"/>
+  </g>
+</svg>

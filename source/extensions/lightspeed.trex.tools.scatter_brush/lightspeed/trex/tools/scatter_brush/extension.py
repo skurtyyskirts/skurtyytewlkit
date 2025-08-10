@@ -39,7 +39,7 @@ class ScatterBrushExtension(omni.ext.IExt):
         self._subs.append(get_model().subscribe_changed(lambda data: evt_mgr.call_global_custom_event(_SETTINGS_CHANGED_EVENT, data)))
         self._subs.append(get_model().subscribe_toggle(lambda enabled: evt_mgr.call_global_custom_event(_TOGGLED_EVENT, enabled)))
 
-        # Register 'B' hotkey to toggle brush enabled state and try to toggle toolbar button if present
+        # Register a non-conflicting hotkey: prefer Ctrl+Shift+B if free, else B
         def _on_hotkey():
             model = get_model()
             try:
@@ -57,11 +57,28 @@ class ScatterBrushExtension(omni.ext.IExt):
                 # okay if toolbar not present or API changed
                 pass
 
+        # Decide key combination
+        from omni.kit.hotkeys.core import get_hotkey_registry
+        registry = get_hotkey_registry()
+        # Prefer Ctrl+Shift+B if not used
+        ctrl_shift_b = KeyCombination(
+            carb.input.KeyboardInput.B,
+            modifiers=(carb.input.KEYBOARD_MODIFIER_FLAG_CONTROL | carb.input.KEYBOARD_MODIFIER_FLAG_SHIFT),
+        )
+        b_key = KeyCombination(carb.input.KeyboardInput.B)
+        chosen_key = ctrl_shift_b
+        try:
+            in_use = any(h.key == ctrl_shift_b for h in registry.get_all_hotkeys())
+            if in_use:
+                chosen_key = b_key
+        except Exception:
+            chosen_key = ctrl_shift_b
+
         self._hotkey = AppHotkey(
             action_id="trex::Scatter Brush Toggle",
-            key=KeyCombination(carb.input.KeyboardInput.B),
+            key=chosen_key,
             action=_on_hotkey,
-            display_name="Scatter Brush Toggle (B)",
+            display_name="Scatter Brush Toggle",
             description="Toggle Scatter Brush mode",
         )
 

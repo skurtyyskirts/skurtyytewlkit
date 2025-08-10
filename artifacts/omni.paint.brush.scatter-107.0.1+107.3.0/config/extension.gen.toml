@@ -1,0 +1,15 @@
+
+[package]
+    archivePath = "https://d4i3qtqj3r0z5.cloudfront.net/omni.paint.brush.scatter-107.0.1%2B107.3.0.zip"
+
+    [package.target]
+
+        [package.target.kit]
+            0 = "107.3.0"
+
+    [package.publish]
+        kitVersion = "107.3.0+feature.200661.b8584094.gl"
+        date = 1749075665
+        buildNumber = "107.3.0+107.2466.0d48c337.gl"
+        repoName = "paint-system"
+        signed = 1

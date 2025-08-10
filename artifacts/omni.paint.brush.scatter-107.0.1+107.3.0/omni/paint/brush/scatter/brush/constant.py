@@ -1,0 +1,17 @@
+PAINT_TOOL_ROOT_VIEW = "/View/Tools/Paint"
+PAINT_TOOL_ROOT_KIT = "/PaintTool"
+
+CONTROL_HEIGHT = 20
+SWITCH_HEIGHT = 30
+SPINNER_WIDTH = 64
+
+SETTING_TRANSFORM_GIZMO_ENABLED = "/app/transform/gizmoEnabled"
+SETTING_PLACEMENT_MODE_ENABLED = "/physics/placementModeEnabled"
+SETTING_PLACEMENT_MODE_ALLOW_DROP_ON_TRANSFORM_GIZMO_CHANGES = "/physics/placementModeAllowDropOnTransformGizmoChanges"
+SETTING_PLACEMENT_MODE_DROP_SPEED = "/persistent/physics/placementModeDropSpeed"
+SETTING_PLACEMENT_MODE_HIDE_ACTION_BAR = "/physics/placementModeHideActionBar"
+
+# Thumbnail
+THUMBNAIL_SIZE = 256
+THUMBNAIL_SUB_DIR = f"{THUMBNAIL_SIZE}x{THUMBNAIL_SIZE}"
+THUMBNAIL_DIR = f".thumbs/{THUMBNAIL_SUB_DIR}"

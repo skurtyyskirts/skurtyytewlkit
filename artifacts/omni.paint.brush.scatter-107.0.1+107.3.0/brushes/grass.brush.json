@@ -1,0 +1,152 @@
+{
+    "file_version": "104.0.0",
+    "name": "grass",
+    "type": "Scatter",
+    "read_only": false,
+    "assets": [
+        {
+            "path": "https://omniverse-content-production.s3.us-west-2.amazonaws.com/Assets/Vegetation/Shrub/Grass_Short_A.usd",
+            "thumbnail": "",
+            "weight": 0.876596,
+            "enabled": true
+        },
+        {
+            "path": "https://omniverse-content-production.s3.us-west-2.amazonaws.com/Assets/Vegetation/Shrub/Grass_Short_B.usd",
+            "thumbnail": "",
+            "weight": 0.188065,
+            "enabled": true
+        }
+    ],
+    "size": 100.0,
+    "size_ui": {
+        "key": "size",
+        "type": "float", 
+        "label": "Size",
+        "suffix": "cm",
+        "tooltip": "Brush Size (Radius)",
+        "step": 0.1,
+        "min": 1.0,
+        "read_only": false
+    },
+    "falloff": 0,
+    "falloff_ui": {
+        "key": "falloff",
+        "type": "falloff", 
+        "label": "Falloff",
+        "read_only": false
+    },
+    "density": 500.0,
+    "density_ui": {
+        "key": "density",
+        "type": "float", 
+        "label": "Density (per Stamp)",
+        "tooltip": "Max painted assets in a stamp",
+        "read_only": false,
+        "step": 0.1,
+        "min": 0.0
+    },
+    "stamp_spacing": 1.0, 
+    "stamp_spacing_ui": {
+        "key": "stamp_spacing",
+        "type": "float", 
+        "label": "Stamp Interval",
+        "tooltip": "Interval to stamp by in brush distance travelled (cm)",
+        "step": 0.01,
+        "min": 0.01,
+        "max": 1.0,
+        "read_only": false
+    },   
+    "object_padding_enabled": true,
+    "padding_enabled_ui": {
+        "key": "object_padding_enabled",
+        "type": "bool", 
+        "label": "Object Padding",
+        "read_only": false
+    },
+    "object_padding": -100.0,
+    "padding_ui": {
+        "key": "object_padding",
+        "type": "float", 
+        "label": "Padding Size",
+        "suffix": "cm",
+        "tooltip": "Spacing between assets",
+        "step": 0.1,
+        "read_only": false
+    },
+    "vertical_offset": -0.5,
+    "vertical_ui": {
+        "key": "vertical_offset",
+        "type": "float", 
+        "label": "Vertical Offset",
+        "suffix": "cm",
+        "tooltip": "Offsets placed assets on the mesh surface",
+        "step": 0.1,
+        "read_only": false
+    },
+    "conform_to_surface": true,
+    "conform_ui": {
+        "key": "conform_to_surface",
+        "type": "bool", 
+        "label": "Conform to Surface",
+        "tooltip": "Painted assets will conform to mesh surface",
+        "read_only": false
+    },
+    "physics": false,
+    "physics_ui": {
+        "key": "physics",
+        "type": "bool", 
+        "label": "Physics",
+        "tooltip": "Painted assets will have Physics Colliders",
+        "read_only": false
+    },
+    "gravity": false,
+    "gravity_ui": {
+        "key": "gravity",
+        "type": "bool", 
+        "label": "Gravity",
+        "tooltip": "Painted assets will drop as if gravity is being applied to them",
+        "read_only": false
+    },
+    "instancing": "Point Instancing",
+    "instancing_ui": {
+        "key": "instancing",
+        "type": "combo", 
+        "label": "Instancing",
+        "tooltip": "Places assets with selected type",
+        "options": ["Point Instancing", "Instanced Asset", "None"],
+        "read_only": false
+    },
+    "align_to_stroke": 0.0,
+    "stroke_ui": {
+        "key": "align_to_stroke",
+        "type": "float", 
+        "label": "Align To Stroke (Ratio)",
+        "tooltip": "Aligns the rotation of the placed assets to the stroke",
+        "step": 0.01,
+        "min": 0.0,
+        "max": 1.0,
+        "read_only": false
+    },
+    "rotation": {
+        "min": -175.0,
+        "max": 175.0
+    },
+    "rotation_ui": {
+        "key": "rotation",
+        "type": "range", 
+        "label": "Rotation",
+        "tooltip": "Random rotation range of painted assets",
+        "step": 0.01,
+        "read_only": false
+    },
+    "scale": {
+        "enabled": true,
+        "bias": 0.2,
+        "min": 1.0,
+        "max": 1.2,
+        "weight": 0.5
+    },
+    "floodable": true,
+    "lock_selection": true,
+    "erase_enabled": true
+}
