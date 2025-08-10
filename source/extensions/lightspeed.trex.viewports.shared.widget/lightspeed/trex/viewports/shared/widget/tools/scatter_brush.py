@@ -183,6 +183,14 @@ class ScatterBrush:
         self._picker = PointMousePicker(self._viewport_api, self.__viewport_frame, self._on_pick)
         self._last_place_time_ms: int = 0
         self._pending_pick: bool = False
+        # Stroke state
+        self._prev_lmb_down: bool = False
+        self._is_stroking: bool = False
+        # Map (mesh_root_path or "", asset_path) -> list of world positions (Gf.Vec3d)
+        self._stroke_batches: dict[tuple[str, str], list[Gf.Vec3d]] = {}
+        # Randomization captured per stroke
+        self._stroke_rand_params: tuple[float, float, float, float] | None = None
+        self._rand = None
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -229,24 +237,37 @@ class ScatterBrush:
         while True:
             await asyncio.sleep(0.03)
             if not self._active:
+                # ensure stroke ends if tool deactivates while dragging
+                if self._is_stroking:
+                    self._end_stroke()
+                self._prev_lmb_down = False
                 continue
-            # Only act if left mouse button is pressed
-            if input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) <= 0:
-                continue
-            # Avoid overlapping pick requests
-            if self._pending_pick:
-                continue
-            self._pending_pick = True
-            try:
-                # Pick at current mouse position
-                self._picker.pick()
-            finally:
-                # _on_pick will run async context via callback; small delay allows callback to schedule
-                await asyncio.sleep(0)
-                self._pending_pick = False
+
+            is_down = input_interface.get_mouse_value(mouse, carb.input.MouseInput.LEFT_BUTTON) > 0
+
+            # detect stroke begin
+            if is_down and not self._prev_lmb_down:
+                self._begin_stroke()
+
+            # enqueue picks during stroke respecting rate limit and avoiding overlap
+            if is_down:
+                now_ms = int(time.time() * 1000)
+                if not self._pending_pick and (now_ms - self._last_place_time_ms >= self._settings.min_interval_ms):
+                    self._pending_pick = True
+                    try:
+                        self._picker.pick()
+                    finally:
+                        await asyncio.sleep(0)
+                        self._pending_pick = False
+
+            # detect stroke end
+            if not is_down and self._prev_lmb_down:
+                self._end_stroke()
+
+            self._prev_lmb_down = is_down
 
     def _on_pick(self, path: str, position: carb.Double3 | None, _pixels: carb.Uint2):
-        # place object if rate-limited and valid position
+        # enqueue placement if valid position
         if position is None:
             return
         now_ms = int(time.time() * 1000)
@@ -254,9 +275,98 @@ class ScatterBrush:
             return
         self._last_place_time_ms = now_ms
         try:
-            self._place_at_world_position(Gf.Vec3d(position[0], position[1], position[2]), path)
+            self._queue_at_world_position(Gf.Vec3d(position[0], position[1], position[2]), path)
         except Exception:  # noqa
-            carb.log_warn("Scatter brush placement failed")
+            carb.log_warn("Scatter brush placement enqueue failed")
+
+    def _begin_stroke(self):
+        self._is_stroking = True
+        self._stroke_batches.clear()
+        # Capture randomization settings and seed RNG for determinism within the stroke
+        yaw_min = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_min_deg") or self._settings.random_yaw_min_deg
+        yaw_max = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_max_deg") or self._settings.random_yaw_max_deg
+        scale_min = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_min") or self._settings.uniform_scale_min
+        scale_max = self._settings_iface.get_as_float(self._settings_prefix + "/uniform_scale_max") or self._settings.uniform_scale_max
+        self._stroke_rand_params = (yaw_min, yaw_max, scale_min, scale_max)
+        try:
+            seed_val = int(self._settings_iface.get_as_int(self._settings_prefix + "/seed"))
+        except Exception:
+            seed_val = int(time.time() * 1000) & 0xFFFFFFFF
+        import random as _random
+        self._rand = _random.Random(seed_val)
+
+    def _end_stroke(self):
+        self._is_stroking = False
+        if not self._stroke_batches:
+            return
+        # Flush all batched instances to the stage in one undo group and change block
+        with omni.kit.undo.group():
+            with Sdf.ChangeBlock():
+                stage = self._viewport_api.stage
+                for (mesh_root_str, asset_path), world_positions in self._stroke_batches.items():
+                    # Ensure parent prim (anchor under mesh or global group) exists
+                    if mesh_root_str:
+                        parent_prim = self._ensure_anchor_under_mesh(stage, Sdf.Path(mesh_root_str))
+                    else:
+                        parent_prim = self._ensure_group_parent(stage)
+
+                    # Compute local translations from world positions
+                    parent_to_world_inv = (
+                        UsdGeom.Xformable(parent_prim)
+                        .ComputeParentToWorldTransform(Usd.TimeCode.Default())
+                        .GetInverse()
+                    )
+                    local_positions = [Gf.Vec3f(parent_to_world_inv.Transform(p)) for p in world_positions]
+
+                    # Ensure PI exists for asset under parent (and its prototype rel)
+                    pi_prim = self._ensure_point_instancer(parent_prim, asset_path)
+                    pi = UsdGeom.PointInstancer(pi_prim)
+
+                    time_code = Usd.TimeCode.Default()
+                    positions_attr = pi.GetPositionsAttr()
+                    proto_indices_attr = pi.GetProtoIndicesAttr()
+                    orientations_attr = pi.GetOrientationsAttr()
+                    scales_attr = pi.GetScalesAttr()
+                    ids_attr = pi.GetIdsAttr()
+
+                    positions = list(positions_attr.Get(time_code) or [])
+                    proto_indices = list(proto_indices_attr.Get(time_code) or [])
+                    orientations = list(orientations_attr.Get(time_code) or [])
+                    scales = list(scales_attr.Get(time_code) or [])
+                    ids = list(ids_attr.Get(time_code) or [])
+
+                    # Determine starting id
+                    next_id = (max(ids) + 1) if ids else 1
+
+                    # Randomization parameters captured at stroke-begin
+                    yaw_min, yaw_max, scale_min, scale_max = self._stroke_rand_params or (
+                        self._settings.random_yaw_min_deg,
+                        self._settings.random_yaw_max_deg,
+                        self._settings.uniform_scale_min,
+                        self._settings.uniform_scale_max,
+                    )
+                    import math as _math
+
+                    for lp in local_positions:
+                        # Random yaw around Z and uniform scale
+                        yaw_deg = self._rand.uniform(yaw_min, yaw_max) if self._rand else 0.0
+                        yaw_rad = _math.radians(yaw_deg)
+                        q = Gf.Quatf(float(_math.cos(yaw_rad * 0.5)), Gf.Vec3f(0.0, 0.0, float(_math.sin(yaw_rad * 0.5))))
+                        s = self._rand.uniform(scale_min, scale_max) if self._rand else 1.0
+
+                        positions.append(Gf.Vec3f(lp))
+                        proto_indices.append(0)  # single prototype per PI
+                        orientations.append(q)
+                        scales.append(Gf.Vec3f(s, s, s))
+                        ids.append(int(next_id))
+                        next_id += 1
+
+                    # Write arrays once
+                    positions_attr.Set(positions)
+                    proto_indices_attr.Set(proto_indices)
+                    orientations_attr.Set(orientations)
+                    scales_attr.Set(scales)
+                    ids_attr.Set(ids)
 
     def _ensure_group_parent(self, stage: Usd.Stage) -> Usd.Prim:
         # Create (or get) a scope for scatter anchors near the default prim
@@ -319,6 +429,17 @@ class ScatterBrush:
             pi_prim = self._ensure_point_instancer(parent_prim, asset_path)
             self._append_instance(pi_prim, local_translation)
 
+    def _queue_at_world_position(self, world_pos: Gf.Vec3d, picked_path: str):
+        # Resolve selected asset from settings; only proceed if present
+        asset_path = self._settings_iface.get_as_string(self._settings_prefix + "/asset_path") or self._settings.asset_path
+        if not asset_path:
+            return
+        if not _is_asset_ingested(asset_path):
+            return
+        mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+        key = (str(mesh_root) if mesh_root else "", asset_path)
+        self._stroke_batches.setdefault(key, []).append(world_pos)
+
     def _ensure_point_instancer(self, parent_prim: Usd.Prim, asset_path: str) -> Usd.Prim:
         stage = parent_prim.GetStage()
         # One PI per asset to keep arrays simple for MVP. Name derived from asset basename
@@ -358,8 +479,10 @@ class ScatterBrush:
         proto_indices = list(pi.GetProtoIndicesAttr().Get(time_code) or [])
         orientations_attr = pi.GetOrientationsAttr()
         scales_attr = pi.GetScalesAttr()
+        ids_attr = pi.GetIdsAttr()
         orientations = list(orientations_attr.Get(time_code) or [])
         scales = list(scales_attr.Get(time_code) or [])
+        ids = list(ids_attr.Get(time_code) or [])
 
         # Compute randomized yaw and scale
         yaw_min = self._settings_iface.get_as_float(self._settings_prefix + "/random_yaw_min_deg") or self._settings.random_yaw_min_deg
@@ -380,12 +503,16 @@ class ScatterBrush:
         proto_indices.append(0)
         orientations.append(q)
         scales.append(Gf.Vec3f(s, s, s))
+        next_id = (max(ids) + 1) if ids else 1
+        ids.append(int(next_id))
 
-        # Write back arrays
-        pi.GetPositionsAttr().Set(positions)
-        pi.GetProtoIndicesAttr().Set(proto_indices)
-        orientations_attr.Set(orientations)
-        scales_attr.Set(scales)
+        # Write back arrays with a change block to minimize notifications
+        with Sdf.ChangeBlock():
+            pi.GetPositionsAttr().Set(positions)
+            pi.GetProtoIndicesAttr().Set(proto_indices)
+            orientations_attr.Set(orientations)
+            scales_attr.Set(scales)
+            ids_attr.Set(ids)
 
     def _ensure_anchor_under_mesh(self, stage: Usd.Stage, mesh_root: Sdf.Path) -> Usd.Prim:
         """Create or return an anchor Xform under the mesh root in the replacement layer.
