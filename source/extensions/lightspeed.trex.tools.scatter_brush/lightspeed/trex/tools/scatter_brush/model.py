@@ -63,6 +63,11 @@ class ScatterBrushModel:
         gs = self._settings
         gs.set(f"{_SETTINGS_ROOT}.enabled", bool(self._enabled))
         gs.set(f"{_SETTINGS_ROOT}.asset_usd_path", self._data.asset_usd_path)
+        # Back-compat for shared viewport tool that reads legacy prefix
+        try:
+            gs.set("/exts/lightspeed.trex.scatter_brush/asset_path", self._data.asset_usd_path)
+        except Exception:
+            pass
         gs.set(f"{_SETTINGS_ROOT}.brush_radius", float(self._data.brush_radius))
         gs.set(f"{_SETTINGS_ROOT}.spacing", float(self._data.spacing))
         gs.set(f"{_SETTINGS_ROOT}.density", float(self._data.density))
