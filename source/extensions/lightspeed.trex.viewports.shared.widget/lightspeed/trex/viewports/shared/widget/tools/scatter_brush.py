@@ -312,6 +312,35 @@ class ScatterBrush:
             prim = stage.GetPrimAtPath(group_path)
         return prim
 
+    def _ensure_category_under_parent(self, parent_prim: Usd.Prim, category_name: str) -> Usd.Prim:
+        """Create or return a category Scope under the given parent for grouping scattered assets.
+
+        The category name is sanitized into a valid USD path token.
+        """
+        if not category_name:
+            return parent_prim
+        stage = parent_prim.GetStage()
+        # Sanitize to a USD-legal token: letters, digits, and underscores
+        import re
+        token = re.sub(r"[^A-Za-z0-9_]", "_", str(category_name).strip())
+        if not token:
+            return parent_prim
+        # Avoid leading digits for prim names
+        if token[0].isdigit():
+            token = f"cat_{token}"
+        cat_path = parent_prim.GetPath().AppendPath(token)
+        cat_prim = stage.GetPrimAtPath(cat_path)
+        if not cat_prim.IsValid():
+            omni.kit.commands.execute(
+                "CreatePrimCommand",
+                prim_path=str(cat_path),
+                prim_type="Scope",
+                select_new_prim=False,
+                context_name=self._viewport_api.usd_context_name,
+            )
+            cat_prim = stage.GetPrimAtPath(cat_path)
+        return cat_prim
+
     @staticmethod
     def _mesh_root_from_path(prim_path: str) -> Sdf.Path | None:
         import re
@@ -360,6 +389,14 @@ class ScatterBrush:
                 parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
         else:
             parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
+
+        # Optionally group under a category scope for preset-based management
+        try:
+            category = str(self._settings_iface.get(self._settings_prefix_tools + ".category") or "")
+        except Exception:
+            category = ""
+        if category:
+            parent_prim = self._ensure_category_under_parent(parent_prim, category)
 
         parent_to_world = (
             UsdGeom.Xformable(parent_prim).ComputeParentToWorldTransform(Usd.TimeCode.Default()).GetInverse()
@@ -448,11 +485,31 @@ class ScatterBrush:
         orientations.append(q)
         scales.append(Gf.Vec3f(s, s, s))
 
-        # Write back arrays
-        pi.GetPositionsAttr().Set(positions)
-        pi.GetProtoIndicesAttr().Set(proto_indices)
-        orientations_attr.Set(orientations)
-        scales_attr.Set(scales)
+        # Write back arrays via undoable commands
+        omni.kit.commands.execute(
+            "ChangeProperty",
+            prop_path=pi.GetPositionsAttr().GetPath(),
+            value=positions,
+            prev=list(pi.GetPositionsAttr().Get(time_code) or []),
+        )
+        omni.kit.commands.execute(
+            "ChangeProperty",
+            prop_path=pi.GetProtoIndicesAttr().GetPath(),
+            value=proto_indices,
+            prev=list(pi.GetProtoIndicesAttr().Get(time_code) or []),
+        )
+        omni.kit.commands.execute(
+            "ChangeProperty",
+            prop_path=orientations_attr.GetPath(),
+            value=orientations,
+            prev=list(orientations_attr.Get(time_code) or []),
+        )
+        omni.kit.commands.execute(
+            "ChangeProperty",
+            prop_path=scales_attr.GetPath(),
+            value=scales,
+            prev=list(scales_attr.Get(time_code) or []),
+        )
 
     def _ensure_anchor_under_mesh(self, stage: Usd.Stage, mesh_root: Sdf.Path) -> Usd.Prim:
         """Create or return an anchor Xform under the mesh root in the replacement layer.
