@@ -35,6 +35,8 @@ import omni.kit.commands
 import omni.kit.undo
 import omni.ui as ui
 import omni.usd
+import omni.kit.window.cursor as _window_cursor
+from carb.windowing import CursorStandardShape
 from lightspeed.trex.app.style import style
 from lightspeed.common import constants as _constants
 from lightspeed.trex.utils.common.asset_utils import is_asset_ingested as _is_asset_ingested
@@ -196,6 +198,7 @@ class ScatterBrush:
         self._pending_pick: bool = False
         self._mouse_was_down: bool = False
         self._undo_group_open: bool = False
+        self._cursor = _window_cursor.get_main_window_cursor()
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -231,6 +234,14 @@ class ScatterBrush:
 
     def set_active(self, value: bool):
         self._active = bool(value)
+        # Change cursor to CROSS when active, else clear override
+        try:
+            if self._active:
+                self._cursor.override_cursor_shape(CursorStandardShape.CROSS)
+            else:
+                self._cursor.clear_overridden_cursor_shape()
+        except Exception:
+            pass
 
     async def _run_loop(self):
         # periodic sampler; when active and LMB is pressed, request a pick under mouse
