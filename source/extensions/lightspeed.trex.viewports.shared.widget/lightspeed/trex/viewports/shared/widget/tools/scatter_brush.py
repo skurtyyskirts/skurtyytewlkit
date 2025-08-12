@@ -45,6 +45,10 @@ from omni.kit.widget.toolbar.widget_group import WidgetGroup
 from lightspeed.layer_manager.core import LayerManagerCore as _LayerManagerCore
 from lightspeed.layer_manager.core import LayerType as _LayerType
 
+# Material converter utilities for ensuring path-tracer compatible materials
+from omni.flux.utils.material_converter import MaterialConverterCore as _MaterialConverterCore
+from omni.flux.utils.material_converter.utils import SupportedShaderOutputs as _SupportedShaderOutputs
+
 try:
     # Optional utility that enforces authoring in mod/replacement layer and creates anchors per mesh
     from tools.custom import mesh_anchor_resolver as _anchor_resolver  # type: ignore
@@ -395,10 +399,21 @@ class ScatterBrush:
                     prim_path=str(proto_root),
                     reference=Sdf.Reference(assetPath=asset_path),
                 )
+                # Ensure prototype materials are compatible with path tracer (convert if needed)
+                try:
+                    self._ensure_prototype_materials_supported(stage, proto_root)
+                except Exception:
+                    carb.log_warn("ScatterBrush: material compatibility check failed")
             # Bind prototypes rel
             pi_geom = UsdGeom.PointInstancer(pi)
             rel = pi_geom.GetPrototypesRel()
             rel.SetTargets([proto_root])
+            # Ensure primary PI attributes exist for efficient updates
+            pi_geom.CreatePositionsAttr([])
+            pi_geom.CreateOrientationsAttr([])
+            pi_geom.CreateScalesAttr([])
+            pi_geom.CreateProtoIndicesAttr([])
+            pi_geom.CreateIdsAttr([])
         return pi
 
     def _append_instance(self, pi_prim: Usd.Prim, local_translation: Gf.Vec3d) -> None:
@@ -411,6 +426,8 @@ class ScatterBrush:
         scales_attr = pi.GetScalesAttr()
         orientations = list(orientations_attr.Get(time_code) or [])
         scales = list(scales_attr.Get(time_code) or [])
+        ids_attr = pi.GetIdsAttr()
+        ids = list(ids_attr.Get(time_code) or [])
 
         # Compute randomized yaw and scale (support both legacy and UI settings)
         yaw_min = self._settings_iface.get_as_float(self._settings_prefix_legacy + "/random_yaw_min_deg") or self._settings.random_yaw_min_deg
@@ -447,12 +464,17 @@ class ScatterBrush:
         proto_indices.append(0)
         orientations.append(q)
         scales.append(Gf.Vec3f(s, s, s))
+        # Append a stable id to enable efficient Hydra/RTX refits
+        next_id = (max(ids) + 1) if ids else 0
+        ids.append(next_id)
 
-        # Write back arrays
-        pi.GetPositionsAttr().Set(positions)
-        pi.GetProtoIndicesAttr().Set(proto_indices)
-        orientations_attr.Set(orientations)
-        scales_attr.Set(scales)
+        # Batch USD change notifications to minimize Hydra dirtiness propagation during painting
+        with Sdf.ChangeBlock():
+            pi.GetPositionsAttr().Set(positions)
+            pi.GetProtoIndicesAttr().Set(proto_indices)
+            orientations_attr.Set(orientations)
+            scales_attr.Set(scales)
+            ids_attr.Set(ids)
 
     def _ensure_anchor_under_mesh(self, stage: Usd.Stage, mesh_root: Sdf.Path) -> Usd.Prim:
         """Create or return an anchor Xform under the mesh root in the replacement layer.
@@ -482,6 +504,61 @@ class ScatterBrush:
                 usd_context_name=self._viewport_api.usd_context_name,
             )
         return prim
+
+    def _ensure_prototype_materials_supported(self, stage: Usd.Stage, prototype_root_path: Sdf.Path) -> None:
+        """Validate/convert materials under the prototype root to Aperture PBR for Remix path tracer.
+
+        This operates by creating overrides in the current edit layer when the referenced
+        materials are not authored on the layer, so source assets are not modified.
+        """
+        try:
+            from pxr import UsdShade
+        except Exception:
+            return
+
+        proto_root_prim = stage.GetPrimAtPath(prototype_root_path)
+        if not proto_root_prim.IsValid():
+            return
+
+        def choose_output_for_input(shader_id: str | None) -> str | None:
+            if not shader_id:
+                return _SupportedShaderOutputs.APERTURE_PBR_OPACITY.value
+            sid = str(shader_id)
+            if "OmniGlass" in sid:
+                return _SupportedShaderOutputs.APERTURE_PBR_TRANSLUCENT.value
+            # Default to opacity variant for Opaque/Masked
+            return _SupportedShaderOutputs.APERTURE_PBR_OPACITY.value
+
+        for prim in Usd.PrimRange(proto_root_prim):
+            if not prim.IsA(UsdShade.Material):
+                continue
+            try:
+                shader = omni.usd.get_shader_from_material(prim, get_prim=True)
+                shader_id = None
+                if shader and shader.IsValid():
+                    shader_id_attr = UsdShade.Shader(shader).GetIdAttr()
+                    shader_id = shader_id_attr.Get() if shader_id_attr.IsValid() else None
+                output_subidentifier = choose_output_for_input(shader_id)
+                if not output_subidentifier:
+                    continue
+                # Choose converter builder via simple shader id heuristics to avoid blocking with awaits
+                from omni.flux.utils.material_converter.mapping import Converters as _ConvertersEnum
+                if shader_id and "OmniPBR" in str(shader_id):
+                    converter_builder = _ConvertersEnum.OMNI_PBR_TO_APERTURE_PBRCONVERTER_BUILDER.value[0]
+                elif shader_id and "UsdPreviewSurface" in str(shader_id):
+                    converter_builder = _ConvertersEnum.USD_PREVIEW_SURFACE_TO_APERTURE_PBRCONVERTER_BUILDER.value[0]
+                elif shader_id and "OmniGlass" in str(shader_id):
+                    # Glass uses translucent output
+                    converter_builder = _ConvertersEnum.OMNI_GLASS_TO_APERTURE_PBRCONVERTER_BUILDER.value[0]
+                else:
+                    converter_builder = _ConvertersEnum.NONE_TO_APERTURE_PBRCONVERTER_BUILDER.value[0]
+
+                converter = converter_builder().build(prim, output_subidentifier)
+                # Fire and forget conversion in background
+                asyncio.ensure_future(_MaterialConverterCore.convert(self._viewport_api.usd_context_name, converter))
+            except Exception:
+                # Non-fatal; prototypes may already be compatible
+                continue
 
 
 def scatter_brush_factory(desc: dict[str, object]):
