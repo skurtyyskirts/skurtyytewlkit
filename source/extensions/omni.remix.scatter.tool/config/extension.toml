@@ -1,0 +1,14 @@
+[package]
+name = "omni.remix.scatter.tool"
+version = "0.1.0"
+title = "RTX Remix Scatter Tool"
+description = "A tool for scattering ingested assets in RTX Remix."
+authors = ["NVIDIA"]
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.usd" = {}
+"lightspeed.trex.asset_replacements.core.shared" = {}
+
+[python.module]
+"omni.remix.scatter.tool" = {}
