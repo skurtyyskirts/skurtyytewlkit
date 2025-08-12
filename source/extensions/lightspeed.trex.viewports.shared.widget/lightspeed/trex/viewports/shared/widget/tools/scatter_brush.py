@@ -467,6 +467,22 @@ class ScatterBrush:
 
         s = random.uniform(scale_min, scale_max)
 
+        # Position jitter based on brush settings (small radial jitter)
+        try:
+            brush_radius = self._settings_iface.get_as_float(self._settings_prefix_tools + ".brush_radius") or self._settings.radius
+        except Exception:
+            brush_radius = self._settings.radius
+        try:
+            spacing = self._settings_iface.get_as_float(self._settings_prefix_tools + ".spacing") or self._settings.spacing
+        except Exception:
+            spacing = self._settings.spacing
+        jitter_radius = max(0.0, min(float(brush_radius), float(spacing))) * 0.25
+        if jitter_radius > 0.0:
+            r = random.uniform(0.0, jitter_radius)
+            a = random.uniform(0.0, 2.0 * math.pi)
+            # Apply jitter in local X/Y plane (MVP without surface normal)
+            local_translation = Gf.Vec3d(local_translation[0] + r * math.cos(a), local_translation[1] + r * math.sin(a), local_translation[2])
+
         positions.append(Gf.Vec3f(local_translation))
         proto_indices.append(0)
         orientations.append(q)
