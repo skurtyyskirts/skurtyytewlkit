@@ -284,6 +284,7 @@ current_dict.update(
         },
         "Button.Image::teleport": {"image_url": _get_icons("teleport")},
         "Button.Image::scatter_brush": {"image_url": _get_icons("brush"), "color": _WHITE_60},
+        "Button.Image::scatter_brush:checked": {"image_url": _get_icons("brush"), "color": _RED_80},
         "Button.Image::packaging_rollout": {"image_url": _get_icons("categories"), "color": _WHITE_60},
         "Button.Image::ShowValidation": {
             "image_url": _get_icons("v-box"),

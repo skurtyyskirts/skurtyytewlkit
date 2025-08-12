@@ -44,6 +44,8 @@ from pxr import Gf, Sdf, Usd, UsdGeom
 from omni.kit.widget.toolbar.widget_group import WidgetGroup
 from lightspeed.layer_manager.core import LayerManagerCore as _LayerManagerCore
 from lightspeed.layer_manager.core import LayerType as _LayerType
+import omni.kit.window.cursor as _window_cursor
+from carb.windowing import CursorStandardShape
 
 try:
     # Optional utility that enforces authoring in mod/replacement layer and creates anchors per mesh
@@ -134,8 +136,13 @@ class ScatterBrushButtonGroup(WidgetGroup):
             self.__on_toggled.remove(callback)
 
     def get_style(self):
-        # expects a style key Button.Image::scatter_brush (lowercase to match style key)
-        return {f"Button.Image::{self.name}": style.default.get(f"Button.Image::{self.name}", {})}
+        # include base and checked variants so the toolbar reflects active state
+        return {
+            f"Button.Image::{self.name}": style.default.get(f"Button.Image::{self.name}", {}),
+            f"Button.Image::{self.name}:checked": style.default.get(
+                f"Button.Image::{self.name}:checked", {}
+            ),
+        }
 
     def _on_mouse_released(self, _button):
         # toggle state
@@ -196,6 +203,8 @@ class ScatterBrush:
         self._pending_pick: bool = False
         self._mouse_was_down: bool = False
         self._undo_group_open: bool = False
+        self._main_window_cursor = _window_cursor.get_main_window_cursor()
+        self._cursor_override_applied: bool = False
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -215,6 +224,11 @@ class ScatterBrush:
         with contextlib.suppress(Exception):
             if self._task:
                 self._task.cancel()
+        # Ensure cursor override is cleared on destroy
+        with contextlib.suppress(Exception):
+            if self._cursor_override_applied:
+                self._main_window_cursor.clear_overridden_cursor_shape()
+                self._cursor_override_applied = False
 
     # Required for compatibility with scene layer
     @property
@@ -231,6 +245,16 @@ class ScatterBrush:
 
     def set_active(self, value: bool):
         self._active = bool(value)
+        # Update cursor to indicate brush mode when active
+        try:
+            if self._active and not self._cursor_override_applied:
+                self._main_window_cursor.override_cursor_shape(CursorStandardShape.CROSSHAIR)
+                self._cursor_override_applied = True
+            elif (not self._active) and self._cursor_override_applied:
+                self._main_window_cursor.clear_overridden_cursor_shape()
+                self._cursor_override_applied = False
+        except Exception:
+            pass
 
     async def _run_loop(self):
         # periodic sampler; when active and LMB is pressed, request a pick under mouse
