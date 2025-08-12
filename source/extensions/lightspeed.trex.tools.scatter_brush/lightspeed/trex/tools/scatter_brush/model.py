@@ -110,6 +110,48 @@ class ScatterBrushModel:
     def subscribe_toggle(self, fn: Callable[[bool], None]) -> EventSubscription:
         return EventSubscription(self._on_toggle, fn)
 
+    # Presets helpers (stored as JSON dict under settings key)
+    def _load_presets_dict(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            raw = self._settings.get(f"{_SETTINGS_ROOT}.presets_json") or "{}"
+            import json
+            return dict(json.loads(str(raw)))
+        except Exception:
+            return {}
+
+    def _save_presets_dict(self, presets: Dict[str, Dict[str, Any]]):
+        try:
+            import json
+            self._settings.set(f"{_SETTINGS_ROOT}.presets_json", json.dumps(presets))
+        except Exception:
+            pass
+
+    def list_presets(self) -> List[str]:
+        return sorted(self._load_presets_dict().keys())
+
+    def save_preset(self, name: str) -> None:
+        name = (name or "").strip()
+        if not name:
+            return
+        presets = self._load_presets_dict()
+        presets[name] = self._data.to_dict()
+        self._save_presets_dict(presets)
+
+    def load_preset(self, name: str) -> bool:
+        presets = self._load_presets_dict()
+        cfg = presets.get(name)
+        if not cfg:
+            return False
+        # Only update known fields
+        self.update(**{k: v for k, v in cfg.items() if hasattr(self._data, k)})
+        return True
+
+    def delete_preset(self, name: str) -> None:
+        presets = self._load_presets_dict()
+        if name in presets:
+            del presets[name]
+            self._save_presets_dict(presets)
+
     # Prototypes index helpers
     def get_prototypes_index_path(self) -> Optional[Path]:
         raw = self._settings.get(f"{_SETTINGS_ROOT}.prototypes_index")

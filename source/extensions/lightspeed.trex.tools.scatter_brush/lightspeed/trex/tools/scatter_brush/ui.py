@@ -24,6 +24,10 @@ class ScatterBrushPane:
         self._model = get_model()
         self._window: Optional[ui.Window] = None
         self._asset_container: Optional[ui.Widget] = None
+        self._preset_combo_model: Optional[ui.SimpleIntModel] = None
+        self._preset_names: List[str] = []
+        self._asset_list: List[Dict[str, Any]] = []
+        self._asset_combo_model: Optional[ui.SimpleIntModel] = None
         self._build_ui()
 
     def _build_ui(self):
@@ -57,12 +61,10 @@ class ScatterBrushPane:
                                     self._build_content()
 
     def _build_content(self):
-        # Asset picker
+        # Asset section
         with ui.VStack(spacing=ui.Pixel(6)):
             ui.Label("Asset", name="PropertiesWidgetLabel")
-            self._asset_container = ui.VStack()
-            with self._asset_container:
-                self._rebuild_assets()
+            self._build_asset_dropdown()
 
         ui.Spacer(height=ui.Pixel(8))
         ui.Line(name="PropertiesPaneSectionTitle")
@@ -137,20 +139,122 @@ class ScatterBrushPane:
             combo = ui.ComboBox(combo_model, *names)
             combo_model.add_value_changed_fn(_on_combo_changed)
 
-    def _rebuild_assets(self):
-        def _resolve_thumb(index_dir: Path, record: Dict[str, Any]) -> Optional[str]:
-            thumb = record.get("thumbnail_128") or record.get("thumbnail")
-            if not thumb:
-                return None
-            p = Path(thumb)
-            if not p.is_absolute():
-                p = index_dir / p
-            return str(p)
+        ui.Spacer(height=ui.Pixel(8))
+        ui.Line(name="PropertiesPaneSectionTitle")
 
-        # Enumerate only ingested USDs within the current project
+        # Presets controls
+        with ui.VStack(spacing=ui.Pixel(6)):
+            ui.Label("Presets", name="PropertiesWidgetLabel")
+            with ui.HStack(spacing=ui.Pixel(6)):
+                # Preset dropdown
+                self._preset_names = self._model.list_presets()
+                initial_idx = 0 if self._preset_names else -1
+                self._preset_combo_model = ui.SimpleIntModel(max(0, initial_idx))
+                self._preset_combo = ui.ComboBox(self._preset_combo_model, *(self._preset_names or ["<none>"]))
+                # Buttons
+                def _save():
+                    # Prompt text field inline for name
+                    def _commit(name_field_model):
+                        name = name_field_model.get_value_as_string()
+                        if name:
+                            self._model.save_preset(name)
+                            self._refresh_preset_dropdown(select=name)
+                    name_field = ui.StringField(height=ui.Pixel(20), style_type_name_override="Field")
+                    name_field.model.add_end_edit_fn(_commit)
+                ui.Button("Save", clicked_fn=_save)
+
+                def _load():
+                    idx = int(self._preset_combo_model.get_value_as_int())
+                    name = self._preset_names[idx] if 0 <= idx < len(self._preset_names) else None
+                    if name:
+                        self._model.load_preset(name)
+                ui.Button("Load", clicked_fn=_load)
+
+                def _delete():
+                    idx = int(self._preset_combo_model.get_value_as_int())
+                    name = self._preset_names[idx] if 0 <= idx < len(self._preset_names) else None
+                    if name:
+                        self._model.delete_preset(name)
+                        self._refresh_preset_dropdown()
+                ui.Button("Delete", clicked_fn=_delete)
+
+    def _refresh_preset_dropdown(self, select: Optional[str] = None):
+        self._preset_names = self._model.list_presets()
+        # Rebuild combobox items
+        if self._preset_combo_model is None:
+            return
+        # Find selection index
+        sel_idx = 0
+        if select and select in self._preset_names:
+            sel_idx = self._preset_names.index(select)
+        self._preset_combo_model.set_value(sel_idx if self._preset_names else 0)
+        # Replace ComboBox items by recreating it inside a transient frame
+        # Simpler approach: rebuild the whole content would also work, but avoid flicker.
+        # Find parent container from current layout and replace widget
+        # For brevity, we do a simple rebuild of the panel.
+        self._window.frame.clear()
+        with self._window.frame:
+            with ui.ZStack():
+                ui.Rectangle(name="WorkspaceBackground")
+                with ui.ScrollingFrame(name="PropertiesPaneSection", horizontal_scrollbar_policy=ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_OFF):
+                    with ui.VStack(spacing=ui.Pixel(8)):
+                        ui.Spacer(height=ui.Pixel(8))
+                        with ui.HStack():
+                            ui.Spacer(width=ui.Pixel(8))
+                            with ui.VStack(spacing=ui.Pixel(8)):
+                                coll = PropertyCollapsableFrameWithInfoPopup(
+                                    self.TITLE,
+                                    info_text=(
+                                        "Paint-scatter pre-ingested assets onto surfaces.\n\n"
+                                        "- Use the toolbar toggle or 'B' to activate brush mode.\n"
+                                        "- Settings persist across sessions.\n"
+                                    ),
+                                    collapsed=False,
+                                )
+                                with coll:
+                                    self._build_content()
+
+    def _build_asset_dropdown(self):
+        # Source assets from toolkit list (tools/custom/paintable_assets.py)
+        try:
+            from tools.custom.paintable_assets import list_paintable_assets
+            assets = list_paintable_assets()
+        except Exception as e:
+            carb.log_warn(f"ScatterBrushPane: failed to query paintable assets: {e}")
+            assets = []
+        self._asset_list = [
+            {
+                "name": a.display_name,
+                "usd_path": a.usd_path,
+                "thumb": a.thumbnail_path,
+            }
+            for a in assets
+        ]
+        # Fallback to ingested USD enumeration if toolkit returned nothing
+        if not self._asset_list:
+            self._asset_list = self._enumerate_ingested_usds()
+
+        # Build a simple dropdown for selection by name
+        names = [str(a.get("name") or a.get("usd_path") or "asset") for a in self._asset_list]
+        # Try to select current model asset if present
+        selected_index = 0
+        if self._model.data.asset_usd_path:
+            for i, a in enumerate(self._asset_list):
+                if str(a.get("usd_path")) == str(self._model.data.asset_usd_path):
+                    selected_index = i
+                    break
+        self._asset_combo_model = ui.SimpleIntModel(selected_index if names else 0)
+        def _on_asset_changed(m):
+            idx = int(m.get_value_as_int())
+            if 0 <= idx < len(self._asset_list):
+                usd = self._asset_list[idx].get("usd_path")
+                if usd:
+                    self._on_change(asset_usd_path=str(usd))
+        ui.ComboBox(self._asset_combo_model, *(names or ["<no assets>"]))
+        self._asset_combo_model.add_value_changed_fn(_on_asset_changed)
+
+    def _enumerate_ingested_usds(self) -> List[Dict[str, Any]]:
         protos: List[Dict[str, Any]] = []
-        index_dir = None
-
         try:
             import omni.usd
             ctx = omni.usd.get_context()
@@ -170,36 +274,14 @@ class ScatterBrushPane:
                         elif e.flags & omni.client.ItemFlags.READABLE_FILE:
                             lower = e.relative_path.lower()
                             if any(lower.endswith(ext) for ext in _constants.USD_EXTENSIONS):
-                                # Convert URL to local path, if possible
                                 path = omni.client.break_url(child).path
                                 if path and _is_asset_ingested(path):
                                     protos.append({"name": e.relative_path, "usd_path": path})
-
                 walk(ingested_url)
-                # Sort by name
                 protos.sort(key=lambda d: str(d.get("name") or d.get("usd_path")).lower())
         except Exception as e:
-            carb.log_warn(f"ScatterBrushPane: failed to enumerate ingested assets: {e}")
-
-        self._asset_container.clear()
-        with self._asset_container:
-            if not protos:
-                ui.Label("No pre-ingested assets found.")
-                return
-            with ui.VStack(spacing=ui.Pixel(6)):
-                for rec in protos:
-                    name = str(rec.get("name") or rec.get("usd_path") or "asset")
-                    usd_path = rec.get("usd_path") or ""
-                    if not usd_path:
-                        continue
-                    with ui.HStack(height=ui.Pixel(48)):
-                        with ui.VStack():
-                            ui.Label(name)
-                            ui.Label(str(usd_path), name="PropertiesWidgetLabel")
-                        # Select button
-                        def _on_pick(this_usd=usd_path):
-                            self._on_change(asset_usd_path=str(this_usd))
-                        ui.Button("Select", clicked_fn=_on_pick)
+            carb.log_warn(f"ScatterBrushPane: fallback enumeration failed: {e}")
+        return protos
 
     def _on_change(self, **kwargs):
         self._model.update(**kwargs)
