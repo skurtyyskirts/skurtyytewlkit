@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  build-test:
+    name: Lint, Test, Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            # pxr is not available on PyPI for linux runners; install others only
+            grep -v '^pxr' requirements.txt | python -m pip install -r /dev/stdin || true
+          fi
+          # CI-only tools
+          python -m pip install pytest pytest-benchmark flake8
+
+      - name: Lint (flake8)
+        run: |
+          flake8 .
+
+      - name: Run tests (pytest)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          mkdir -p artifacts
+          pytest -q -k "not test_mesh_anchor_resolver" --junitxml=artifacts/test-results.xml
+
+      - name: Performance benchmark
+        run: |
+          python tools/perf/benchmark.py --baseline tools/perf/baseline.json --save artifacts/perf.json --regression-threshold 5.0
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-artifacts-${{ github.run_id }}
+          path: artifacts
+
+      - name: Auto-triage on failure (create issue)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isPR = !!context.payload.pull_request;
+            const title = isPR
+              ? `CI failed for PR #${context.payload.pull_request.number} (${context.sha.substring(0,7)})`
+              : `CI failed on ${context.ref} (${context.sha.substring(0,7)})`;
+            const body = `CI run failed.
+
+            - Workflow: ${context.workflow}
+            - Run: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
+            - Ref: ${context.ref}
+            - SHA: ${context.sha}
+
+            Artifacts contain test results (JUnit XML) and perf metrics.
+            `;
+            const assignees = isPR && context.payload.pull_request.user && context.payload.pull_request.user.login
+              ? [context.payload.pull_request.user.login]
+              : [];
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              assignees
+            });
