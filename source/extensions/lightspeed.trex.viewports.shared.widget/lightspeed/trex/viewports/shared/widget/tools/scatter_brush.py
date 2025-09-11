@@ -44,6 +44,8 @@ from pxr import Gf, Sdf, Usd, UsdGeom
 from omni.kit.widget.toolbar.widget_group import WidgetGroup
 from lightspeed.layer_manager.core import LayerManagerCore as _LayerManagerCore
 from lightspeed.layer_manager.core import LayerType as _LayerType
+from omni.kit.notification_manager import NotificationStatus, post_notification
+import omni.client
 
 try:
     # Optional utility that enforces authoring in mod/replacement layer and creates anchors per mesh
@@ -55,6 +57,10 @@ from .teleport import PointMousePicker  # reuse picker and screen->NDC mapping
 
 if TYPE_CHECKING:
     from omni.kit.widget.viewport.api import ViewportAPI
+
+
+# Heuristic distance to consider a hit as "sky" or otherwise too far to be meaningful
+MAX_PICK_DISTANCE = 1.0e5
 
 
 @dataclass
@@ -281,6 +287,9 @@ class ScatterBrush:
         # place object if rate-limited and valid position
         if position is None:
             return
+        # Ignore clearly invalid picks (no path)
+        if not path:
+            return
         now_ms = int(time.time() * 1000)
         if now_ms - self._last_place_time_ms < self._settings.min_interval_ms:
             return
@@ -328,6 +337,22 @@ class ScatterBrush:
             try_path = try_path.GetParentPath()
         return None
 
+    def _is_invalid_category_target(self, stage: Usd.Stage, mesh_root: Sdf.Path) -> bool:
+        """Return True if the mesh root or its immediate prim has a category that should be ignored."""
+        prim = stage.GetPrimAtPath(mesh_root)
+        if not prim or not prim.IsValid():
+            return True
+        invalid_attrs = [
+            _constants.REMIX_CATEGORIES["World UI"]["attr"],
+            _constants.REMIX_CATEGORIES["Sky"]["attr"],
+            _constants.REMIX_CATEGORIES["Ignore"]["attr"],
+        ]
+        for attr_name in invalid_attrs:
+            attr = prim.GetAttribute(attr_name)
+            if attr.IsValid() and bool(attr.Get()):
+                return True
+        return False
+
     def _place_at_world_position(self, world_pos: Gf.Vec3d, picked_path: str):
         stage = self._viewport_api.stage
         # Resolve selected asset from settings; only proceed if present
@@ -340,7 +365,31 @@ class ScatterBrush:
             return
         # Ensure asset is ingested (or part of capture, which is always allowed)
         if not _is_asset_ingested(asset_path):
+            post_notification("Scatter Brush: Selected asset is not ingested or invalid.", status=NotificationStatus.WARNING)
             return
+
+        # Ignore far-away hits (likely sky)
+        try:
+            cam_path = self._viewport_api.camera_path
+            if cam_path:
+                cam_prim = UsdGeom.Camera(stage.GetPrimAtPath(cam_path))
+                if cam_prim:
+                    cam_xf = cam_prim.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                    cam_pos = cam_xf.ExtractTranslation()
+                    import math as _math
+
+                    if _math.dist(cam_pos, world_pos) > MAX_PICK_DISTANCE:
+                        return
+        except Exception:
+            pass
+
+        # Only allow scatter on captured meshes. If invalid, ignore event.
+        mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+        if mesh_root is None:
+            return
+        if self._is_invalid_category_target(stage, mesh_root):
+            return
+
         # Ensure we are authoring on the replacement (mod) layer to avoid capture edits
         try:
             _LayerManagerCore(self._viewport_api.usd_context_name).set_edit_target_layer(
@@ -348,18 +397,17 @@ class ScatterBrush:
             )
         except Exception:
             pass
-        # Author as PointInstancer under a per-anchor parent; anchor is the mesh hash scope if available
-        # Try to anchor under the picked mesh root; fall back to global parent scope
-        mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+
+        # Author as PointInstancer under a per-anchor parent beneath the picked mesh
         parent_prim: Usd.Prim
         if _anchor_resolver is not None and picked_path:
             try:
                 anchor_path = _anchor_resolver.resolve_or_create_anchor_for_hit(str(picked_path), stage=stage)
                 parent_prim = stage.GetPrimAtPath(anchor_path)
             except Exception:
-                parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
+                parent_prim = self._ensure_anchor_under_mesh(stage, mesh_root)
         else:
-            parent_prim = self._ensure_group_parent(stage) if mesh_root is None else self._ensure_anchor_under_mesh(stage, mesh_root)
+            parent_prim = self._ensure_anchor_under_mesh(stage, mesh_root)
 
         parent_to_world = (
             UsdGeom.Xformable(parent_prim).ComputeParentToWorldTransform(Usd.TimeCode.Default()).GetInverse()
@@ -368,10 +416,25 @@ class ScatterBrush:
 
         # Ensure a PointInstancer exists for the chosen asset
         pi_prim = self._ensure_point_instancer(parent_prim, asset_path)
-        self._append_instance(pi_prim, local_translation)
+        self._append_instance(pi_prim, local_translation, parent_prim, picked_path, world_pos)
 
     def _ensure_point_instancer(self, parent_prim: Usd.Prim, asset_path: str) -> Usd.Prim:
         stage = parent_prim.GetStage()
+
+        # Validate referenced asset exists before creating PI/prototype
+        try:
+            url = omni.client.normalize_url(asset_path)
+            res, _info = omni.client.stat(url)
+            if res != omni.client.Result.OK:
+                post_notification(
+                    f"Scatter Brush: Cannot reference asset. File not found: {asset_path}",
+                    status=NotificationStatus.ERROR,
+                )
+                raise RuntimeError("Asset not found")
+        except Exception:
+            # If normalize/stat fails for any reason, avoid creating broken references
+            raise
+
         # One PI per asset to keep arrays simple for MVP. Name derived from asset basename
         asset_name = str(asset_path).split("/")[-1].split(".")[0]
         pi_path = parent_prim.GetPath().AppendPath(f"PI_{asset_name}")
@@ -389,19 +452,39 @@ class ScatterBrush:
                     context_name=self._viewport_api.usd_context_name,
                 )
                 # Add reference to asset
-                omni.kit.commands.execute(
+                success, _ = omni.kit.commands.execute(
                     "AddReference",
                     stage=stage,
                     prim_path=str(proto_root),
                     reference=Sdf.Reference(assetPath=asset_path),
                 )
+                if not success:
+                    post_notification(
+                        "Scatter Brush: Failed to add reference to asset. The USD may be invalid or missing dependencies.",
+                        status=NotificationStatus.ERROR,
+                    )
+                    # Clean up the created proto xform to avoid dangling prims
+                    with contextlib.suppress(Exception):
+                        omni.kit.commands.execute(
+                            "DeletePrimsCommand",
+                            paths=[str(proto_root)],
+                            context_name=self._viewport_api.usd_context_name,
+                        )
+                    raise RuntimeError("Failed to reference asset")
             # Bind prototypes rel
             pi_geom = UsdGeom.PointInstancer(pi)
             rel = pi_geom.GetPrototypesRel()
             rel.SetTargets([proto_root])
         return pi
 
-    def _append_instance(self, pi_prim: Usd.Prim, local_translation: Gf.Vec3d) -> None:
+    def _append_instance(
+        self,
+        pi_prim: Usd.Prim,
+        local_translation: Gf.Vec3d,
+        parent_prim: Usd.Prim,
+        picked_path: str,
+        world_pos: Gf.Vec3d,
+    ) -> None:
         pi = UsdGeom.PointInstancer(pi_prim)
         time_code = Usd.TimeCode.Default()
         # Read existing arrays
@@ -438,8 +521,51 @@ class ScatterBrush:
 
         yaw_deg = random.uniform(yaw_min, yaw_max)
         yaw_rad = math.radians(yaw_deg)
-        # Quaternion around Z for MVP (assuming up=Z in Remix capture)
-        q = Gf.Quatf(float(math.cos(yaw_rad * 0.5)), Gf.Vec3f(0.0, 0.0, float(math.sin(yaw_rad * 0.5))))
+
+        # Determine orientation: optionally align to an estimated surface normal
+        try:
+            align_enabled = bool(self._settings_iface.get(self._settings_prefix_tools + ".align_to_normals"))
+        except Exception:
+            align_enabled = self._settings.align_to_normal
+        max_angle = (
+            self._settings_iface.get_as_float(self._settings_prefix_tools + ".max_surface_angle_deg")
+            or 90.0
+        )
+
+        # Default normal is world up
+        normal_world = Gf.Vec3d(0.0, 0.0, 1.0)
+        mesh_root = self._mesh_root_from_path(picked_path) if picked_path else None
+        if mesh_root is not None:
+            # Use the mesh root transform's +Z as a proxy for surface normal
+            try:
+                mesh_prim = parent_prim.GetStage().GetPrimAtPath(mesh_root)
+                xf = UsdGeom.Xformable(mesh_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                normal_world = xf.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
+                if normal_world.GetLength() > 0:
+                    normal_world = normal_world.GetNormalized()
+                else:
+                    normal_world = Gf.Vec3d(0.0, 0.0, 1.0)
+            except Exception:
+                normal_world = Gf.Vec3d(0.0, 0.0, 1.0)
+
+        # Reject surfaces steeper than the max angle relative to world up
+        try:
+            dot = max(-1.0, min(1.0, float(Gf.Dot(normal_world, Gf.Vec3d(0.0, 0.0, 1.0)))))
+            angle_deg = math.degrees(math.acos(dot))
+            if angle_deg > max_angle:
+                return
+        except Exception:
+            pass
+
+        if align_enabled:
+            # Rotate +Z to normal_world, then apply random twist about the normal
+            base_rot = Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), normal_world).GetQuat()
+            twist_rot = Gf.Rotation(normal_world, yaw_deg if random_yaw_enabled else 0.0).GetQuat()
+            qd = twist_rot * base_rot  # Quatd
+            q = Gf.Quatf(float(qd.GetReal()), Gf.Vec3f(qd.GetImaginary()[0], qd.GetImaginary()[1], qd.GetImaginary()[2]))
+        else:
+            # Quaternion around Z for MVP (assuming up=Z in Remix capture)
+            q = Gf.Quatf(float(math.cos(yaw_rad * 0.5)), Gf.Vec3f(0.0, 0.0, float(math.sin(yaw_rad * 0.5))))
 
         s = random.uniform(scale_min, scale_max)
 
