@@ -1,0 +1,6 @@
+{
+  "iterations": 1000000,
+  "runs": 5,
+  "durations_sec": [0.0],
+  "median_sec": 0.25
+}
