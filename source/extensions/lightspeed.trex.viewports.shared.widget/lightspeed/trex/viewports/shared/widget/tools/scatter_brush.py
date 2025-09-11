@@ -38,6 +38,16 @@ import omni.usd
 from lightspeed.trex.app.style import style
 from lightspeed.common import constants as _constants
 from lightspeed.trex.utils.common.asset_utils import is_asset_ingested as _is_asset_ingested
+# Allow ingestion check on omni.client URLs by normalizing to local path when possible
+def _is_ingested_url_or_path(path_or_url: str) -> bool:
+    try:
+        import omni.client as _oc  # type: ignore
+        br = _oc.break_url(path_or_url)
+        if br.path:
+            return _is_asset_ingested(br.path)
+    except Exception:
+        pass
+    return _is_asset_ingested(path_or_url)
 from lightspeed.trex.hotkeys import TrexHotkeyEvent
 from lightspeed.trex.hotkeys import get_global_hotkey_manager as _get_global_hotkey_manager
 from pxr import Gf, Sdf, Usd, UsdGeom
@@ -339,7 +349,7 @@ class ScatterBrush:
         if not asset_path:
             return
         # Ensure asset is ingested (or part of capture, which is always allowed)
-        if not _is_asset_ingested(asset_path):
+        if not _is_ingested_url_or_path(asset_path):
             return
         # Ensure we are authoring on the replacement (mod) layer to avoid capture edits
         try:
@@ -389,6 +399,7 @@ class ScatterBrush:
                     context_name=self._viewport_api.usd_context_name,
                 )
                 # Add reference to asset
+                # Resolve omni.client URL to assetPath directly; Sdf.Reference accepts URLs
                 omni.kit.commands.execute(
                     "AddReference",
                     stage=stage,

@@ -21,6 +21,7 @@ __all__ = [
     "is_layer_from_capture",
     "is_mesh_from_capture",
     "is_texture_from_capture",
+    "list_ingested_usd_assets",
 ]
 
 from pathlib import Path
@@ -88,3 +89,50 @@ def is_texture_from_capture(texture_path: str) -> bool:
         bool(constants.CAPTURE_FOLDER in path.parts or constants.REMIX_CAPTURE_FOLDER in path.parts)
         and constants.TEXTURES_FOLDER in path.parts
     )
+
+
+def list_ingested_usd_assets(context_name: str = "") -> list[tuple[str, str]]:
+    """
+    Return a list of (display_name, url) for all ingested USD assets in the current project.
+
+    - Uses the active stage URL to determine the project root
+    - Scans under `assets/ingested` recursively
+    - Filters by USD extensions and validates that the asset is ingested via metadata
+    """
+    try:
+        import omni.client  # type: ignore
+        import omni.usd  # type: ignore
+    except Exception:  # pragma: no cover - available in Kit
+        return []
+
+    ctx = omni.usd.get_context(context_name)
+    stage_url = ctx.get_stage_url()
+    if not stage_url:
+        return []
+
+    root_url = omni.client.normalize_url(str(omni.client.Uri(stage_url).get_dirname()))
+    ingested_url = omni.client.combine_urls(root_url, constants.REMIX_INGESTED_ASSETS_FOLDER)
+
+    results: list[tuple[str, str]] = []
+
+    def walk(url: str):
+        res, entries = omni.client.list(url)
+        if res != omni.client.Result.OK:
+            return
+        for e in entries:
+            child = omni.client.combine_urls(url, e.relative_path)
+            if e.flags & omni.client.ItemFlags.CAN_HAVE_CHILDREN:
+                walk(child)
+            elif e.flags & omni.client.ItemFlags.READABLE_FILE:
+                lower = e.relative_path.lower()
+                if any(lower.endswith(ext) for ext in constants.USD_EXTENSIONS):
+                    if is_asset_ingested(child):
+                        results.append((e.relative_path, child))
+
+    try:
+        walk(ingested_url)
+    except Exception:  # pragma: no cover
+        return []
+
+    results.sort(key=lambda t: t[0].lower())
+    return results

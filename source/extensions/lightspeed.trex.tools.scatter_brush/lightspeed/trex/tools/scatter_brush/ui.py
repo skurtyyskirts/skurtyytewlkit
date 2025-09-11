@@ -10,6 +10,7 @@ import omni.ui as ui
 from lightspeed.common import constants as _constants
 import omni.client
 from lightspeed.trex.utils.common.asset_utils import is_asset_ingested as _is_asset_ingested
+from lightspeed.trex.utils.common.asset_utils import list_ingested_usd_assets as _list_ingested_usd_assets
 from omni.flux.utils.widget.collapsable_frame import PropertyCollapsableFrameWithInfoPopup
 
 from .model import get_model
@@ -138,68 +139,35 @@ class ScatterBrushPane:
             combo_model.add_value_changed_fn(_on_combo_changed)
 
     def _rebuild_assets(self):
-        def _resolve_thumb(index_dir: Path, record: Dict[str, Any]) -> Optional[str]:
-            thumb = record.get("thumbnail_128") or record.get("thumbnail")
-            if not thumb:
-                return None
-            p = Path(thumb)
-            if not p.is_absolute():
-                p = index_dir / p
-            return str(p)
-
-        # Enumerate only ingested USDs within the current project
-        protos: List[Dict[str, Any]] = []
-        index_dir = None
-
+        # Use common helper to enumerate ingested assets in the project
         try:
-            import omni.usd
-            ctx = omni.usd.get_context()
-            stage_url = ctx.get_stage_url()
-            if stage_url:
-                root_url = omni.client.normalize_url(str(omni.client.Uri(stage_url).get_dirname()))
-                ingested_url = omni.client.combine_urls(root_url, _constants.REMIX_INGESTED_ASSETS_FOLDER)
-
-                def walk(url: str):
-                    res, entries = omni.client.list(url)
-                    if res != omni.client.Result.OK:
-                        return
-                    for e in entries:
-                        child = omni.client.combine_urls(url, e.relative_path)
-                        if e.flags & omni.client.ItemFlags.CAN_HAVE_CHILDREN:
-                            walk(child)
-                        elif e.flags & omni.client.ItemFlags.READABLE_FILE:
-                            lower = e.relative_path.lower()
-                            if any(lower.endswith(ext) for ext in _constants.USD_EXTENSIONS):
-                                # Convert URL to local path, if possible
-                                path = omni.client.break_url(child).path
-                                if path and _is_asset_ingested(path):
-                                    protos.append({"name": e.relative_path, "usd_path": path})
-
-                walk(ingested_url)
-                # Sort by name
-                protos.sort(key=lambda d: str(d.get("name") or d.get("usd_path")).lower())
+            entries = _list_ingested_usd_assets()
         except Exception as e:
             carb.log_warn(f"ScatterBrushPane: failed to enumerate ingested assets: {e}")
+            entries = []
 
         self._asset_container.clear()
         with self._asset_container:
-            if not protos:
+            if not entries:
                 ui.Label("No pre-ingested assets found.")
                 return
-            with ui.VStack(spacing=ui.Pixel(6)):
-                for rec in protos:
-                    name = str(rec.get("name") or rec.get("usd_path") or "asset")
-                    usd_path = rec.get("usd_path") or ""
-                    if not usd_path:
-                        continue
-                    with ui.HStack(height=ui.Pixel(48)):
-                        with ui.VStack():
-                            ui.Label(name)
-                            ui.Label(str(usd_path), name="PropertiesWidgetLabel")
-                        # Select button
-                        def _on_pick(this_usd=usd_path):
-                            self._on_change(asset_usd_path=str(this_usd))
-                        ui.Button("Select", clicked_fn=_on_pick)
+            with ui.HStack(spacing=ui.Pixel(8)):
+                ui.Label("Ingested Asset", name="PropertiesWidgetLabel", width=ui.Percent(40))
+                names = [n for (n, _u) in entries]
+                urls = [u for (_n, u) in entries]
+                # Determine initial selection based on current model setting
+                current = self._model.data.asset_usd_path
+                try:
+                    initial_index = urls.index(current) if current in urls else 0
+                except Exception:
+                    initial_index = 0
+                model = ui.SimpleIntModel(initial_index)
+                def _on_changed(m):
+                    idx = int(m.get_value_as_int())
+                    if 0 <= idx < len(urls):
+                        self._on_change(asset_usd_path=str(urls[idx]))
+                combo = ui.ComboBox(model, *names)
+                model.add_value_changed_fn(_on_changed)
 
     def _on_change(self, **kwargs):
         self._model.update(**kwargs)
