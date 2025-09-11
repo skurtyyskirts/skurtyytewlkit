@@ -44,6 +44,8 @@ from pxr import Gf, Sdf, Usd, UsdGeom
 from omni.kit.widget.toolbar.widget_group import WidgetGroup
 from lightspeed.layer_manager.core import LayerManagerCore as _LayerManagerCore
 from lightspeed.layer_manager.core import LayerType as _LayerType
+import omni.kit.window.cursor as _window_cursor
+from carb.windowing import CursorStandardShape
 
 try:
     # Optional utility that enforces authoring in mod/replacement layer and creates anchors per mesh
@@ -134,8 +136,13 @@ class ScatterBrushButtonGroup(WidgetGroup):
             self.__on_toggled.remove(callback)
 
     def get_style(self):
-        # expects a style key Button.Image::scatter_brush (lowercase to match style key)
-        return {f"Button.Image::{self.name}": style.default.get(f"Button.Image::{self.name}", {})}
+        # include base and checked variants so the toolbar reflects active state
+        return {
+            f"Button.Image::{self.name}": style.default.get(f"Button.Image::{self.name}", {}),
+            f"Button.Image::{self.name}:checked": style.default.get(
+                f"Button.Image::{self.name}:checked", {}
+            ),
+        }
 
     def _on_mouse_released(self, _button):
         # toggle state
@@ -196,6 +203,8 @@ class ScatterBrush:
         self._pending_pick: bool = False
         self._mouse_was_down: bool = False
         self._undo_group_open: bool = False
+        self._main_window_cursor = _window_cursor.get_main_window_cursor()
+        self._cursor_override_applied: bool = False
 
         # Register hotkey to toggle painting (reuse teleport hotkey? no, keep separate if available)
         # Not defining a new TrexHotkeyEvent; toolbar toggle is primary control.
@@ -215,6 +224,11 @@ class ScatterBrush:
         with contextlib.suppress(Exception):
             if self._task:
                 self._task.cancel()
+        # Ensure cursor override is cleared on destroy
+        with contextlib.suppress(Exception):
+            if self._cursor_override_applied:
+                self._main_window_cursor.clear_overridden_cursor_shape()
+                self._cursor_override_applied = False
 
     # Required for compatibility with scene layer
     @property
@@ -231,6 +245,16 @@ class ScatterBrush:
 
     def set_active(self, value: bool):
         self._active = bool(value)
+        # Update cursor to indicate brush mode when active
+        try:
+            if self._active and not self._cursor_override_applied:
+                self._main_window_cursor.override_cursor_shape(CursorStandardShape.CROSSHAIR)
+                self._cursor_override_applied = True
+            elif (not self._active) and self._cursor_override_applied:
+                self._main_window_cursor.clear_overridden_cursor_shape()
+                self._cursor_override_applied = False
+        except Exception:
+            pass
 
     async def _run_loop(self):
         # periodic sampler; when active and LMB is pressed, request a pick under mouse
@@ -442,6 +466,22 @@ class ScatterBrush:
         q = Gf.Quatf(float(math.cos(yaw_rad * 0.5)), Gf.Vec3f(0.0, 0.0, float(math.sin(yaw_rad * 0.5))))
 
         s = random.uniform(scale_min, scale_max)
+
+        # Position jitter based on brush settings (small radial jitter)
+        try:
+            brush_radius = self._settings_iface.get_as_float(self._settings_prefix_tools + ".brush_radius") or self._settings.radius
+        except Exception:
+            brush_radius = self._settings.radius
+        try:
+            spacing = self._settings_iface.get_as_float(self._settings_prefix_tools + ".spacing") or self._settings.spacing
+        except Exception:
+            spacing = self._settings.spacing
+        jitter_radius = max(0.0, min(float(brush_radius), float(spacing))) * 0.25
+        if jitter_radius > 0.0:
+            r = random.uniform(0.0, jitter_radius)
+            a = random.uniform(0.0, 2.0 * math.pi)
+            # Apply jitter in local X/Y plane (MVP without surface normal)
+            local_translation = Gf.Vec3d(local_translation[0] + r * math.cos(a), local_translation[1] + r * math.sin(a), local_translation[2])
 
         positions.append(Gf.Vec3f(local_translation))
         proto_indices.append(0)
