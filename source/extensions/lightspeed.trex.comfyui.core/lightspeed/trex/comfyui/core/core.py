@@ -79,6 +79,7 @@ class ComfyUICore:
     INSTANCE_PORT_SETTING = "/exts/lightspeed.trex.comfyui.core/instance/port"
     INSTANCE_START_TIMEOUT_SETTING = "/exts/lightspeed.trex.comfyui.core/instance/start_timeout_s"
     INSTANCE_POLL_INTERVAL_SETTING = "/exts/lightspeed.trex.comfyui.core/instance/poll_interval_s"
+    INSTANCE_FRONTEND_VERSION_SETTING = "/exts/lightspeed.trex.comfyui.core/instance/frontend_version"
 
     _INSTALL_DIRECTORY_SETTING = "/persistent/exts/lightspeed.trex.comfyui.core/install_directory"
 
@@ -875,6 +876,10 @@ class ComfyUICore:
         ]
         if headless:
             run_cmd.append("--disable-auto-launch")
+
+        frontend_version = self._settings.get(self.INSTANCE_FRONTEND_VERSION_SETTING)
+        if frontend_version:
+            run_cmd.extend(["--front-end-version", frontend_version])
 
         try:
             self._run_process = subprocess.Popen(run_cmd, cwd=self._repo.workdir)

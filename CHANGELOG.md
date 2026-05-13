@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LSSDEVOPS-39: Retargeted GitHub mirror sync to lightspeed-kit Linux runners.
 - LSSDEVOPS-39: Removed the repoman runtime private-repo download bootstrap while preserving committed internal repo dependency manifests.
 - REMIX-4286: Added branch-aware repo tooling and agent guidance for atomic merge sequences.
+- Pinned the ComfyUI frontend served by `lightspeed.trex.comfyui.core` to `comfyui-frontend-package==1.26.6` via the `--front-end-version` launch flag, configurable through the new `instance/frontend_version` setting.
 
 ### Fixed
 
