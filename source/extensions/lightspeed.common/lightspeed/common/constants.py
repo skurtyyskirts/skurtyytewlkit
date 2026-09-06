@@ -687,6 +687,7 @@ class WindowNames(StrEnum):
     COMFYUI_WORKFLOW = "ComfyUI Workflow"
     JOB_QUEUE = "Job Queue"
     JOB_DETAILS = "Job Details"
+    SCATTER = "Scatter"
 
 
 class Layouts(Enum):

@@ -15,13 +15,20 @@
 * limitations under the License.
 """
 
+from .e2e.test_scatter_brush_viewport import TestScatterBrushViewportE2E
 from .e2e.test_widget import TestSharedViewportWidget
-from .unit.test_delegate import TestViewportEventDelegate
+from .unit.test_delegate import TestMouseWheelInterceptors, TestViewportEventDelegate
 from .unit.test_layers import TestViewportLayersFactorySkip
+from .unit.test_scatter_brush import TestBrushCursorMatrix, TestScatterBrushButtonGroup, TestScatterBrushTool
 from .unit.test_setup_ui import TestSetupUI, TestSetupUIGameCameraBoundary
 from .unit.test_stats import TestViewportStatisticFading
 
 __all__ = [
+    "TestBrushCursorMatrix",
+    "TestMouseWheelInterceptors",
+    "TestScatterBrushButtonGroup",
+    "TestScatterBrushTool",
+    "TestScatterBrushViewportE2E",
     "TestSetupUI",
     "TestSetupUIGameCameraBoundary",
     "TestSharedViewportWidget",

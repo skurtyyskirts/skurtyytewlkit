@@ -27,6 +27,8 @@ from lightspeed.particle.gizmos.layer import ParticleGizmosLayer as _ParticleGiz
 from lightspeed.trex.contexts.setup import Contexts as _TrexContexts
 from lightspeed.trex.hotkeys import TrexHotkeyEvent as _TrexHotkeyEvent
 from lightspeed.trex.hotkeys import get_global_hotkey_manager as _get_global_hotkey_manager
+from lightspeed.trex.scatter.core.constants import SCENE_FACTORY_ID as _SCATTER_BRUSH_SCENE_FACTORY_ID
+from lightspeed.trex.scatter.core.constants import TOOLBAR_PRIORITY as _SCATTER_BRUSH_TOOLBAR_PRIORITY
 from lightspeed.trex.viewports.manipulators import camera_default_factory as _manipulator_camera_default
 from lightspeed.trex.viewports.manipulators import grid_default_factory as _manipulator_grid_default
 from lightspeed.trex.viewports.manipulators import prim_transform_default_factory as _prim_transform_manipulator
@@ -41,6 +43,9 @@ from .scene.scenes import origin_default_factory as _origin_default_factory
 from .setup_ui import SetupUI as _ViewportSetupUI
 from .stats.layer import ViewportStatsLayer
 from .tools.layer import ViewportToolsLayer
+from .tools.scatter_brush import create_button_instance as _create_scatter_toolbar_button_group
+from .tools.scatter_brush import delete_button_instance as _delete_scatter_toolbar_button_group
+from .tools.scatter_brush import scatter_brush_factory as _scatter_brush_factory
 from .tools.teleport import create_button_instance as _create_teleporter_toolbar_button_group
 from .tools.teleport import delete_button_instance as _delete_teleporter_toolbar_button_group
 from .tools.teleport import teleporter_factory as _teleporter_factory
@@ -110,6 +115,7 @@ class TrexViewportSharedExtension(omni.ext.IExt):
         super().__init__()
         self.__registered = None
         self.__teleport_button_group = None
+        self.__scatter_button_group = None
         self.__frame_hotkey_sub = None
 
     def on_startup(self, ext_id):
@@ -131,6 +137,7 @@ class TrexViewportSharedExtension(omni.ext.IExt):
         self.__registered.append(RegisterScene(_manipulator_camera_default, "omni.kit.viewport.manipulator.Camera"))
         self.__registered.append(RegisterScene(_prim_transform_manipulator, "omni.kit.lss.viewport.manipulator.prim"))
         self.__registered.append(RegisterScene(_teleporter_factory, "omni.kit.lss.viewport.tools.teleport"))
+        self.__registered.append(RegisterScene(_scatter_brush_factory, _SCATTER_BRUSH_SCENE_FACTORY_ID))
 
         # self.__registered.append(
         #     RegisterScene(_grid_default_factory, "omni.kit.viewport.scene.SimpleGrid")
@@ -165,6 +172,8 @@ class TrexViewportSharedExtension(omni.ext.IExt):
         toolbar = _get_toolbar_instance()
         self.__teleport_button_group = _create_teleporter_toolbar_button_group()
         toolbar.add_widget(self.__teleport_button_group, 12)
+        self.__scatter_button_group = _create_scatter_toolbar_button_group()
+        toolbar.add_widget(self.__scatter_button_group, _SCATTER_BRUSH_TOOLBAR_PRIORITY)
 
     def __remove_tools(self):
         if self.__teleport_button_group:
@@ -172,6 +181,11 @@ class TrexViewportSharedExtension(omni.ext.IExt):
             toolbar.remove_widget(self.__teleport_button_group)
             self.__teleport_button_group.clean()
             _delete_teleporter_toolbar_button_group()
+        if self.__scatter_button_group:
+            toolbar = _get_toolbar_instance()
+            toolbar.remove_widget(self.__scatter_button_group)
+            self.__scatter_button_group.clean()
+            _delete_scatter_toolbar_button_group()
 
     def __register_hotkeys(self):
         def frame_active_viewport():

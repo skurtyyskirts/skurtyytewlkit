@@ -52,6 +52,16 @@
                 "title": "Editor",
                 "visible": true,
                 "width": 492.8000183105469
+              },
+              {
+                "dock_id": 3,
+                "height": 874.4000244140625,
+                "position_x": 59.20000076293945,
+                "position_y": 24.80000114440918,
+                "selected_in_dock": false,
+                "title": "Scatter",
+                "visible": true,
+                "width": 492.8000183105469
               }
             ],
             "dock_id": 3,

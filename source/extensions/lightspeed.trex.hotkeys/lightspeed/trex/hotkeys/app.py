@@ -77,6 +77,8 @@ class TrexHotkeyEvent(HotkeyEvent):
     ESC = KeyCombination(carb.input.KeyboardInput.ESCAPE)
     # teleport selection as in a viewport
     CTRL_T = KeyCombination(carb.input.KeyboardInput.T, modifiers=carb.input.KEYBOARD_MODIFIER_FLAG_CONTROL)
+    # toggle the scatter brush in a viewport
+    CTRL_B = KeyCombination(carb.input.KeyboardInput.B, modifiers=carb.input.KEYBOARD_MODIFIER_FLAG_CONTROL)
 
 
 class HotkeyManager:

@@ -305,6 +305,9 @@ current_dict.update(
         "Button.Image::Particle": {"image_url": _get_icons("particle"), "color": _WHITE_60},
         "Button.Image::Particle:hovered": {"image_url": _get_icons("particle"), "color": _WHITE_100},
         "Button.Image::teleport": {"image_url": _get_icons("teleport")},
+        "Button.Image::scatter_brush": {"image_url": _get_icons("scatter-brush"), "color": _WHITE_60},
+        "Button.Image::scatter_brush:hovered": {"image_url": _get_icons("scatter-brush"), "color": _WHITE_100},
+        "Button.Image::scatter_brush:checked": {"image_url": _get_icons("scatter-brush"), "color": _BLUE_ACTION},
         "Button.Image::ShowValidation": {
             "image_url": _get_icons("v-box"),
             "color": _WHITE_20,

@@ -230,5 +230,15 @@
     "title": "0",
     "visible": false,
     "width": 821.6000366210938
+  },
+  {
+    "dock_id": 0,
+    "height": 600.0,
+    "position_x": 3.4028234663852886e+38,
+    "position_y": 3.4028234663852886e+38,
+    "selected_in_dock": false,
+    "title": "Scatter",
+    "visible": false,
+    "width": 400.0
   }
 ]

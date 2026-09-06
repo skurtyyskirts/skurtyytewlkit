@@ -1,6 +1,10 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.31.0]
+### Added
+- Added the scatter brush toolbar icon and docked the Scatter window next to the Editor in the StageCraft layout (hidden in the other layouts)
+
 ## [1.30.2]
 ### Added
 - Added ComfyUI protocol, disconnected-state, and retarget icons and reorganized the TextureCraft layout used by AI Tools around Setup, Workflow, Job Queue, a full-height Job Details column, and Stage Manager submission.

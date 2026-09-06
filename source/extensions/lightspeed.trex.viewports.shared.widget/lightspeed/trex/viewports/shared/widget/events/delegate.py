@@ -15,17 +15,63 @@
 * limitations under the License.
 """
 
-__all__ = ["ViewportEventDelegate"]
+from __future__ import annotations
+
+__all__ = ["MouseWheelInterceptorSubscription", "ViewportEventDelegate", "register_mouse_wheel_interceptor"]
 
 import contextlib
 import math
 import traceback
+from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 import carb
 import omni.appwindow
 from lightspeed.common.constants import GlobalEventNames
 from lightspeed.events_manager import get_instance as _get_event_manager_instance
 from lightspeed.trex.viewports.manipulators.zoom import zoom_operation as _zoom_operation
+
+if TYPE_CHECKING:
+    from omni.kit.widget.viewport.api import ViewportAPI as _ViewportAPI
+
+# Consulted before any camera handling in ViewportEventDelegate.mouse_wheel so a viewport tool can claim the wheel
+# (for example to resize a brush) without the camera zooming underneath it.
+_MOUSE_WHEEL_INTERCEPTORS: list[Callable[[_ViewportAPI | None, float, float, int], bool]] = []
+
+
+class MouseWheelInterceptorSubscription:
+    """Keeps a mouse-wheel interceptor registered for as long as the subscription is alive.
+
+    The interceptor is removed when `destroy` is called or when the subscription is garbage collected.
+    """
+
+    def __init__(self, fn: Callable[[_ViewportAPI | None, float, float, int], bool]):
+        self.__fn = fn
+
+    def __del__(self):
+        self.destroy()
+
+    def destroy(self):
+        """Unregister the interceptor; calling it again is a no-op."""
+        fn, self.__fn = self.__fn, None
+        if fn is not None and fn in _MOUSE_WHEEL_INTERCEPTORS:
+            _MOUSE_WHEEL_INTERCEPTORS.remove(fn)
+
+
+def register_mouse_wheel_interceptor(
+    fn: Callable[[_ViewportAPI | None, float, float, int], bool],
+) -> MouseWheelInterceptorSubscription:
+    """Register a callback that is consulted before the viewport handles a mouse-wheel event.
+
+    Args:
+        fn: Called as ``fn(viewport_api, x, y, modifiers)`` with the raw wheel deltas. Return True to consume the
+            event, which skips the flight-speed adjustment and the camera zoom.
+
+    Returns:
+        The subscription that keeps the interceptor registered until it is destroyed.
+    """
+    _MOUSE_WHEEL_INTERCEPTORS.append(fn)
+    return MouseWheelInterceptorSubscription(fn)
 
 
 def _limit_camera_velocity(value: float, settings: carb.settings.ISettings, context_name: str):
@@ -53,6 +99,8 @@ _REGULAR_KEYBOARD_INPUTS = tuple(_regular_keyboard_inputs())
 
 
 class ViewportEventDelegate:
+    """Routes the mouse-wheel, keyboard, and drag-and-drop events of one viewport scene view."""
+
     def __init__(self, scene_view, viewport_api):
         self.__scene_view = scene_view
         self.__viewport_api = viewport_api
@@ -123,6 +171,9 @@ class ViewportEventDelegate:
         return False
 
     def mouse_wheel(self, x: float, y: float, modifiers: int):
+        """Zoom the camera unless an interceptor, the flight-speed adjustment, or a held key claims the wheel."""
+        if self.__intercept_mouse_wheel(x, y, modifiers):
+            return
         # Do not use horizontal scroll at all (do we want to hide this behind a setting, or allow it for speed
         # but not zoom)
         x = 0
@@ -141,6 +192,16 @@ class ViewportEventDelegate:
             _zoom_operation(x, y * speed_scale, self.viewport_api)
         except Exception:  # noqa: BLE001
             carb.log_error(f"Traceback:\n{traceback.format_exc()}")
+
+    def __intercept_mouse_wheel(self, x: float, y: float, modifiers: int) -> bool:
+        # Iterate over a snapshot: an interceptor may unregister itself while it is being called.
+        for interceptor in tuple(_MOUSE_WHEEL_INTERCEPTORS):
+            try:
+                if interceptor(self.viewport_api, x, y, modifiers):
+                    return True
+            except Exception:  # noqa: BLE001
+                carb.log_error(f"Traceback:\n{traceback.format_exc()}")
+        return False
 
     def __regular_key_is_down(self):
         app_window = omni.appwindow.get_default_app_window()

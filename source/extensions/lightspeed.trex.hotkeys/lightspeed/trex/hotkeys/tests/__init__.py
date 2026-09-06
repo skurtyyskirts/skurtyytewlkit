@@ -15,4 +15,9 @@
 * limitations under the License.
 """
 
-from .unit.test_app import *
+from .unit.test_app import TestTrexHotkeyEvent, TestTrigger
+
+__all__ = [
+    "TestTrexHotkeyEvent",
+    "TestTrigger",
+]

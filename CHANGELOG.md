@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - REMIX-5993: Added NVCARPS outbound skill validation and signing to merge request pipelines, so agent skill content under `skills/` is validated and signed before it can merge
 - REMIX-4970: Validator and pipeline DDS conversions now call the NVTT C binding directly through `omni.flux.nvtt.core.encode_dds`, with typed validator format, gamma, and mip-filter settings.
 - REMIX-2968: Added a non-blocking `check-tests-written` merge request job that warns when an extension's Python source changed without any change to its tests, posting a self-resolving merge request note and honoring a `no-tests-needed` opt-out label
+- Added a viewport asset scattering brush: a Scatter window docked next to the Editor and a viewport toolbar tool (Ctrl+B) that paints, erases and floods ingested assets onto captured meshes with Paint-Tool-style density, falloff, spacing, padding, strength, random rotation and scale, per-asset weights, presets and per-stroke undo
 
 ### Changed
 

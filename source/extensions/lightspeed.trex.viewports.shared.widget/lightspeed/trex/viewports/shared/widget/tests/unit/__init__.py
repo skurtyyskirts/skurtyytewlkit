@@ -15,12 +15,17 @@
 * limitations under the License.
 """
 
-from .test_delegate import TestViewportEventDelegate
+from .test_delegate import TestMouseWheelInterceptors, TestViewportEventDelegate
 from .test_layers import TestViewportLayersFactorySkip
+from .test_scatter_brush import TestBrushCursorMatrix, TestScatterBrushButtonGroup, TestScatterBrushTool
 from .test_setup_ui import TestSetupUI, TestSetupUIGameCameraBoundary
 from .test_stats import TestViewportStatisticFading
 
 __all__ = [
+    "TestBrushCursorMatrix",
+    "TestMouseWheelInterceptors",
+    "TestScatterBrushButtonGroup",
+    "TestScatterBrushTool",
     "TestSetupUI",
     "TestSetupUIGameCameraBoundary",
     "TestViewportEventDelegate",

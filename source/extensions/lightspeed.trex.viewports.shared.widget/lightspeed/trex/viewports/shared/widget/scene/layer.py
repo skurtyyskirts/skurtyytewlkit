@@ -24,6 +24,7 @@ from collections.abc import Sequence
 
 import carb
 import omni.ui as ui
+from lightspeed.trex.scatter.core.constants import SCENE_FACTORY_ID as _SCATTER_BRUSH_SCENE_FACTORY_ID
 from omni.kit.viewport.registry import RegisterScene
 from omni.ui import scene as sc
 
@@ -36,6 +37,8 @@ INCLUDED_SCENE_LAYERS = [
     "omni.kit.viewport.manipulator.Camera",
     "omni.kit.lss.viewport.manipulator.prim",
     "omni.kit.lss.viewport.tools.teleport",
+    # Shared with lightspeed.trex.scatter.core so the brush registration and this whitelist cannot drift apart
+    _SCATTER_BRUSH_SCENE_FACTORY_ID,
     # "omni.kit.viewport.scene.SimpleGrid",  # use legacy grid for now
     "omni.kit.viewport.scene.SimpleOrigin",
     "omni.kit.viewport.scene.CameraAxisLayer",

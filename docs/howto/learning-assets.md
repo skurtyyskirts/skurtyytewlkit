@@ -104,6 +104,99 @@ Apply transforms to the "Xforms" prim, available on all ingested assets. Capture
 to the "mesh" prim.
 ```
 
+## Scattering Assets
+
+The scatter brush paints copies of ingested assets onto captured meshes directly in the viewport, the way a foliage
+or debris painter works in other DCC tools. Drag across a mesh and it stamps grass, rocks, glass shards, or any other
+ingested prop with randomized rotation and scale, instead of placing one reference at a time through the Selection
+Panel.
+
+### Enabling the Brush
+
+Open the brush from any of these:
+
+* The **Scatter** tab, docked next to the Editor tab by default.
+* The scatter brush button in the viewport toolbar, directly under the Teleport button.
+* `Ctrl+B`, which toggles paint mode from anywhere in the viewport.
+
+```{tip}
+The toolbar button, `Ctrl+B`, and the Paint button in the Scatter window all flip the same switch, so any of them
+turns painting on or off.
+```
+
+### Building the Asset Palette
+
+The **ASSETS** section of the Scatter window holds the palette the brush chooses from:
+
+* **Add** opens the asset file picker to choose a USD model.
+* **Add Selection** adds the asset referenced by the currently selected prim.
+* The browse dropdown lists every model already ingested into the project.
+
+Only ingested, in-project assets can join the palette. Adding anything else brings up the usual ingestion dialog
+first; refer to [Ingesting Assets](learning-ingestion.md). Each row in the palette can be enabled or disabled, given a
+relative selection **Weight**, and assigned the **Up Axis** it was authored with (Y or Z), which the brush uses to
+keep the asset upright on the surface it paints onto.
+
+### Painting
+
+With at least one enabled asset in the palette and paint mode on:
+
+* **Drag** across a captured mesh to stamp copies of the palette assets; a new stamp is placed every time the cursor
+  travels the **Stamp Spacing** distance.
+* **Shift+drag** erases placements under the brush instead of adding them.
+* Hold **B** and scroll the mouse wheel to resize the brush without opening the panel.
+* `Ctrl+Z` undoes a whole stroke at once, not stamp by stamp.
+
+The brush cursor turns grey over meshes the current settings will not paint on, for example when **Apply To** is
+restricted to the selection and the cursor is over something else.
+
+### Brush Settings
+
+The Scatter window groups the brush parameters into collapsible sections:
+
+* **BRUSH** — the shape of one stamp: **Radius** (brush size in stage units), **Falloff** (the acceptance curve from
+  the center to the edge: Constant, Linear, Smooth, Sphere, or Gaussian), **Density** (candidates drawn per stamp),
+  **Strength** (the share of those candidates that is kept), **Stamp Spacing** (distance between stamps along a
+  stroke), and **Padding** (minimum distance kept between placements).
+* **PLACEMENT** — how each placement sits on the surface: **Vertical Offset** along the surface normal, **Conform to
+  Surface** (aligns the asset's up axis with the surface normal), **Align to Stroke** (turns the asset to face the
+  stroke direction), and random rotation ranges (yaw at the top level, with tilt around the other two axes under an
+  **ADVANCED ROTATION** sub-section).
+* **SCALE** — random scale per placement, with an enable toggle, a uniform **Min**/**Max** range, **Bias** (skews the
+  distribution toward the minimum at -1 or the maximum at 1), **Weight** (sharpens the distribution above 1 or
+  flattens it below 1), and, once **Uniform** is turned off, a separate Min/Max range per axis.
+* **RANDOM** — the stroke's random **Seed**, with **Reroll** drawing a new one on demand, and **Randomize**, which
+  draws a fresh seed for every stroke instead of reusing the fixed one.
+* **TARGET** — which captured meshes receive placements: **Apply To** (All or Selected), **Target Mode** (Hit
+  Surface authors under whatever mesh is under the cursor, Anchor always authors under one pinned prototype, set with
+  the **Use Selection** button), **Erase Scope** (All Scattered or Brush Assets, controlling what Shift+drag or Erase
+  mode removes), and **Flood Cap**, the placement limit for the **Flood** button, which fills the anchor or the
+  selected captured meshes with placements in a single undoable step; requesting more than the default cap asks for
+  confirmation first.
+
+### Presets
+
+The **PRESETS** section stores named brush configurations as files in the user's documents folder. **Save** writes
+the current settings to the active preset, **Save As** and **Clone** prompt for a new name, **Rename** renames the
+stored preset, and **Delete** removes the preset file after confirmation.
+
+```{warning}
+Placements are authored under the captured mesh's **prototype**, not the instance painted on, so they appear on
+every instance that shares that mesh's hash. The Scatter window warns when the current target has more than one
+instance. Use **Target Mode: Anchor** together with **Use Selection** to pin one specific mesh instead.
+```
+
+```{warning}
+Like every other asset replacement, scattering only changes what is rendered; it does not add or move game-side
+collision. The captured mesh itself is never modified, so it keeps rendering underneath the scattered assets.
+```
+
+Each placement is authored as its own reference prim (`s_<id>`), grouped under a `scatter_<preset>` container prim
+beneath the target's `mesh_<HASH>` prototype in the mod. Placements and their container both carry the
+`IsRemixScatter` attribute, which is how the brush tells its own placements apart from references added by hand,
+for example when erasing. Placements are ordinary reference prims otherwise, so the Selection Panel and packaging
+treat them like any other asset replacement.
+
 ## Handling Animated Assets
 
 Animated asset replacement varies depending on the game's skeleton animation type.

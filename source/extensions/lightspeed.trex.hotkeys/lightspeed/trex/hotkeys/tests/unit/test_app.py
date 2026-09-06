@@ -15,18 +15,21 @@
 * limitations under the License.
 """
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import carb.input
 import omni.kit.test
 import omni.kit.ui_test as ui_test
 from lightspeed.trex.contexts.extension import get_instance as get_context_manager
 from lightspeed.trex.contexts.setup import Contexts
+from lightspeed.trex.hotkeys import app as _hotkeys_app
 from lightspeed.trex.hotkeys.app import (
     HotkeyEvent,
+    TrexHotkeyEvent,
     create_global_hotkey_manager,
     destroy_global_hotkey_manager,
     get_global_hotkey_manager,
+    register_global_hotkeys,
 )
 from omni.kit.actions.core import get_action_registry
 from omni.kit.hotkeys.core import KeyCombination, get_hotkey_context, get_hotkey_registry
@@ -123,3 +126,42 @@ class TestTrigger(omni.kit.test.AsyncTestCase):
         self.assertEqual(self._global_hotkey_mock.call_count, 1)
         self.assertEqual(self._stagecraft_context_hotkey_mock.call_count, 1)
         self.assertEqual(self._ingestcraft_context_hotkey_mock.call_count, 1)
+
+
+class TestTrexHotkeyEvent(omni.kit.test.AsyncTestCase):
+    """
+    Test the Remix hotkey event definitions and their global registration.
+    """
+
+    async def test_ctrl_b_event_defined_maps_to_b_key_with_control_modifier(self):
+        # Arrange
+        expected_modifiers = carb.input.KEYBOARD_MODIFIER_FLAG_CONTROL
+
+        # Act
+        combination = TrexHotkeyEvent.CTRL_B.value
+
+        # Assert
+        self.assertIsInstance(combination, KeyCombination)
+        self.assertEqual(combination.key, carb.input.KeyboardInput.B)
+        self.assertEqual(combination.modifiers, expected_modifiers)
+
+    async def test_ctrl_b_event_defined_is_not_an_alias_of_another_event(self):
+        # Arrange
+        expected_name = "CTRL_B"
+
+        # Act
+        member = TrexHotkeyEvent[expected_name]
+
+        # Assert
+        self.assertEqual(member.name, expected_name)
+
+    async def test_register_global_hotkeys_called_defines_ctrl_b_event(self):
+        # Arrange
+        hotkey_manager = Mock()
+
+        with patch.object(_hotkeys_app, "get_global_hotkey_manager", return_value=hotkey_manager):
+            # Act
+            register_global_hotkeys()
+
+        # Assert
+        hotkey_manager.define_hotkey_event.assert_any_call(TrexHotkeyEvent.CTRL_B, "Global CTRL_B")

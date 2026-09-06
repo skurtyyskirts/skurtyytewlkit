@@ -20,7 +20,10 @@ from unittest.mock import MagicMock, patch
 import carb.input
 import omni.kit.test
 from lightspeed.common.constants import GlobalEventNames
-from lightspeed.trex.viewports.shared.widget.events.delegate import ViewportEventDelegate
+from lightspeed.trex.viewports.shared.widget.events.delegate import (
+    ViewportEventDelegate,
+    register_mouse_wheel_interceptor,
+)
 
 _ZOOM_OP = "lightspeed.trex.viewports.shared.widget.events.delegate._zoom_operation"
 _EVENT_MANAGER = "lightspeed.trex.viewports.shared.widget.events.delegate._get_event_manager_instance"
@@ -219,3 +222,151 @@ class TestViewportEventDelegate(omni.kit.test.AsyncTestCase):
 
         # Assert
         mock_get_event_manager.return_value.call_global_custom_event.assert_not_called()
+
+
+class TestMouseWheelInterceptors(omni.kit.test.AsyncTestCase):
+    async def setUp(self):
+        self._scene_view = MagicMock()
+        self._viewport_api = MagicMock()
+        self._viewport_api.camera_path = "/OmniverseKit_Persp"
+        self._viewport_api.usd_context_name = "test_context"
+        self._delegate = ViewportEventDelegate(self._scene_view, self._viewport_api)
+        self._subscriptions = []
+
+    async def tearDown(self):
+        for subscription in self._subscriptions:
+            subscription.destroy()
+        self._subscriptions = []
+        self._delegate.destroy()
+        self._delegate = None
+
+    def _register_interceptor(self, interceptor):
+        """Register an interceptor that tearDown unregisters again."""
+        subscription = register_mouse_wheel_interceptor(interceptor)
+        self._subscriptions.append(subscription)
+        return subscription
+
+    async def test_mouse_wheel_interceptor_consumes_event_skips_zoom(self):
+        # Arrange
+        self._register_interceptor(MagicMock(return_value=True))
+        mock_settings = MagicMock()
+        mock_settings.get.return_value = 5.0
+
+        with (
+            patch.object(self._delegate, "adjust_flight_speed", return_value=False),
+            patch("carb.settings.get_settings", return_value=mock_settings),
+            patch(_ZOOM_OP) as mock_zoom,
+        ):
+            # Act
+            self._delegate.mouse_wheel(0, 1.0, 0)
+
+        # Assert
+        mock_zoom.assert_not_called()
+
+    async def test_mouse_wheel_interceptor_consumes_event_skips_flight_speed_adjustment(self):
+        # Arrange
+        self._register_interceptor(MagicMock(return_value=True))
+
+        with (
+            patch.object(self._delegate, "adjust_flight_speed", return_value=True) as mock_flight_speed,
+            patch(_ZOOM_OP),
+        ):
+            # Act
+            self._delegate.mouse_wheel(0, 1.0, 0)
+
+        # Assert
+        mock_flight_speed.assert_not_called()
+
+    async def test_mouse_wheel_interceptor_declines_event_still_zooms(self):
+        # Arrange
+        self._register_interceptor(MagicMock(return_value=False))
+        mock_settings = MagicMock()
+        mock_settings.get.return_value = 5.0
+
+        with (
+            patch.object(self._delegate, "adjust_flight_speed", return_value=False),
+            patch("carb.settings.get_settings", return_value=mock_settings),
+            patch(_ZOOM_OP) as mock_zoom,
+        ):
+            # Act
+            self._delegate.mouse_wheel(0, 1.0, 0)
+
+        # Assert
+        mock_zoom.assert_called_once_with(0, 1.0, self._viewport_api)
+
+    async def test_mouse_wheel_interceptor_registered_receives_viewport_api_and_raw_wheel_arguments(self):
+        # Arrange
+        interceptor = MagicMock(return_value=True)
+        self._register_interceptor(interceptor)
+
+        with patch(_ZOOM_OP):
+            # Act
+            self._delegate.mouse_wheel(4.0, -2.0, 3)
+
+        # Assert
+        interceptor.assert_called_once_with(self._viewport_api, 4.0, -2.0, 3)
+
+    async def test_mouse_wheel_first_interceptor_consumes_event_later_interceptor_not_called(self):
+        # Arrange
+        self._register_interceptor(MagicMock(return_value=True))
+        later_interceptor = MagicMock(return_value=True)
+        self._register_interceptor(later_interceptor)
+
+        with patch(_ZOOM_OP):
+            # Act
+            self._delegate.mouse_wheel(0, 1.0, 0)
+
+        # Assert
+        later_interceptor.assert_not_called()
+
+    async def test_mouse_wheel_subscription_destroyed_interceptor_not_called(self):
+        # Arrange
+        interceptor = MagicMock(return_value=True)
+        subscription = self._register_interceptor(interceptor)
+        subscription.destroy()
+        mock_settings = MagicMock()
+        mock_settings.get.return_value = 5.0
+
+        with (
+            patch.object(self._delegate, "adjust_flight_speed", return_value=False),
+            patch("carb.settings.get_settings", return_value=mock_settings),
+            patch(_ZOOM_OP) as mock_zoom,
+        ):
+            # Act
+            self._delegate.mouse_wheel(0, 1.0, 0)
+
+        # Assert
+        interceptor.assert_not_called()
+        mock_zoom.assert_called_once_with(0, 1.0, self._viewport_api)
+
+    async def test_mouse_wheel_subscription_garbage_collected_interceptor_not_called(self):
+        # Arrange
+        interceptor = MagicMock(return_value=True)
+        subscription = register_mouse_wheel_interceptor(interceptor)
+        del subscription
+
+        with patch(_ZOOM_OP):
+            # Act
+            self._delegate.mouse_wheel(0, 1.0, 0)
+
+        # Assert
+        interceptor.assert_not_called()
+
+    async def test_mouse_wheel_interceptor_raises_still_zooms(self):
+        # Arrange
+        self._register_interceptor(MagicMock(side_effect=RuntimeError("interceptor failure")))
+        mock_settings = MagicMock()
+        mock_settings.get.return_value = 5.0
+
+        with (
+            patch.object(self._delegate, "adjust_flight_speed", return_value=False),
+            patch("carb.settings.get_settings", return_value=mock_settings),
+            patch("carb.log_error") as mock_log_error,
+            patch(_ZOOM_OP) as mock_zoom,
+        ):
+            # Act
+            self._delegate.mouse_wheel(0, 1.0, 0)
+
+        # Assert
+        mock_zoom.assert_called_once_with(0, 1.0, self._viewport_api)
+        mock_log_error.assert_called_once()

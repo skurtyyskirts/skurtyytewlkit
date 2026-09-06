@@ -1,6 +1,6 @@
 [package]
 kit_sdk_version = "110.*"
-version = "1.8.3"
+version = "1.9.0"
 authors =["Damien Bataille <dbataille@nvidia.com>"]
 title = "NVIDIA RTX Remix Viewports implementation"
 description = "Viewports implementation for NVIDIA RTX Remix App"
@@ -25,11 +25,13 @@ icon = "data/icon.png"
 "lightspeed.events_manager" = {}
 "lightspeed.trex.contexts" = {}
 "lightspeed.trex.hotkeys" = {}
+"lightspeed.trex.scatter.core" = {}
 "lightspeed.trex.viewports.manipulators" = {}
 "lightspeed.trex.viewports.properties_pane.widget" = {}
 "lightspeed.light.gizmos" = {}
 "lightspeed.particle.gizmos" = {}
 "lightspeed.ui_scene.light_manipulator" = {}
+"omni.flux.pip_archive" = {}
 "omni.flux.utils.common" = {}
 "omni.appwindow" = {}
 "omni.kit.viewport.utility" = {}
@@ -77,6 +79,8 @@ args = [
     "--/exts/omni.kit.viewport.window/startup/showOnLaunch=false",
     "--/exts/omni.kit.viewport.window/windowMenu/entryCount=0",
     "--/exts/lightspeed/trex/viewports/shared/widget/registerOpenGLSceneLayers=false",
+    # Headless tests render with Storm, so the scatter brush must pick surfaces on the CPU.
+    "--/exts/lightspeed.trex.scatter.core/forceCpuPicker=true",
 ]
 
 stdoutFailPatterns.exclude = [

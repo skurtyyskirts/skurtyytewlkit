@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40">
+  <rect width="40" height="40" fill="none"/>
+  <!-- brush handle -->
+  <path d="M27.5 5.5 L34.5 12.5 L22.5 24.5 L15.5 17.5 Z" fill="none" stroke="#ccc" stroke-width="2" stroke-linejoin="round"/>
+  <!-- ferrule -->
+  <path d="M15.5 17.5 L22.5 24.5 L19 28 L12 21 Z" fill="#ccc" stroke="#ccc" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- bristle tip -->
+  <path d="M12 21 L19 28 C17 31 13 33.5 8.5 33.5 C7 33.5 6.2 33 6.5 31.5 C7.5 27.5 9.5 23.5 12 21 Z" fill="none" stroke="#ccc" stroke-width="2" stroke-linejoin="round"/>
+  <!-- scattered dots -->
+  <circle cx="6" cy="9" r="1.8" fill="#ccc"/>
+  <circle cx="12" cy="6" r="1.4" fill="#ccc"/>
+  <circle cx="9" cy="14.5" r="1.4" fill="#ccc"/>
+  <circle cx="30" cy="31" r="1.8" fill="#ccc"/>
+  <circle cx="34.5" cy="25.5" r="1.4" fill="#ccc"/>
+  <circle cx="26" cy="35" r="1.4" fill="#ccc"/>
+</svg>

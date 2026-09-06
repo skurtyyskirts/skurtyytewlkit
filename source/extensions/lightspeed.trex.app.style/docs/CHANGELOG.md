@@ -1,6 +1,10 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.28.0]
+### Added
+- Added the scatter brush toolbar button style.
+
 ## [1.27.1]
 ### Changed
 - Changed the sectioned combo box section style: the name is smaller and faded, and a faded thin line runs beside it.

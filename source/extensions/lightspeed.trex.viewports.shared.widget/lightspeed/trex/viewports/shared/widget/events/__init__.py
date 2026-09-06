@@ -15,13 +15,20 @@
 * limitations under the License.
 """
 
-__all__ = ["ViewportEventDelegate", "add_event_delegation", "remove_event_delegation", "set_ui_delegate"]
+__all__ = [
+    "MouseWheelInterceptorSubscription",
+    "ViewportEventDelegate",
+    "add_event_delegation",
+    "register_mouse_wheel_interceptor",
+    "remove_event_delegation",
+    "set_ui_delegate",
+]
 
 import traceback
 
 import carb
 
-from .delegate import ViewportEventDelegate
+from .delegate import MouseWheelInterceptorSubscription, ViewportEventDelegate, register_mouse_wheel_interceptor
 
 _ui_delegate_setup = ViewportEventDelegate
 _ui_delegate_list = []
