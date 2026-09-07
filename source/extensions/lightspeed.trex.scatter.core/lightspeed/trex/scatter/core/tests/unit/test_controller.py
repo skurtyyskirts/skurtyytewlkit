@@ -34,6 +34,8 @@ from lightspeed.trex.scatter.core.settings import (
     Falloff,
     ScatterAssetEntry,
     ScatterBrushSettings,
+    ScatterMaterialOverride,
+    ScatterTextureSet,
     TargetMode,
     UpAxis,
 )
@@ -241,16 +243,16 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertTrue(status_callback.call_args.args[1])
         self.assertNotIn(constants_module.BRUSH_SETTINGS_PATH, self.settings_store)
 
-    async def test_update_settings_with_range_violation_returns_false(self):
+    async def test_update_settings_with_an_out_of_bounds_value_returns_false(self):
         # Arrange
         status_callback = self._subscribe(self.controller.subscribe_status_message)
 
         # Act
-        result = self.controller.update_settings(scale_min=5.0)
+        result = self.controller.update_settings(radius=0.5)
 
         # Assert
         self.assertFalse(result)
-        self.assertEqual(self.controller.settings.scale_min, 0.8)
+        self.assertEqual(self.controller.settings.radius, 50.0)
         status_callback.assert_called_once()
 
     async def test_update_settings_with_unknown_field_returns_false(self):
@@ -678,6 +680,208 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertIs(result, picker)
         create_picker.assert_called_once_with(viewport_api, cache)
 
+    async def test_lowering_a_max_below_its_min_carries_the_min_down(self):
+        # A drag field reports every value it passes through, so a max that cannot cross its min cannot be dragged
+        # under it at all.
+        # Arrange
+        self.controller.update_settings(scale_min=0.8, scale_max=1.2)
+
+        # Act
+        updated = self.controller.update_settings(scale_max=0.01)
+
+        # Assert
+        self.assertTrue(updated)
+        self.assertEqual(self.controller.settings.scale_max, 0.01)
+        self.assertEqual(self.controller.settings.scale_min, 0.01)
+
+    async def test_raising_a_min_above_its_max_carries_the_max_up(self):
+        # Arrange
+        self.controller.update_settings(scale_min=0.8, scale_max=1.2)
+
+        # Act
+        updated = self.controller.update_settings(scale_min=4.0)
+
+        # Assert
+        self.assertTrue(updated)
+        self.assertEqual(self.controller.settings.scale_min, 4.0)
+        self.assertEqual(self.controller.settings.scale_max, 4.0)
+
+    async def test_setting_both_ends_of_a_range_in_conflict_is_still_rejected(self):
+        # Arrange
+        status = self._subscribe(self.controller.subscribe_status_message)
+
+        # Act
+        updated = self.controller.update_settings(scale_min=2.0, scale_max=1.0)
+
+        # Assert
+        self.assertFalse(updated)
+        self.assertIn("scale_min", status.call_args.args[0])
+
+    async def test_moving_one_range_leaves_the_other_ranges_alone(self):
+        # Arrange
+        self.controller.update_settings(rotation_z_min=10.0, rotation_z_max=200.0, scale_min=0.8, scale_max=1.2)
+
+        # Act
+        self.controller.update_settings(scale_max=0.5)
+
+        # Assert
+        self.assertEqual(self.controller.settings.rotation_z_min, 10.0)
+        self.assertEqual(self.controller.settings.rotation_z_max, 200.0)
+        self.assertEqual(self.controller.settings.scale_min, 0.5)
+
+    async def test_add_asset_resolves_and_caches_the_texture_set(self):
+        # Arrange
+        texture_set = ScatterTextureSet(source_hash="abc", assigned=("inputs:diffuse_texture",))
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=texture_set) as resolve:
+            # Act
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        # Assert
+        resolve.assert_called_once_with(_ROCK)
+        self.assertEqual(self.controller.assets[0].textures, texture_set)
+
+    async def test_add_asset_whose_textures_cannot_be_resolved_posts_a_status_and_still_adds_it(self):
+        # Arrange
+        status = self._subscribe(self.controller.subscribe_status_message)
+        texture_set = ScatterTextureSet(reason="the asset has no AperturePBR material")
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=texture_set):
+            # Act
+            added = self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        # Assert
+        self.assertTrue(added)
+        self.assertEqual([asset.path for asset in self.controller.assets], [_ROCK])
+        self.assertIn("no AperturePBR material", status.call_args.args[0])
+
+    async def test_add_asset_that_received_textures_posts_no_status(self):
+        # A texture set that carries no height map is ordinary, not a fault worth announcing on every add.
+        # Arrange
+        status = self._subscribe(self.controller.subscribe_status_message)
+        texture_set = ScatterTextureSet(
+            overrides=(
+                ScatterMaterialOverride(
+                    shader_rel_path="XForms/Looks/rock/Shader",
+                    inputs={"inputs:diffuse_texture": "rock.a.rtex.dds"},
+                ),
+            ),
+            unresolved=("inputs:height_texture",),
+        )
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=texture_set):
+            # Act
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        # Assert
+        status.assert_not_called()
+
+    async def test_add_asset_that_supplies_its_own_textures_posts_no_status(self):
+        # Arrange
+        status = self._subscribe(self.controller.subscribe_status_message)
+        texture_set = ScatterTextureSet(
+            assigned=("inputs:diffuse_texture",),
+            unresolved=("inputs:height_texture",),
+            reason="no matching ingested texture set was found for this asset",
+        )
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=texture_set):
+            # Act
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        # Assert
+        status.assert_not_called()
+
+    async def test_ensure_asset_textures_backfills_an_entry_restored_from_carb(self):
+        # Arrange
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=None):
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        texture_set = ScatterTextureSet(source_hash="abc")
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=texture_set):
+            # Act
+            changed = self.controller.ensure_asset_textures()
+
+        # Assert
+        self.assertTrue(changed)
+        self.assertEqual(self.controller.assets[0].textures, texture_set)
+
+    async def test_ensure_asset_textures_re_resolves_when_the_asset_was_re_ingested(self):
+        # Arrange
+        stale = ScatterTextureSet(source_hash="old")
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=stale):
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        fresh = ScatterTextureSet(source_hash="new")
+
+        with mock.patch.object(controller_module, "asset_source_hash", return_value="new"):
+            with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=fresh):
+                # Act
+                changed = self.controller.ensure_asset_textures()
+
+        # Assert
+        self.assertTrue(changed)
+        self.assertEqual(self.controller.assets[0].textures, fresh)
+
+    async def test_ensure_asset_textures_leaves_an_up_to_date_entry_alone(self):
+        # Arrange
+        texture_set = ScatterTextureSet(source_hash="same")
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=texture_set):
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        with mock.patch.object(controller_module, "asset_source_hash", return_value="same"):
+            with mock.patch.object(controller_module, "resolve_asset_texture_set") as resolve:
+                # Act
+                changed = self.controller.ensure_asset_textures()
+
+        # Assert
+        self.assertFalse(changed)
+        resolve.assert_not_called()
+
+    async def test_set_asset_texture_source_re_resolves_with_the_picked_texture(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        picked = "C:/project/assets/ingested/SubUSDs/textures/rock.a.rtex.dds"
+        resolved = ScatterTextureSet(source_hash="abc")
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=resolved) as resolve:
+            # Act
+            updated = self.controller.set_asset_texture_source(_ROCK, picked)
+
+        # Assert
+        self.assertTrue(updated)
+        resolve.assert_called_once_with(_ROCK, picked)
+        self.assertEqual(self.controller.assets[0].texture_source, picked)
+
+    async def test_set_asset_texture_source_for_an_unknown_asset_returns_false(self):
+        # Act / Assert
+        self.assertFalse(self.controller.set_asset_texture_source(_GRASS, "whatever.dds"))
+
+    async def test_materials_payload_is_empty_when_assign_textures_is_off(self):
+        # Arrange
+        self.controller.update_settings(assign_textures=False)
+        layer = Usd.Stage.CreateInMemory().GetEditTarget().GetLayer()
+
+        with mock.patch.object(controller_module, "build_materials_payload") as build:
+            # Act
+            payload = self.controller.materials_payload(layer)
+
+        # Assert
+        self.assertEqual(payload, {})
+        build.assert_not_called()
+
+    async def test_materials_payload_builds_from_the_enabled_assets(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        layer = Usd.Stage.CreateInMemory().GetEditTarget().GetLayer()
+
+        with mock.patch.object(controller_module, "build_materials_payload", return_value={"a": []}) as build:
+            # Act
+            payload = self.controller.materials_payload(layer)
+
+        # Assert
+        self.assertEqual(payload, {"a": []})
+        self.assertEqual([asset.path for asset in build.call_args.args[1]], [_ROCK])
+
     async def test_flood_with_explicit_target_executes_flood_command_inside_undo_group(self):
         # Arrange
         stage = Usd.Stage.CreateInMemory()
@@ -719,6 +923,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
             context_name="scatter_context",
             layer_identifier=stage.GetEditTarget().GetLayer().identifier,
             records=[{"prim_name": "s_1"}, {"prim_name": "s_2"}],
+            materials={},
         )
         patched["generate_flood"].assert_called_once()
         flood_args = patched["generate_flood"].call_args.args

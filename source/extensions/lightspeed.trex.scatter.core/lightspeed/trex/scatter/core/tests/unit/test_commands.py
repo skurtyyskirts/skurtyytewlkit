@@ -53,6 +53,15 @@ def Xform "Root"
 """
 
 
+def _material_override() -> dict:
+    """One shader override payload of the shape ``build_materials_payload`` produces."""
+    return {
+        "shader_rel_path": "XForms/Looks/brick/Shader",
+        "inputs": {"inputs:diffuse_texture": "./textures/brick.a.rtex.dds"},
+        "encoding": None,
+    }
+
+
 def _write_asset(temp_dir: tempfile.TemporaryDirectory, file_name: str) -> str:
     path = pathlib.Path(temp_dir.name) / "assets" / file_name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +115,11 @@ class TestScatterStrokeCommand(omni.kit.test.AsyncTestCase):
         self._temp_dir.cleanup()
 
     def _execute_place(
-        self, records: list[PlacementRecord], already_applied: bool = True, layer_identifier: str | None = None
+        self,
+        records: list[PlacementRecord],
+        already_applied: bool = True,
+        layer_identifier: str | None = None,
+        materials: dict | None = None,
     ) -> tuple[bool, object]:
         return omni.kit.commands.execute(
             "ScatterStrokeCommand",
@@ -115,7 +128,16 @@ class TestScatterStrokeCommand(omni.kit.test.AsyncTestCase):
             kind=ScatterStrokeKind.PLACE.value,
             records=[record.to_dict() for record in records],
             already_applied=already_applied,
+            materials=materials,
         )
+
+    async def _redo_place_with_materials(self) -> str:
+        """Paint, undo and redo a stroke that carries a texture override; returns the shader path it authors."""
+        materials = {self._asset: [_material_override()]}
+        self._execute_place(self._records, already_applied=False, materials=materials)
+        omni.kit.undo.undo()
+        omni.kit.undo.redo()
+        return f"{self._records[0].prim_path}/XForms/Looks/brick/Shader"
 
     def _execute_erase(
         self, prim_paths: list[str], snapshot_layer: Sdf.Layer | None, already_applied: bool = True
@@ -350,6 +372,41 @@ class TestScatterStrokeCommand(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertIsNone(self._layer.GetPrimAtPath(_CONTAINER_PATH))
 
+    async def test_place_authors_the_texture_overrides_it_was_given(self):
+        # Arrange
+        materials = {self._asset: [_material_override()]}
+
+        # Act
+        self._execute_place(self._records, already_applied=False, materials=materials)
+
+        # Assert
+        shader = self._layer.GetPrimAtPath(f"{self._records[0].prim_path}/XForms/Looks/brick/Shader")
+        self.assertIsNotNone(shader)
+        self.assertEqual(shader.attributes["inputs:diffuse_texture"].default.path, "./textures/brick.a.rtex.dds")
+
+    async def test_place_redo_reauthors_the_texture_overrides_from_the_command_payload(self):
+        # The command never reaches back to the brush, so a redo must still work after the asset left the palette.
+        # Arrange
+        shader_path = await self._redo_place_with_materials()
+
+        # Act
+        shader = self._layer.GetPrimAtPath(shader_path)
+
+        # Assert
+        self.assertIsNotNone(shader)
+        self.assertEqual(shader.attributes["inputs:diffuse_texture"].default.path, "./textures/brick.a.rtex.dds")
+
+    async def test_place_undo_after_redo_removes_the_texture_overrides_again(self):
+        # Arrange
+        shader_path = await self._redo_place_with_materials()
+
+        # Act
+        omni.kit.undo.undo()
+
+        # Assert
+        self.assertIsNone(self._layer.GetPrimAtPath(shader_path))
+        self.assertIsNone(self._layer.GetPrimAtPath(self._records[0].prim_path))
+
 
 class TestScatterFloodCommand(omni.kit.test.AsyncTestCase):
     async def setUp(self):
@@ -437,3 +494,22 @@ class TestScatterFloodCommand(omni.kit.test.AsyncTestCase):
         self.assertEqual(created, [])
         log_warn_mock.assert_called_once()
         self.assertIsNone(self._layer.GetPrimAtPath(_CONTAINER_PATH))
+
+    async def test_flood_undo_removes_the_texture_overrides_with_the_placements(self):
+        # Arrange
+        materials = {self._asset: [_material_override()]}
+        omni.kit.commands.execute(
+            "ScatterFloodCommand",
+            context_name="",
+            layer_identifier=self._layer.identifier,
+            records=[record.to_dict() for record in self._records],
+            materials=materials,
+        )
+        shader_path = f"{self._records[0].prim_path}/XForms/Looks/brick/Shader"
+        self.assertIsNotNone(self._layer.GetPrimAtPath(shader_path))
+
+        # Act
+        omni.kit.undo.undo()
+
+        # Assert
+        self.assertIsNone(self._layer.GetPrimAtPath(shader_path))

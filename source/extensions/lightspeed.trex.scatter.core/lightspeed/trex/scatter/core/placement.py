@@ -66,6 +66,7 @@ from .targets import ScatterTarget
 _LOG_PREFIX = "[lightspeed.trex.scatter.core]"
 _XFORM_TYPE_NAME = "Xform"
 _XFORM_OP_ORDER = ("xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale")
+_ENCODING_INPUT = "inputs:encoding"
 
 
 @dataclass
@@ -313,16 +314,25 @@ def erase_candidates(
     return candidates
 
 
-def author_placements(layer: Sdf.Layer, records: Sequence[PlacementRecord]) -> list[str]:
+def author_placements(
+    layer: Sdf.Layer,
+    records: Sequence[PlacementRecord],
+    materials: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+) -> list[str]:
     """Author the placement prims described by ``records`` into ``layer`` with pure Sdf edits.
 
     Each container is ensured as a ``def Xform`` carrying the scatter marker and brush id; each placement is a
     ``def Xform`` with a prepended reference, the Remix reference and scatter markers, the asset path and explicit
     translate / rotateXYZ / scale ops. Existing prim names are left untouched.
 
+    When ``materials`` holds an entry for a record's asset, the texture inputs it names are authored as overrides
+    beneath the placement, so the whole subtree still belongs to the placement and undo removes it with the prim.
+
     Args:
         layer: Layer to author in.
         records: Placements to author.
+        materials: Relative asset path to the shader overrides to author, as built by
+            ``lightspeed.trex.scatter.core.materials.build_materials_payload``.
 
     Returns:
         The paths of the prims that were created.
@@ -353,8 +363,31 @@ def author_placements(layer: Sdf.Layer, records: Sequence[PlacementRecord]) -> l
                 Vt.TokenArray(list(_XFORM_OP_ORDER)),
                 variability=Sdf.VariabilityUniform,
             )
+            if materials:
+                _author_material_overrides(layer, spec, materials.get(record.asset_rel_path))
             created.append(str(spec.path))
     return created
+
+
+def _author_material_overrides(
+    layer: Sdf.Layer, placement_spec: Sdf.PrimSpec, overrides: Sequence[Mapping[str, Any]] | None
+) -> None:
+    """Author the texture inputs of ``overrides`` on shader overs beneath ``placement_spec``.
+
+    ``Sdf.CreatePrimInLayer`` leaves every prim it creates with the default ``over`` specifier, which is exactly what
+    an override chain onto a referenced asset needs. Inputs the placement already carries an opinion for are never
+    touched, so a hand-assigned texture always wins.
+    """
+    for override in overrides or ():
+        shader_rel_path = str(override.get("shader_rel_path", ""))
+        if not shader_rel_path:
+            continue
+        shader_spec = Sdf.CreatePrimInLayer(layer, placement_spec.path.AppendPath(shader_rel_path))
+        for name, texture_path in (override.get("inputs") or {}).items():
+            _set_attribute_if_absent(shader_spec, name, Sdf.ValueTypeNames.Asset, Sdf.AssetPath(texture_path))
+        encoding = override.get("encoding")
+        if encoding is not None:
+            _set_attribute_if_absent(shader_spec, _ENCODING_INPUT, Sdf.ValueTypeNames.Int, int(encoding))
 
 
 def remove_placements(layer: Sdf.Layer, prim_paths: Sequence[str], remove_empty_containers: bool = True) -> None:
@@ -568,6 +601,21 @@ def _set_attribute(
         attr_spec = Sdf.AttributeSpec(spec, name, type_name, variability)
     if custom:
         attr_spec.custom = True
+    attr_spec.default = value
+    return attr_spec
+
+
+def _set_attribute_if_absent(
+    spec: Sdf.PrimSpec, name: str, type_name: Sdf.ValueTypeName, value: Any
+) -> Sdf.AttributeSpec | None:
+    """Author ``value`` on ``spec`` only when the layer has no opinion for ``name`` yet.
+
+    Unlike :func:`_set_attribute` this never replaces an existing value, which is what keeps the brush from clobbering
+    a texture the user assigned by hand.
+    """
+    if name in spec.attributes:
+        return None
+    attr_spec = Sdf.AttributeSpec(spec, name, type_name, Sdf.VariabilityVarying)
     attr_spec.default = value
     return attr_spec
 

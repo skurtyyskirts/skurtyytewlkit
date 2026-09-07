@@ -19,11 +19,13 @@ __all__ = [
     "TestChoicesComboModel",
     "TestDragValueModel",
     "TestFieldBounds",
+    "TestMapsSummary",
     "TestPresetsWidget",
     "TestScatterAssetDelegate",
     "TestScatterAssetItem",
     "TestScatterAssetListWidget",
     "TestScatterAssetModel",
+    "TestScatterAssetTextureSource",
     "TestScatterPane",
     "TestScatterWindow",
     "TestScatterWindowE2E",
@@ -32,10 +34,12 @@ __all__ = [
 
 from .e2e.test_scatter_window import TestScatterWindowE2E
 from .unit.test_asset_list import (
+    TestMapsSummary,
     TestScatterAssetDelegate,
     TestScatterAssetItem,
     TestScatterAssetListWidget,
     TestScatterAssetModel,
+    TestScatterAssetTextureSource,
 )
 from .unit.test_combo_model import TestChoicesComboModel
 from .unit.test_extension import TestTrexScatterWindowExtension

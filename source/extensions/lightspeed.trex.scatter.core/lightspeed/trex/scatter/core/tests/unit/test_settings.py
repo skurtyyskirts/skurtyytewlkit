@@ -79,6 +79,7 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
             "anchor_prototype_path": "",
             "erase_scope": settings_module.EraseScope.ALL_SCATTERED,
             "flood_max_instances": 300,
+            "assign_textures": True,
         }
 
         # Act
@@ -270,6 +271,56 @@ class TestAssetsCarbPersistence(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(loaded, assets)
 
+    async def test_asset_entry_dump_excludes_the_resolved_texture_set(self):
+        # The set holds absolute texture paths of one project, so persisting it would leak them into the next one.
+        # Arrange
+        entry = settings_module.ScatterAssetEntry(path="rock.usd")
+        entry.textures = settings_module.ScatterTextureSet(source_hash="abc")
+
+        # Act
+        dumped = entry.model_dump(mode="json")
+
+        # Assert
+        self.assertNotIn("textures", dumped)
+
+    async def test_asset_entry_persists_a_hand_picked_texture_source(self):
+        # Arrange
+        entry = settings_module.ScatterAssetEntry(path="rock.usd", texture_source="rock.a.rtex.dds")
+
+        # Act
+        dumped = entry.model_dump(mode="json")
+
+        # Assert
+        self.assertEqual(dumped["texture_source"], "rock.a.rtex.dds")
+
+    async def test_asset_entry_from_an_older_persisted_blob_defaults_the_texture_fields(self):
+        # Arrange
+        blob = {"path": "rock.usd", "enabled": True, "weight": 1.0, "up_axis": "Z"}
+
+        # Act
+        entry = settings_module.ScatterAssetEntry.model_validate(blob)
+
+        # Assert
+        self.assertIsNone(entry.textures)
+        self.assertEqual(entry.texture_source, "")
+
+    async def test_texture_set_is_frozen(self):
+        # A palette read hands out shallow copies, so a mutable set would be shared by every copy and every stroke.
+        # Arrange
+        texture_set = settings_module.ScatterTextureSet(source_hash="abc")
+
+        # Act / Assert
+        with self.assertRaises(ValidationError):
+            texture_set.source_hash = "changed"
+
+    async def test_material_override_is_frozen(self):
+        # Arrange
+        override = settings_module.ScatterMaterialOverride(shader_rel_path="XForms/Looks/rock/Shader")
+
+        # Act / Assert
+        with self.assertRaises(ValidationError):
+            override.shader_rel_path = "changed"
+
     async def test_save_assets_to_carb_writes_json_list_to_assets_path(self):
         # Arrange
         interface, store = _make_settings_interface()
@@ -281,7 +332,7 @@ class TestAssetsCarbPersistence(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(
             json.loads(store[constants_module.ASSETS_SETTING_PATH]),
-            [{"path": "rock.usd", "enabled": True, "weight": 1.0, "up_axis": "Z"}],
+            [{"path": "rock.usd", "enabled": True, "weight": 1.0, "up_axis": "Z", "texture_source": ""}],
         )
 
     async def test_load_assets_from_carb_with_invalid_json_returns_empty_list(self):

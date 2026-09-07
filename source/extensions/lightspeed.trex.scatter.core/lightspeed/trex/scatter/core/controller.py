@@ -36,15 +36,18 @@ import omni.kit.commands
 import omni.kit.undo
 import omni.usd
 from omni.flux.utils.common import Event, EventSubscription
+from omni.flux.utils.common.omni_url import OmniUrl
 from pxr import Gf, Sdf, Usd, UsdGeom
 from pydantic import ValidationError
 
 from .assets import read_asset_up_axis
+from .materials import asset_source_hash, build_materials_payload, resolve_asset_texture_set
 from .picking import create_surface_picker
 from .placement import existing_placement_points, generate_flood
 from .presets import PresetStore, get_default_presets_directory
 from .sampling import PaddingIndex, stage_up_axis, stamp_rng
 from .settings import (
+    RANGE_PAIRS,
     ScatterAssetEntry,
     ScatterBrushSettings,
     TargetMode,
@@ -84,6 +87,34 @@ def _normalize_asset_path(path: str) -> str:
 def _asset_key(path: str) -> str:
     """Return the comparison key used to detect duplicate asset paths on the current platform."""
     return os.path.normcase(os.path.normpath(_normalize_asset_path(path)))
+
+
+def _asset_display_name(path: str) -> str:
+    """Return the file name of an asset, for status messages."""
+    return OmniUrl(path).name or path
+
+
+def _input_display_name(input_name: str) -> str:
+    """Return a shader input name without its ``inputs:`` prefix, for status messages."""
+    return input_name.removeprefix("inputs:")
+
+
+def _with_ranges_ordered(current: dict, updates: dict) -> dict:
+    """Merge ``updates`` into ``current``, moving the untouched end of an inverted low/high pair out of the way.
+
+    Only the end the caller did not set is moved: when both ends arrive together and still conflict, the caller asked
+    for something contradictory and validation should say so.
+    """
+    merged = {**current, **updates}
+    for low_name, high_name in RANGE_PAIRS:
+        low, high = merged[low_name], merged[high_name]
+        if low <= high:
+            continue
+        if high_name in updates and low_name not in updates:
+            merged[low_name] = high
+        elif low_name in updates and high_name not in updates:
+            merged[high_name] = low
+    return merged
 
 
 def _describe_validation_error(exc: ValidationError) -> str:
@@ -147,6 +178,9 @@ class ScatterBrushController:
     def update_settings(self, **kwargs) -> bool:
         """Apply field updates after validating the complete resulting settings.
 
+        Moving one end of a low/high pair past the other carries the other end along, because a drag field reports
+        every value it passes through and would otherwise be unable to cross its partner at all.
+
         Returns False and posts an error status, leaving the settings untouched, when a field is unknown or the merged
         settings fail validation. On success the settings are persisted and ``settings_changed`` fires.
         """
@@ -155,7 +189,7 @@ class ScatterBrushController:
             self.post_status(f"Unknown brush setting: {', '.join(unknown)}", is_error=True)
             return False
         try:
-            validated = ScatterBrushSettings.model_validate({**self._settings.model_dump(), **kwargs})
+            validated = ScatterBrushSettings.model_validate(_with_ranges_ordered(self._settings.model_dump(), kwargs))
         except ValidationError as exc:
             self.post_status(f"Invalid brush setting: {_describe_validation_error(exc)}", is_error=True)
             return False
@@ -181,7 +215,10 @@ class ScatterBrushController:
             return False
         if up_axis is None:
             up_axis = read_asset_up_axis(normalized)
-        self._assets.append(ScatterAssetEntry(path=normalized, up_axis=up_axis))
+        entry = ScatterAssetEntry(path=normalized, up_axis=up_axis)
+        entry.textures = resolve_asset_texture_set(normalized)
+        self._assets.append(entry)
+        self._report_texture_set(entry)
         self._assets_changed()
         return True
 
@@ -205,6 +242,50 @@ class ScatterBrushController:
     def set_asset_up_axis(self, path: str, up_axis: UpAxis) -> bool:
         """Override the authored up axis of a palette entry. Returns False when the path is unknown."""
         return self._update_asset(path, "up_axis", up_axis)
+
+    def set_asset_texture_source(self, path: str, texture_path: str) -> bool:
+        """Point a palette entry at a texture set instead of auto-detecting one, or clear the override with "".
+
+        The picked texture's siblings become the only candidates, which is how an asset whose textures are named after
+        something else gets them assigned. Returns False when the path is unknown.
+        """
+        entry = self._find_asset(path)
+        if entry is None:
+            return False
+        entry.texture_source = _normalize_asset_path(texture_path)
+        entry.textures = resolve_asset_texture_set(entry.path, entry.texture_source)
+        self._report_texture_set(entry)
+        self._assets_changed()
+        return True
+
+    def ensure_asset_textures(self) -> bool:
+        """Resolve the texture set of every palette entry that has none or whose asset was re-ingested.
+
+        Entries restored from carb never went through ``add_asset``, so this is what fills them in. Call it when the
+        palette is displayed or before a flood, never from the ``assets`` properties, which run on every UI refresh.
+
+        Returns:
+            Whether any entry changed.
+        """
+        changed = False
+        for entry in self._assets:
+            texture_set = entry.textures
+            if texture_set is not None and texture_set.source_hash == asset_source_hash(entry.path):
+                continue
+            entry.textures = resolve_asset_texture_set(entry.path, entry.texture_source)
+            changed = True
+        if changed:
+            self._assets_changed()
+        return changed
+
+    def materials_payload(self, layer: Sdf.Layer, assets: Sequence[ScatterAssetEntry] | None = None) -> dict:
+        """Build the shader-override payload for ``assets`` (the enabled palette by default).
+
+        Returns an empty payload when ``assign_textures`` is off, so callers can pass the result straight through.
+        """
+        if not self._settings.assign_textures:
+            return {}
+        return build_materials_payload(layer, self.enabled_assets() if assets is None else assets)
 
     def enabled_assets(self) -> list[ScatterAssetEntry]:
         """Copy of the enabled palette entries in palette order."""
@@ -319,6 +400,7 @@ class ScatterBrushController:
         if stage is None:
             self.post_status("Open a project before flooding", is_error=True)
             return 0
+        self.ensure_asset_textures()
         assets = self.enabled_assets()
         if not assets:
             self.post_status("Add and enable at least one asset before flooding", is_error=True)
@@ -333,6 +415,7 @@ class ScatterBrushController:
             return 0
 
         layer = stage.GetEditTarget().GetLayer()
+        materials = self.materials_payload(layer, assets)
         stage_up = stage_up_axis(stage)
         seed, stroke_index = self.next_stroke()
         remaining = self._settings.flood_max_instances
@@ -363,6 +446,7 @@ class ScatterBrushController:
                     context_name=usd_context_name,
                     layer_identifier=layer.identifier,
                     records=[record.to_dict() for record in records],
+                    materials=materials,
                 )
                 total += len(records)
                 remaining -= len(records)
@@ -433,6 +517,22 @@ class ScatterBrushController:
             return False
         self._assets_changed()
         return True
+
+    def _report_texture_set(self, entry: ScatterAssetEntry) -> None:
+        """Post one status line when an entry's textures could not be resolved, and stay quiet when they are fine.
+
+        An asset that supplies its own textures is silent even though it leaves most AperturePBR inputs empty: almost
+        no asset uses all of them, so reporting that would be noise on every healthy asset.
+        """
+        texture_set = entry.textures
+        if texture_set is None:
+            return
+        if texture_set.overrides or texture_set.assigned or not texture_set.reason:
+            # Nothing to say: the asset either got its textures or already had them. Which maps a texture set does
+            # not contain is shown in the row's tooltip rather than announced, because no asset carries every input
+            # AperturePBR declares and saying so on every add would be pure noise.
+            return
+        self.post_status(f"{_asset_display_name(entry.path)}: {texture_set.reason}")
 
     def _assets_changed(self) -> None:
         """Persist the palette and notify subscribers."""

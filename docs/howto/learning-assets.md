@@ -137,6 +137,39 @@ first; refer to [Ingesting Assets](learning-ingestion.md). Each row in the palet
 relative selection **Weight**, and assigned the **Up Axis** it was authored with (Y or Z), which the brush uses to
 keep the asset upright on the surface it paints onto.
 
+### Textures
+
+Painted assets come out with their textures already assigned, so there is no second pass through the material
+properties panel. With **Assign Textures** on, the brush looks for the asset's ingested texture set and fills in the
+maps its material leaves empty — albedo, normal (with the right encoding), roughness, height, metallic and emissive —
+using the same detection as the **Assign Texture Sets** button. Textures the asset already carries are never
+replaced, and neither is one you assigned by hand.
+
+The **Maps** column shows what will happen before you paint:
+
+| Cell | Meaning |
+|---|---|
+| `asset` | The asset supplies its own textures; the brush adds nothing. |
+| `A N R` | The brush will assign these maps: **A**lbedo, **N**ormal, **R**oughness, **H**eight, **M**etallic, **E**missive. Maps the set does not contain are named in the tooltip, not counted here — a texture set without a normal map is ordinary, not a fault. |
+| `none` | Nothing to assign, or no matching texture set was found. The tooltip says which. |
+
+A texture is matched when its file name contains the material's or the asset's own name followed by the name of a
+texture type. The name does not have to come first, so an asset pack's prefix is no obstacle:
+`Quaternius_Leaves_diff.a.rtex.dds` is claimed by a material called `Leaves`. What has to follow is the texture type,
+which is why `grass_medium_02_diff_4k.a.rtex.dds` is left for `grass_medium_02` and never taken by a material merely
+called `grass` — the word after `grass` there is `medium`, not a texture type.
+
+That rule deliberately errs toward assigning nothing rather than assigning another asset's textures, so a material
+whose name carries extra words (`Leaves_NormalTree`) may find nothing even when a sensible human guess exists. When
+detection finds nothing, or picks the wrong set, use the button in the **Maps** cell to choose one texture of the
+right set yourself; the rest are matched to it by name. The button then reads **auto**, which puts the row back on
+automatic detection.
+
+```{tip}
+An asset whose material has no textures at all, and no texture set on disk to find, needs its textures ingested
+before the brush can assign them. Name them after the asset's material so they are picked up automatically.
+```
+
 ### Painting
 
 With at least one enabled asset in the palette and paint mode on:
@@ -164,7 +197,9 @@ The Scatter window groups the brush parameters into collapsible sections:
   **ADVANCED ROTATION** sub-section).
 * **SCALE** — random scale per placement, with an enable toggle, a uniform **Min**/**Max** range, **Bias** (skews the
   distribution toward the minimum at -1 or the maximum at 1), **Weight** (sharpens the distribution above 1 or
-  flattens it below 1), and, once **Uniform** is turned off, a separate Min/Max range per axis.
+  flattens it below 1), and, once **Uniform** is turned off, a separate Min/Max range per axis. Dragging a **Min**
+  above its **Max**, or a **Max** below its **Min**, carries the other end along, so either end can be moved
+  anywhere without first making room for it. The same applies to the rotation ranges.
 * **RANDOM** — the stroke's random **Seed**, with **Reroll** drawing a new one on demand, and **Randomize**, which
   draws a fresh seed for every stroke instead of reusing the fixed one.
 * **TARGET** — which captured meshes receive placements: **Apply To** (All or Selected), **Target Mode** (Hit

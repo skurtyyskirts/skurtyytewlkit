@@ -154,6 +154,18 @@ class TestScatterWindowE2E(AsyncTestCase):
         self.assertEqual(self._controller.settings.conform_to_surface, not conform_before)
         self.assertEqual(conform_checkbox.widget.model.get_value_as_bool(), not conform_before)
 
+    async def test_assign_textures_checkbox_click_flips_assign_textures(self):
+        # The user turns off "Assign Textures" in the ASSETS section to paint an asset without its maps.
+        assign_checkbox = await self._find_control("CheckBox", "scatter_assign_textures")
+        assign_before = self._controller.settings.assign_textures
+        self.assertEqual(assign_checkbox.widget.model.get_value_as_bool(), assign_before)
+        await assign_checkbox.click()
+        await ui_test.human_delay(5)
+
+        # The brush follows the checkbox.
+        self.assertEqual(self._controller.settings.assign_textures, not assign_before)
+        self.assertEqual(assign_checkbox.widget.model.get_value_as_bool(), not assign_before)
+
     async def test_falloff_combo_selection_updates_falloff(self):
         # The user picks another falloff curve in the BRUSH section; the combo lists the curves in enum order.
         falloff_combo = await self._find_control("ComboBox", "scatter_falloff")

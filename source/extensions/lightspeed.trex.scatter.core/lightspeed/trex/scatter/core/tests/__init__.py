@@ -20,6 +20,7 @@ from .unit.test_assets import TestAssets
 from .unit.test_commands import TestScatterFloodCommand, TestScatterStrokeCommand
 from .unit.test_controller import TestScatterBrushController, TestScatterBrushControllerSingleton
 from .unit.test_geometry import TestGeometryFunctions, TestMeshGeometry, TestMeshSurfaceCache
+from .unit.test_materials import TestBuildMaterialsPayload, TestResolveAssetTextureSet
 from .unit.test_picking import (
     TestCameraRayFromNdc,
     TestCpuRaySurfacePicker,
@@ -36,6 +37,7 @@ from .unit.test_targets import TestTargets
 __all__ = (
     "TestAssets",
     "TestAssetsCarbPersistence",
+    "TestBuildMaterialsPayload",
     "TestCameraRayFromNdc",
     "TestCpuRaySurfacePicker",
     "TestCreateSurfacePicker",
@@ -48,6 +50,7 @@ __all__ = (
     "TestPlacementFunctions",
     "TestPlacementRecord",
     "TestPresetStore",
+    "TestResolveAssetTextureSet",
     "TestSamplingFunctions",
     "TestScatterAssetEntry",
     "TestScatterBrushController",

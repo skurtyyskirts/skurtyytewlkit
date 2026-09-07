@@ -117,6 +117,9 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
 
         self.generate_stamp = enter(mock.patch.object(stroke_module, "generate_stamp", return_value=[]))
         self.author_placements = enter(mock.patch.object(stroke_module, "author_placements", return_value=[]))
+        self.build_materials_payload = enter(
+            mock.patch.object(stroke_module, "build_materials_payload", return_value={})
+        )
         self.erase_candidates = enter(mock.patch.object(stroke_module, "erase_candidates", return_value=[]))
         self.snapshot_prims = enter(mock.patch.object(stroke_module, "snapshot_prims"))
         self.remove_placements = enter(mock.patch.object(stroke_module, "remove_placements"))
@@ -253,8 +256,43 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
         session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
 
         # Assert
-        self.author_placements.assert_called_once_with(self.layer, records)
+        self.author_placements.assert_called_once_with(self.layer, records, {})
         self.assertEqual(session.placed_count, 2)
+
+    async def test_begin_builds_the_materials_payload_once_for_the_whole_stroke(self):
+        # Arrange
+        session = self._make_session(stamp_spacing=10.0)
+
+        # Act
+        session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
+        session.update(_make_hit((35.0, 0.0, 0.0)), self.target_a, _make_sample((35.0, 0.0, 0.0)))
+
+        # Assert
+        self.build_materials_payload.assert_called_once_with(self.layer, self.assets)
+
+    async def test_begin_with_assign_textures_off_builds_no_payload(self):
+        # Arrange
+        self.generate_stamp.return_value = [_make_record("s_1")]
+        session = self._make_session(assign_textures=False)
+
+        # Act
+        session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
+
+        # Assert
+        self.build_materials_payload.assert_not_called()
+        self.assertEqual(self.author_placements.call_args.args[2], {})
+
+    async def test_begin_passes_the_materials_payload_to_the_authoring_call(self):
+        # Arrange
+        self.build_materials_payload.return_value = {"rock.usd": [{"shader_rel_path": "S"}]}
+        self.generate_stamp.return_value = [_make_record("s_1")]
+        session = self._make_session()
+
+        # Act
+        session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
+
+        # Assert
+        self.assertEqual(self.author_placements.call_args.args[2], {"rock.usd": [{"shader_rel_path": "S"}]})
 
     async def test_update_along_straight_segment_stamps_every_spacing(self):
         # Arrange
@@ -429,6 +467,7 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
             kind="PLACE",
             records=[{"prim_name": "s_1"}, {"prim_name": "s_2"}],
             already_applied=True,
+            materials={},
         )
         self.end_interaction.assert_called_once_with(self.token)
         self.assertFalse(session.active)

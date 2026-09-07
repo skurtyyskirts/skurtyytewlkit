@@ -6,7 +6,9 @@ presets. It has no UI.
 
 ## Responsibilities
 
-- Own the brush settings model (`ScatterBrushSettings`, `ScatterAssetEntry`) and persist it in carb settings
+- Own the brush settings model (`ScatterBrushSettings`, `ScatterAssetEntry`) and persist it in carb settings.
+  The model rejects a low/high pair that is out of order; the controller keeps a pair ordered by carrying the
+  end the caller did not set, so a drag field can move one end past the other
 - Store named presets as JSON files (`PresetStore`)
 - Resolve a surface hit to a Remix scatter target: the prototype `/RootNode/meshes/mesh_<HASH>` that will parent the
   placements, the instance that was hit, and the capture mesh used for geometry queries (`targets.py`)
@@ -17,6 +19,7 @@ presets. It has no UI.
 - Generate stamps and floods (`placement.py`, `sampling.py`): seeded disk sampling, falloff and strength acceptance,
   padding against existing placements, weighted asset choice, parent-space transform composition with
   conform-to-surface, align-to-stroke, per-axis rotation and scale ranges, and per-asset up-axis correction
+- Resolve the ingested texture set of a palette asset and author the inputs its material leaves empty as overrides under each placement (`materials.py`)
 - Author and remove placements with pure `Sdf` edits and wrap each stroke in one undoable command
   (`ScatterStrokeCommand`, `ScatterFloodCommand`)
 - Run the stroke state machine (`StrokeSession`) and expose the shared brush state and events through
@@ -29,6 +32,7 @@ presets. It has no UI.
   `lightspeed.trex.viewports.shared.widget`
 - Does not ingest assets or show ingestion dialogs; callers gate assets with
   `lightspeed.trex.utils.widget.asset_validation` before adding them to the brush
+- Does not create or bind materials, and never overwrites a texture an asset or the user already authored; an asset without a material is painted as it is and reported through a status message
 - Does not author `UsdGeom.PointInstancer` prims or physics settling; every placement is an `Xform` with a reference so
   the Selection Panel, Stage Manager and packaging treat it as an ordinary replacement reference
 
@@ -50,6 +54,15 @@ HdRemix picking returns a prim path and a world position but no normal and allow
 issues one pick per stamp and derives every other sample, the surface normal and the projection from the cached mesh
 triangles on the CPU.
 
+Texture assignment reuses Remix's own texture-set logic rather than repeating it: `determine_ideal_types` for the
+type of each candidate file and `TEXTURE_TYPE_INPUT_MAP` for the AperturePBR input it belongs on. A set is resolved
+once per palette asset (`resolve_asset_texture_set`), cached on the entry and rebuilt when the asset's ingestion hash
+changes; a stroke turns the palette into one payload (`build_materials_payload`) before its first stamp. The inputs
+are authored as `over` specs beneath the placement prim itself, so they belong to the placement: `remove_placements`
+and the stroke snapshots take them along without knowing they exist, and the material that resolves is still the
+asset's own. Only inputs the asset leaves empty are ever written, and `inputs:encoding` is written only alongside a
+normal map the brush authors itself, because the value an asset declares without a normal map describes nothing.
+
 A stroke writes placements directly into the edit layer while the mouse moves (so the viewport updates live) and
 commits a single `ScatterStrokeCommand` on release; the first `do()` of that command is a no-op, `undo()` removes the
 placements and redo re-authors them. Erase strokes snapshot the removed specs with `Sdf.CopySpec` so undo restores
@@ -66,6 +79,7 @@ them. No `omni.kit.undo` group is held open across frames.
 - `ScatterStrokeCommand`, `ScatterFloodCommand` — undoable mutations
 - `StrokeSession` — spacing accumulator, per-target records, single commit
 - `ScatterBrushController` — singleton brush state (mode, settings, assets, presets, anchor) with events
+- `resolve_asset_texture_set`, `build_materials_payload` — texture-set resolution and the authoring payload
 
 ## Settings
 
@@ -86,3 +100,10 @@ them. No `omni.kit.undo` group is held open across frames.
   left untouched and reported once per stroke in the log
 - A single mouse move that would need more than 256 stamps (for example a grazing pick across the sky) restarts the
   stroke segment at the new sample instead of stamping the whole jump
+- Texture assignment happens when a placement is authored, so it does not reach placements that were already painted;
+  erase and repaint them, or assign the textures through the Texture Replacements surface, which lists scatter shaders
+- Auto-detection claims a texture whose file name contains the material's or the asset's own name followed by the
+  name of a texture type. The name may sit anywhere, so an asset pack's own prefix is fine
+  (`Quaternius_Leaves_diff` belongs to a material called `Leaves`), and a descriptor may span two words (`nor_gl`).
+  A material whose name carries words the texture does not (`Leaves_NormalTree` against `Quaternius_Leaves_diff`) is
+  left unassigned rather than matched on a hunch; the per-asset override resolves those cases

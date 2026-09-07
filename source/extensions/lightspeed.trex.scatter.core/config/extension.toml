@@ -16,9 +16,12 @@ icon = "data/icon.png"
 "lightspeed.common" = {}
 "lightspeed.hydra.remix.core" = {}
 "lightspeed.trex.asset_replacements.core.shared" = {}
+"lightspeed.trex.utils.common" = {}
 "omni.client" = {}
+"omni.flux.asset_importer.core" = {}
 "omni.flux.pip_archive" = {}
 "omni.flux.utils.common" = {}
+"omni.flux.validator.factory" = {}
 "omni.kit.commands" = {}
 "omni.usd" = {}
 

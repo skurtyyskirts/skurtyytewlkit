@@ -15,7 +15,14 @@
 * limitations under the License.
 """
 
-__all__ = ["TestScatterAssetDelegate", "TestScatterAssetItem", "TestScatterAssetListWidget", "TestScatterAssetModel"]
+__all__ = [
+    "TestMapsSummary",
+    "TestScatterAssetDelegate",
+    "TestScatterAssetItem",
+    "TestScatterAssetListWidget",
+    "TestScatterAssetModel",
+    "TestScatterAssetTextureSource",
+]
 
 import contextlib
 import tempfile
@@ -28,7 +35,12 @@ import omni.kit.test
 import omni.usd
 from lightspeed.trex.scatter.core import controller as controller_module
 from lightspeed.trex.scatter.core import settings as settings_module
-from lightspeed.trex.scatter.core.settings import ScatterAssetEntry, UpAxis
+from lightspeed.trex.scatter.core.settings import (
+    ScatterAssetEntry,
+    ScatterMaterialOverride,
+    ScatterTextureSet,
+    UpAxis,
+)
 from lightspeed.trex.scatter.widget import asset_list as asset_list_module
 from omni import ui
 from omni.flux.utils.widget.drag_field import FloatBoundedDrag
@@ -40,6 +52,14 @@ _GRASS = "C:/project/assets/ingested/grass.usd"
 _BROWSE_PLACEHOLDER = "Browse ingested models..."
 _TEST_SETTINGS_PATH = "/exts/lightspeed.trex.scatter.widget.tests/asset_list/brushSettings"
 _TEST_ASSETS_PATH = "/exts/lightspeed.trex.scatter.widget.tests/asset_list/assets"
+_NO_MAPS = "none"
+
+
+def _entry_with_textures(texture_set: ScatterTextureSet) -> ScatterAssetEntry:
+    """Build a palette entry carrying an already-resolved texture set."""
+    entry = ScatterAssetEntry(path=_ROCK)
+    entry.textures = texture_set
+    return entry
 
 
 def _accept_immediately(asset_path, _layer, _asset_core, _context, accept_handler, **_kwargs) -> bool:
@@ -102,6 +122,10 @@ class _AssetListTestCase(omni.kit.test.AsyncTestCase):
 
     def _asset_paths(self) -> list[str]:
         return [entry.path for entry in self.controller.assets]
+
+    def _row_query(self, widget_type: str, identifier: str) -> str:
+        """Return the ui_test selector for a cell widget of a palette row."""
+        return f"{self.window.title}//Frame/**/{widget_type}[*].identifier=='{identifier}'"
 
     async def _add_assets(self, *paths: str) -> list[asset_list_module.ScatterAssetItem]:
         """Add assets through the controller and return the rows built for them."""
@@ -452,14 +476,15 @@ class TestScatterAssetModel(_AssetListTestCase):
         model = self.widget.model
 
         # Act
-        column_models = [model.get_item_value_model(row, column) for column in range(4)]
+        column_models = [model.get_item_value_model(row, column) for column in range(5)]
 
         # Assert
-        self.assertEqual(model.get_item_value_model_count(None), 4)
+        self.assertEqual(model.get_item_value_model_count(None), 5)
         self.assertIs(column_models[0], row.enabled_model)
         self.assertEqual(column_models[1].as_string, _ROCK)
         self.assertIs(column_models[2], row.weight_model)
         self.assertIs(column_models[3], row.up_axis_model.index_model)
+        self.assertIs(column_models[4], row.maps_model)
         self.assertIsNone(model.get_item_value_model(None, 0))
 
     async def test_destroy_destroys_rows_and_drops_controller_subscription(self):
@@ -475,6 +500,56 @@ class TestScatterAssetModel(_AssetListTestCase):
         destroy_mock.assert_called_once_with()
         self.assertIsNone(model._assets_changed_sub)
         self.assertEqual(model.get_item_children(None), [])
+
+
+class TestScatterAssetTextureSource(_AssetListTestCase):
+    """Tests the per-asset texture override: picking a set by hand and going back to auto-detection."""
+
+    async def test_picking_a_texture_stores_it_as_the_asset_texture_source(self):
+        # Arrange
+        rows = await self._add_assets(_ROCK)
+
+        # Act
+        self.widget._set_texture_source(rows[0], "C:/project/textures/rock.a.rtex.dds")
+        await omni.kit.app.get_app().next_update_async()
+
+        # Assert
+        self.assertEqual(self.controller.assets[0].texture_source, "C:/project/textures/rock.a.rtex.dds")
+
+    async def test_cancelling_the_picker_leaves_the_texture_source_alone(self):
+        # Arrange
+        rows = await self._add_assets(_ROCK)
+
+        # Act
+        self.widget._set_texture_source(rows[0], "")
+        await omni.kit.app.get_app().next_update_async()
+
+        # Assert
+        self.assertEqual(self.controller.assets[0].texture_source, "")
+
+    async def test_clearing_the_override_goes_back_to_auto_detection(self):
+        # Arrange
+        rows = await self._add_assets(_ROCK)
+        self.widget._set_texture_source(rows[0], "C:/project/textures/rock.a.rtex.dds")
+        await omni.kit.app.get_app().next_update_async()
+
+        # Act
+        self.widget._clear_texture_source(self.widget.model.get_item_children(None)[0])
+        await omni.kit.app.get_app().next_update_async()
+
+        # Assert
+        self.assertEqual(self.controller.assets[0].texture_source, "")
+
+    async def test_opening_the_texture_picker_filters_to_ingested_textures(self):
+        # Arrange
+        rows = await self._add_assets(_ROCK)
+
+        with mock.patch.object(asset_list_module, "open_file_picker") as picker:
+            # Act
+            self.widget._open_texture_picker(rows[0])
+
+        # Assert
+        self.assertEqual(picker.call_args.kwargs["file_extension_options"], [("*.dds", "Ingested Textures")])
 
 
 class TestScatterAssetDelegate(_AssetListTestCase):
@@ -501,6 +576,31 @@ class TestScatterAssetDelegate(_AssetListTestCase):
 
         # Assert
         self.assertEqual(missing, [])
+
+    async def test_build_maps_cell_carries_the_row_identifiers(self):
+        # Arrange
+        await self._add_assets(_ROCK)
+        await omni.kit.app.get_app().next_update_async()
+
+        # Act
+        label = ui_test.find(self._row_query("Label", "scatter_asset_row_0_maps"))
+        button = ui_test.find(self._row_query("Button", "scatter_asset_row_0_set_textures"))
+
+        # Assert
+        self.assertIsNotNone(label)
+        self.assertIsNotNone(button)
+
+    async def test_build_maps_cell_offers_auto_detection_once_a_texture_set_was_picked(self):
+        # Arrange
+        rows = await self._add_assets(_ROCK)
+        self.controller.set_asset_texture_source(rows[0].path, "C:/project/textures/rock.a.rtex.dds")
+        await omni.kit.app.get_app().next_update_async()
+
+        # Act
+        clear = ui_test.find(self._row_query("Button", "scatter_asset_row_0_clear_textures"))
+
+        # Assert
+        self.assertIsNotNone(clear)
 
     async def test_build_weight_cell_disables_batch_edit_and_hands_field_to_row(self):
         # Arrange
@@ -529,6 +629,107 @@ class TestScatterAssetDelegate(_AssetListTestCase):
         # Assert
         self.assertEqual(row.weight_model.as_float, 100.0)
         self.assertEqual(self.controller.assets[0].weight, 100.0)
+
+
+class TestMapsSummary(omni.kit.test.AsyncTestCase):
+    """Tests the Maps cell text, which tells the user what the brush will paint before they paint it."""
+
+    async def test_summary_without_a_resolved_texture_set_shows_the_none_marker(self):
+        # Arrange
+        entry = ScatterAssetEntry(path=_ROCK)
+
+        # Act / Assert
+        self.assertEqual(asset_list_module.maps_summary(entry), _NO_MAPS)
+
+    async def test_summary_for_an_asset_that_carries_everything_shows_asset(self):
+        # Arrange
+        entry = _entry_with_textures(ScatterTextureSet(assigned=("inputs:diffuse_texture",)))
+
+        # Act / Assert
+        self.assertEqual(asset_list_module.maps_summary(entry), "asset")
+
+    async def test_summary_for_an_asset_with_its_own_textures_shows_asset_even_when_inputs_are_unused(self):
+        # Almost no asset fills every AperturePBR input, so an unused one must not read as a problem.
+        # Arrange
+        entry = _entry_with_textures(
+            ScatterTextureSet(
+                assigned=("inputs:diffuse_texture", "inputs:normalmap_texture"),
+                unresolved=("inputs:height_texture", "inputs:metallic_texture"),
+                reason="no matching ingested texture set was found for this asset",
+            )
+        )
+
+        # Act / Assert
+        self.assertEqual(asset_list_module.maps_summary(entry), "asset")
+
+    async def test_summary_lists_a_badge_per_texture_the_brush_will_author(self):
+        # Arrange
+        entry = _entry_with_textures(
+            ScatterTextureSet(
+                overrides=(
+                    ScatterMaterialOverride(
+                        shader_rel_path="XForms/Looks/rock/Shader",
+                        inputs={
+                            "inputs:reflectionroughness_texture": "rock.r.rtex.dds",
+                            "inputs:diffuse_texture": "rock.a.rtex.dds",
+                            "inputs:normalmap_texture": "rock.n.rtex.dds",
+                        },
+                    ),
+                )
+            )
+        )
+
+        # Act / Assert
+        self.assertEqual(asset_list_module.maps_summary(entry), "A N R")
+
+    async def test_summary_names_only_the_maps_that_will_be_painted(self):
+        # Arrange
+        entry = _entry_with_textures(
+            ScatterTextureSet(
+                overrides=(
+                    ScatterMaterialOverride(
+                        shader_rel_path="XForms/Looks/rock/Shader",
+                        inputs={"inputs:diffuse_texture": "rock.a.rtex.dds"},
+                    ),
+                ),
+                unresolved=("inputs:height_texture",),
+            )
+        )
+
+        # Act / Assert
+        self.assertEqual(asset_list_module.maps_summary(entry), "A")
+
+    async def test_summary_with_nothing_found_shows_the_none_marker(self):
+        # Arrange
+        entry = _entry_with_textures(ScatterTextureSet(reason="no ingested textures were found for this asset"))
+
+        # Act / Assert
+        self.assertEqual(asset_list_module.maps_summary(entry), _NO_MAPS)
+
+    async def test_tooltip_names_the_textures_the_asset_owns_and_the_reason(self):
+        # Arrange
+        entry = _entry_with_textures(
+            ScatterTextureSet(
+                overrides=(
+                    ScatterMaterialOverride(
+                        shader_rel_path="XForms/Looks/rock/Shader",
+                        inputs={"inputs:diffuse_texture": "C:/project/textures/rock.a.rtex.dds"},
+                    ),
+                ),
+                assigned=("inputs:normalmap_texture",),
+                unresolved=("inputs:height_texture",),
+                reason="something to say",
+            )
+        )
+
+        # Act
+        tooltip = asset_list_module.maps_tooltip(entry)
+
+        # Assert
+        self.assertIn("diffuse_texture: rock.a.rtex.dds", tooltip)
+        self.assertIn("Already in the asset: normalmap_texture", tooltip)
+        self.assertIn("Not found: height_texture", tooltip)
+        self.assertIn("something to say", tooltip)
 
 
 class TestScatterAssetItem(omni.kit.test.AsyncTestCase):

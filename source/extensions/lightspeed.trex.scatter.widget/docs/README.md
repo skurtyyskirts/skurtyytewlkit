@@ -26,6 +26,15 @@ Dockable **Scatter** window for the RTX Remix asset scatter brush. It edits the 
 - Does not contain scatter math, USD authoring or undo logic; all of that lives in `lightspeed.trex.scatter.core`
 - Does not ingest assets; it only validates and routes to the ingestion workflow through the shared dialogs
 
+## Textures
+
+The ASSETS section carries an **Assign Textures** toggle and a read-only **Maps** column per row. The column names
+only what the brush will paint onto that asset: a badge per map it will author (`A N R`), `asset` when the asset
+supplies its own textures and nothing needs adding, and `none` when there is nothing to assign at all. Maps a
+texture set simply does not contain are listed in the row's tooltip rather than counted in the cell, because a set
+without a normal map is ordinary rather than a fault. The button beside the cell picks a texture set by hand when
+auto-detection finds nothing or picks the wrong one, and turns into **auto** to go back to detection.
+
 ## Architecture
 
 `TrexScatterWindowExtension` instantiates `ScatterWindow` for the StageCraft USD context (`""`) and registers its

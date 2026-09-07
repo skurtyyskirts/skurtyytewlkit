@@ -4,6 +4,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [1.31.0]
 ### Added
 - Added the scatter brush toolbar icon and docked the Scatter window next to the Editor in the StageCraft layout (hidden in the other layouts)
+- Added a `cube_textured` ingested asset and its texture set to the example project so the scatter brush's texture assignment can be tested end to end
 
 ## [1.30.2]
 ### Added

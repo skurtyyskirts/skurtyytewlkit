@@ -427,10 +427,19 @@ class ScatterPane(_WorkspaceWidget):
             "ASSETS",
             "Ingested assets the brush chooses from, weighted by their Weight.\n\n"
             "- Disabled rows are skipped\n"
-            "- Up Axis corrects assets authored with a different up axis than the stage",
+            "- Up Axis corrects assets authored with a different up axis than the stage\n"
+            "- Maps shows the textures the brush will assign; its button picks a set by hand",
         )
         with frame:
-            self._asset_list_widget = ScatterAssetListWidget(self._context_name)
+            with ui.VStack(height=0, spacing=self._SPACING_XS):
+                self.__build_bool_row(
+                    "Assign Textures",
+                    "assign_textures",
+                    "scatter_assign_textures",
+                    "Assign each asset's ingested albedo, normal, roughness and height maps to the prims it paints.\n"
+                    "Textures the asset already carries are never replaced.",
+                )
+                self._asset_list_widget = ScatterAssetListWidget(self._context_name)
 
     def __build_presets_section(self, settings: ScatterBrushSettings):
         frame = self.__build_section("PRESETS", "Named brush presets stored as files in the user documents folder.")

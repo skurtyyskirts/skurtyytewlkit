@@ -16,6 +16,9 @@
 """
 
 __all__ = [
+    "APERTURE_PBR_TEXTURE_INPUTS",
+    "NORMAL_TYPE_ENCODINGS",
+    "RANGE_PAIRS",
     "ApplyTo",
     "CpuRaySurfacePicker",
     "EraseScope",
@@ -31,10 +34,12 @@ __all__ = [
     "ScatterBrushSettings",
     "ScatterCoreExtension",
     "ScatterFloodCommand",
+    "ScatterMaterialOverride",
     "ScatterMode",
     "ScatterStrokeCommand",
     "ScatterStrokeKind",
     "ScatterTarget",
+    "ScatterTextureSet",
     "StrokeSession",
     "SurfaceHit",
     "SurfacePicker",
@@ -44,8 +49,10 @@ __all__ = [
     "area_weighted_triangle_samples",
     "asset_crate_supported",
     "asset_default_prim_name",
+    "asset_source_hash",
     "asset_up_correction",
     "author_placements",
+    "build_materials_payload",
     "build_mesh_geometry",
     "camera_ray_from_ndc",
     "canonical_instance",
@@ -76,6 +83,7 @@ __all__ = [
     "raycast",
     "read_asset_up_axis",
     "remove_placements",
+    "resolve_asset_texture_set",
     "resolve_reference_asset_from_selection",
     "resolve_target",
     "restore_prims",
@@ -120,6 +128,13 @@ from .geometry import (
     raycast,
     triangulate_faces,
 )
+from .materials import (
+    APERTURE_PBR_TEXTURE_INPUTS,
+    NORMAL_TYPE_ENCODINGS,
+    asset_source_hash,
+    build_materials_payload,
+    resolve_asset_texture_set,
+)
 from .picking import (
     CpuRaySurfacePicker,
     HdRemixSurfacePicker,
@@ -159,11 +174,14 @@ from .sampling import (
     up_axis_vector,
 )
 from .settings import (
+    RANGE_PAIRS,
     ApplyTo,
     EraseScope,
     Falloff,
     ScatterAssetEntry,
     ScatterBrushSettings,
+    ScatterMaterialOverride,
+    ScatterTextureSet,
     TargetMode,
     UpAxis,
     load_assets_from_carb,

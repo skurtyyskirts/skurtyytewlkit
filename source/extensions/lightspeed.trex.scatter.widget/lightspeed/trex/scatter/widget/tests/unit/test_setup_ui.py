@@ -84,6 +84,7 @@ _EXPECTED_CONTROLS = (
     ("IntBoundedDrag", "scatter_flood_cap"),
     ("Label", "scatter_flood_estimate"),
     ("Label", "scatter_instance_warning"),
+    ("CheckBox", "scatter_assign_textures"),
 )
 
 
@@ -212,7 +213,9 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         # Assert
         spy.assert_not_called()
 
-    async def test_edit_rotation_z_min_above_max_restores_field_from_settings(self):
+    async def test_drag_rotation_z_min_past_its_max_carries_the_max_along(self):
+        # A drag field reports every value it crosses, so the min has to be able to pass the max rather than be
+        # refused at it.
         # Arrange
         self.controller.update_settings(rotation_z_max=90.0)
         model = self._model("rotation_z_min")
@@ -221,20 +224,24 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         model.set_value(100.0)
 
         # Assert
-        self.assertEqual(self.controller.settings.rotation_z_min, 0.0)
-        self.assertEqual(model.as_float, 0.0)
+        self.assertEqual(self.controller.settings.rotation_z_min, 100.0)
+        self.assertEqual(self.controller.settings.rotation_z_max, 100.0)
+        self.assertEqual(model.as_float, 100.0)
 
-    async def test_edit_rotation_z_min_above_max_shows_error_status(self):
+    async def test_an_edit_the_controller_rejects_restores_the_field_from_the_settings(self):
+        # The drag fields clamp to their own bounds before the controller sees a value, so the rollback path is
+        # driven by a refusing controller rather than by an out-of-bounds number.
         # Arrange
-        self.controller.update_settings(rotation_z_max=90.0)
-        model = self._model("rotation_z_min")
+        model = self._model("radius")
+        unchanged = self.controller.settings.radius
 
         # Act
-        model.set_value(100.0)
+        with mock.patch.object(self.controller, "update_settings", return_value=False):
+            model.set_value(75.0)
 
         # Assert
-        self.assertTrue(self.pane._status_label.text.startswith("Invalid brush setting"))
-        self.assertEqual(self.pane._status_label.style_type_name_override, _STATUS_ERROR_STYLE)
+        self.assertEqual(model.as_float, unchanged)
+        self.assertEqual(self.controller.settings.radius, unchanged)
 
     async def test_select_falloff_combo_index_updates_controller_settings(self):
         # Arrange
@@ -265,6 +272,16 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertFalse(self.controller.settings.conform_to_surface)
+
+    async def test_uncheck_assign_textures_checkbox_updates_controller_settings(self):
+        # Arrange
+        model = self._model("assign_textures")
+
+        # Act
+        model.set_value(False)
+
+        # Assert
+        self.assertFalse(self.controller.settings.assign_textures)
 
     async def test_edit_flood_cap_model_updates_controller_settings(self):
         # Arrange

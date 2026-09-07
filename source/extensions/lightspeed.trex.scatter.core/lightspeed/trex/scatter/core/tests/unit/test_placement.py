@@ -93,6 +93,15 @@ def _build_flat_quad_scene(stage: Usd.Stage) -> None:
     stage.DefinePrim(_PROTOTYPE_ROOT, "Xform")
 
 
+def _material_override(encoding: int | None = None) -> dict:
+    """One shader override payload of the shape ``build_materials_payload`` produces."""
+    return {
+        "shader_rel_path": "XForms/Looks/brick/Shader",
+        "inputs": {"inputs:diffuse_texture": "./textures/brick.a.rtex.dds"},
+        "encoding": encoding,
+    }
+
+
 def _make_record(
     name: str,
     asset_path: str,
@@ -502,6 +511,130 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         prim = self._stage.GetPrimAtPath(record.prim_path)
         self.assertTrue(prim.IsValid())
         self.assertTrue(prim.GetChild("Cube").IsValid())
+
+    async def test_author_placements_without_materials_authors_no_texture_specs(self):
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+
+        # Act
+        author_placements(self._layer, [record])
+
+        # Assert
+        spec = self._layer.GetPrimAtPath(record.prim_path)
+        self.assertEqual(list(spec.nameChildren), [])
+
+    async def test_author_placements_with_materials_authors_the_texture_inputs_under_the_placement(self):
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+        materials = {
+            self._asset_a: [
+                {
+                    "shader_rel_path": "XForms/Looks/brick/Shader",
+                    "inputs": {
+                        "inputs:diffuse_texture": "./textures/brick.a.rtex.dds",
+                        "inputs:normalmap_texture": "./textures/brick.n.rtex.dds",
+                    },
+                    "encoding": 0,
+                }
+            ]
+        }
+
+        # Act
+        author_placements(self._layer, [record], materials)
+
+        # Assert
+        shader = self._layer.GetPrimAtPath(f"{record.prim_path}/XForms/Looks/brick/Shader")
+        self.assertIsNotNone(shader)
+        diffuse = shader.attributes["inputs:diffuse_texture"]
+        self.assertEqual(diffuse.typeName, Sdf.ValueTypeNames.Asset)
+        self.assertEqual(diffuse.default.path, "./textures/brick.a.rtex.dds")
+        self.assertEqual(shader.attributes["inputs:normalmap_texture"].default.path, "./textures/brick.n.rtex.dds")
+
+    async def test_author_placements_with_materials_authors_the_normal_encoding_as_an_int(self):
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+        materials = {self._asset_a: [_material_override(encoding=0)]}
+
+        # Act
+        author_placements(self._layer, [record], materials)
+
+        # Assert
+        encoding = self._layer.GetPrimAtPath(f"{record.prim_path}/XForms/Looks/brick/Shader").attributes[
+            "inputs:encoding"
+        ]
+        self.assertEqual(encoding.typeName, Sdf.ValueTypeNames.Int)
+        self.assertEqual(encoding.default, 0)
+
+    async def test_author_placements_creates_the_shader_ancestors_as_over_specs(self):
+        # The chain has to stay an override so it composes onto the referenced asset instead of defining new prims.
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+
+        # Act
+        author_placements(self._layer, [record], {self._asset_a: [_material_override()]})
+
+        # Assert
+        for relative_path in ("XForms", "XForms/Looks", "XForms/Looks/brick", "XForms/Looks/brick/Shader"):
+            spec = self._layer.GetPrimAtPath(f"{record.prim_path}/{relative_path}")
+            self.assertEqual(spec.specifier, Sdf.SpecifierOver, relative_path)
+
+    async def test_author_placements_does_not_overwrite_an_existing_texture_opinion(self):
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+        author_placements(self._layer, [record], {self._asset_a: [_material_override()]})
+        shader_path = f"{record.prim_path}/XForms/Looks/brick/Shader"
+        self._layer.GetPrimAtPath(shader_path).attributes["inputs:diffuse_texture"].default = Sdf.AssetPath(
+            "./mine.dds"
+        )
+
+        # Act
+        author_placements(
+            self._layer,
+            [_make_record("s_000000000002", self._asset_a)],
+            {self._asset_a: [_material_override()]},
+        )
+        author_placements(self._layer, [record], {self._asset_a: [_material_override()]})
+
+        # Assert
+        held = self._layer.GetPrimAtPath(shader_path).attributes["inputs:diffuse_texture"].default
+        self.assertEqual(held.path, "./mine.dds")
+
+    async def test_author_placements_with_materials_for_another_asset_authors_nothing(self):
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+
+        # Act
+        author_placements(self._layer, [record], {self._asset_b: [_material_override()]})
+
+        # Assert
+        self.assertIsNone(self._layer.GetPrimAtPath(f"{record.prim_path}/XForms/Looks/brick/Shader"))
+
+    async def test_remove_placements_deletes_the_texture_overrides_with_the_placement(self):
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+        author_placements(self._layer, [record], {self._asset_a: [_material_override()]})
+
+        # Act
+        remove_placements(self._layer, [record.prim_path])
+
+        # Assert
+        self.assertIsNone(self._layer.GetPrimAtPath(record.prim_path))
+        self.assertIsNone(self._layer.GetPrimAtPath(_CONTAINER_PATH))
+
+    async def test_snapshot_and_restore_round_trip_the_texture_overrides(self):
+        # Arrange
+        record = _make_record("s_000000000001", self._asset_a)
+        author_placements(self._layer, [record], {self._asset_a: [_material_override()]})
+        snapshot = snapshot_prims(self._layer, [record.prim_path])
+        remove_placements(self._layer, [record.prim_path])
+
+        # Act
+        restore_prims(self._layer, snapshot, [record.prim_path])
+
+        # Assert
+        shader = self._layer.GetPrimAtPath(f"{record.prim_path}/XForms/Looks/brick/Shader")
+        self.assertIsNotNone(shader)
+        self.assertEqual(shader.attributes["inputs:diffuse_texture"].default.path, "./textures/brick.a.rtex.dds")
 
     async def test_author_placements_skips_existing_names(self):
         # Arrange

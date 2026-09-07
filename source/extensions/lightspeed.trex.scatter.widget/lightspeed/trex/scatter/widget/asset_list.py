@@ -21,7 +21,7 @@ __all__ = ["ScatterAssetDelegate", "ScatterAssetItem", "ScatterAssetListWidget",
 
 import asyncio
 import functools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import PurePosixPath
 
 import carb.events
@@ -41,12 +41,91 @@ from lightspeed.trex.scatter.core import (
 from lightspeed.trex.utils.widget import accept_asset_if_valid_for_replacement, open_asset_file_picker
 from omni import ui
 from omni.flux.utils.widget.drag_field import FloatBoundedDrag
+from omni.flux.utils.widget.file_pickers import open_file_picker
 
 from .combo_model import ChoicesComboModel
 from .value_model import DragValueModel, field_bounds
 
 _UP_AXES = tuple(UpAxis)
 _WEIGHT_MIN, _WEIGHT_MAX = field_bounds(ScatterAssetEntry, "weight")
+
+# Plain ASCII on purpose: the omni.ui font has no glyph for an em dash and renders it as "?", which reads as an
+# error rather than "there is nothing to assign".
+_NO_MAPS = "none"
+_ASSET_MAPS = "asset"
+_MAP_LETTERS = (
+    ("inputs:diffuse_texture", "A"),
+    ("inputs:normalmap_texture", "N"),
+    ("inputs:reflectionroughness_texture", "R"),
+    ("inputs:height_texture", "H"),
+    ("inputs:metallic_texture", "M"),
+    ("inputs:emissive_mask_texture", "E"),
+)
+
+
+def _map_letter(input_name: str) -> str:
+    """Return the one-letter badge of a texture input, falling back to its own initial."""
+    for name, letter in _MAP_LETTERS:
+        if name == input_name:
+            return letter
+    return input_name.removeprefix("inputs:")[:1].upper()
+
+
+def _authored_inputs(entry: ScatterAssetEntry) -> list[str]:
+    """Return the texture inputs the brush will author for an entry, in badge order."""
+    texture_set = entry.textures
+    if texture_set is None:
+        return []
+    authored = {name for override in texture_set.overrides for name in override.inputs}
+    ordered = [name for name, _ in _MAP_LETTERS if name in authored]
+    return ordered + sorted(authored.difference(dict(_MAP_LETTERS)))
+
+
+def _row_signature(entry: ScatterAssetEntry) -> tuple[str, str, str]:
+    """Return what a row shows through widgets the delegate builds once rather than through a bound model.
+
+    The enabled, weight and up-axis cells follow their value models, so a change there only needs a push. The maps
+    cell is a plain label beside a button whose label depends on the override, so those have to force a rebuild.
+    """
+    return entry.path, entry.texture_source, maps_summary(entry)
+
+
+def maps_summary(entry: ScatterAssetEntry) -> str:
+    """Return the Maps cell text: what the brush will paint onto this asset.
+
+    ``asset`` means the asset supplies its own textures and the brush adds nothing, which is the normal state of a
+    properly ingested asset. The cell only ever names maps the brush will paint: a texture set that carries no normal
+    map is ordinary, not a fault, so absent maps belong in the tooltip rather than in a count the user has to read.
+    """
+    texture_set = entry.textures
+    if texture_set is None:
+        return _NO_MAPS
+    authored = _authored_inputs(entry)
+    if not authored:
+        return _ASSET_MAPS if texture_set.assigned else _NO_MAPS
+    return " ".join(_map_letter(name) for name in authored)
+
+
+def maps_tooltip(entry: ScatterAssetEntry) -> str:
+    """Return the Maps cell tooltip, naming the textures found, the ones the asset owns and any problem."""
+    texture_set = entry.textures
+    if texture_set is None:
+        return "The textures of this asset have not been resolved yet"
+    lines = []
+    for override in texture_set.overrides:
+        for name, texture in sorted(override.inputs.items()):
+            lines.append(f"{name.removeprefix('inputs:')}: {PurePosixPath(texture).name}")
+    if texture_set.assigned:
+        assigned = ", ".join(name.removeprefix("inputs:") for name in texture_set.assigned)
+        lines.append(f"Already in the asset: {assigned}")
+    if texture_set.unresolved:
+        unresolved = ", ".join(name.removeprefix("inputs:") for name in texture_set.unresolved)
+        lines.append(f"Not found: {unresolved}")
+    if texture_set.reason:
+        lines.append(texture_set.reason)
+    if entry.texture_source:
+        lines.append(f"Texture set picked by hand: {PurePosixPath(entry.texture_source).name}")
+    return "\n".join(lines) or "This asset already carries all of its textures"
 
 
 class ScatterAssetItem(ui.AbstractItem):
@@ -61,6 +140,7 @@ class ScatterAssetItem(ui.AbstractItem):
         path_model: Asset path, for callers that read the tree through ``get_item_value_model``.
         weight_model: Bound to the weight drag field, which installs its hard clamp on it.
         up_axis_model: Bound to the up-axis combo box; its index follows ``UpAxis`` order.
+        maps_model: Read-only summary of the texture maps the brush will author for the asset.
     """
 
     def __init__(self, entry: ScatterAssetEntry):
@@ -70,6 +150,7 @@ class ScatterAssetItem(ui.AbstractItem):
         self.path_model = ui.SimpleStringModel(entry.path)
         self.weight_model = DragValueModel(float(entry.weight))
         self.up_axis_model = ChoicesComboModel([axis.value for axis in _UP_AXES], _UP_AXES.index(entry.up_axis))
+        self.maps_model = ui.SimpleStringModel(maps_summary(entry))
         self._weight_field: FloatBoundedDrag | None = None
 
     @property
@@ -92,6 +173,9 @@ class ScatterAssetItem(ui.AbstractItem):
         index = _UP_AXES.index(entry.up_axis)
         if self.up_axis_model.index_model.as_int != index:
             self.up_axis_model.index_model.set_value(index)
+        summary = maps_summary(entry)
+        if self.maps_model.as_string != summary:
+            self.maps_model.set_value(summary)
 
     def attach_weight_field(self, field: FloatBoundedDrag) -> None:
         """Own the drag field built for the weight cell, releasing the one a previous build left behind."""
@@ -124,8 +208,8 @@ class ScatterAssetModel(ui.AbstractItemModel):
         self.refresh(controller.assets)
 
     def refresh(self, entries: Sequence[ScatterAssetEntry]) -> None:
-        """Mirror the palette entries, updating rows in place when only their values changed."""
-        if [entry.path for entry in entries] == [item.path for item in self._items]:
+        """Mirror the palette entries, updating rows in place when only their bound values changed."""
+        if [_row_signature(entry) for entry in entries] == [_row_signature(item.entry) for item in self._items]:
             for item, entry in zip(self._items, entries, strict=True):
                 self._push(item, entry)
             return
@@ -150,8 +234,8 @@ class ScatterAssetModel(ui.AbstractItemModel):
         return list(self._items) if item is None else []
 
     def get_item_value_model_count(self, item: ui.AbstractItem | None = None) -> int:
-        """Return the column count: enabled, path, weight and up axis."""
-        return 4
+        """Return the column count: enabled, path, weight, up axis and maps."""
+        return 5
 
     def get_item_value_model(
         self, item: ScatterAssetItem | None = None, column_id: int = 0
@@ -159,7 +243,13 @@ class ScatterAssetModel(ui.AbstractItemModel):
         """Return the row model behind a column, or None for the root."""
         if item is None:
             return None
-        return (item.enabled_model, item.path_model, item.weight_model, item.up_axis_model.index_model)[column_id]
+        return (
+            item.enabled_model,
+            item.path_model,
+            item.weight_model,
+            item.up_axis_model.index_model,
+            item.maps_model,
+        )[column_id]
 
     def destroy(self) -> None:
         """Drop the controller subscription and the rows with their widgets."""
@@ -206,11 +296,25 @@ class ScatterAssetModel(ui.AbstractItemModel):
 
 
 class ScatterAssetDelegate(ui.AbstractItemDelegate):
-    """Builds the enabled, asset, weight and up-axis cells of a ``ScatterAssetItem`` row."""
+    """Builds the enabled, asset, weight, up-axis and maps cells of a ``ScatterAssetItem`` row.
+
+    The maps cell also carries the per-asset texture override button, so the delegate is given the callbacks that
+    open the texture picker and go back to auto-detection.
+    """
 
     _ROW_HEIGHT = ui.Pixel(24)
     _SPACING = ui.Pixel(4)
-    _HEADERS = ("", "Asset", "Weight", "Up")
+    _HEADERS = ("", "Asset", "Weight", "Up", "Maps")
+    _TEXTURE_BUTTON_WIDTH = ui.Pixel(34)
+
+    def __init__(
+        self,
+        on_set_textures: Callable[[ScatterAssetItem], None] | None = None,
+        on_clear_textures: Callable[[ScatterAssetItem], None] | None = None,
+    ):
+        super().__init__()
+        self._on_set_textures = on_set_textures
+        self._on_clear_textures = on_clear_textures
 
     def build_header(self, column_id: int = 0) -> None:
         """Build the title cell of a column."""
@@ -286,7 +390,32 @@ class ScatterAssetDelegate(ui.AbstractItemDelegate):
                         tooltip="Up axis authored in the asset file; placements are uprighted on the stage",
                         identifier=f"{identifier_prefix}_up_axis",
                     )
+                case 4:
+                    self._build_maps_cell(item, identifier_prefix)
             ui.Spacer(width=0)
+
+    def _build_maps_cell(self, item: ScatterAssetItem, identifier_prefix: str) -> None:
+        """Build the maps summary and the button that overrides or restores the asset's texture set."""
+        ui.Label(
+            item.maps_model.as_string,
+            name="PropertiesPaneSectionTreeItem",
+            tooltip=maps_tooltip(item.entry),
+            elided_text=True,
+            identifier=f"{identifier_prefix}_maps",
+        )
+        overridden = bool(item.entry.texture_source)
+        ui.Button(
+            "auto" if overridden else "...",
+            width=self._TEXTURE_BUTTON_WIDTH,
+            clicked_fn=functools.partial(self._on_clear_textures if overridden else self._on_set_textures, item),
+            enabled=bool(self._on_clear_textures if overridden else self._on_set_textures),
+            tooltip=(
+                "Go back to detecting this asset's textures automatically"
+                if overridden
+                else "Choose this asset's texture set: pick any one texture and the rest are matched by name"
+            ),
+            identifier=f"{identifier_prefix}_{'clear' if overridden else 'set'}_textures",
+        )
 
 
 class ScatterAssetListWidget:
@@ -300,15 +429,20 @@ class ScatterAssetListWidget:
     _TREE_HEIGHT = ui.Pixel(140)
     _ROW_HEIGHT = ui.Pixel(24)
     _SPACING = ui.Pixel(8)
-    _COLUMN_WIDTHS = (ui.Pixel(32), ui.Fraction(1), ui.Pixel(72), ui.Pixel(64))
+    _COLUMN_WIDTHS = (ui.Pixel(32), ui.Fraction(1), ui.Pixel(72), ui.Pixel(64), ui.Pixel(116))
     _BROWSE_PLACEHOLDER = "Browse ingested models..."
 
     def __init__(self, context_name: str):
         self._context_name = context_name
         self._controller = get_scatter_brush_controller()
         self._asset_core = AssetReplacementsCore(context_name)
+        # Entries restored from carb never went through add_asset, so their texture sets are resolved here, on the
+        # click that opens the window rather than on the first mouse-down of a stroke.
+        self._controller.ensure_asset_textures()
         self._model = ScatterAssetModel(self._controller)
-        self._delegate: ScatterAssetDelegate | None = ScatterAssetDelegate()
+        self._delegate: ScatterAssetDelegate | None = ScatterAssetDelegate(
+            on_set_textures=self._open_texture_picker, on_clear_textures=self._clear_texture_source
+        )
         self._ingested_models: list[str] = []
         self._refreshing_browse = False
         self._browse_refresh_task: asyncio.Task | None = None
@@ -408,6 +542,26 @@ class ScatterAssetListWidget:
         """Open the shared asset file picker for USD models."""
         open_asset_file_picker("Select an asset to scatter", ReplacementAssetType.MESH, self._accept, lambda *_: None)
 
+    def _open_texture_picker(self, item: ScatterAssetItem) -> None:
+        """Ask for one texture of the set this asset should use, the way Remix's Assign Texture Sets does."""
+        open_file_picker(
+            f"Select a texture for {item.display_name}",
+            functools.partial(self._set_texture_source, item),
+            lambda *_: None,
+            apply_button_label="Choose",
+            file_extension_options=[("*.dds", "Ingested Textures")],
+        )
+
+    def _set_texture_source(self, item: ScatterAssetItem, texture_path: str) -> None:
+        """Adopt the picked texture as the asset's texture set; its siblings supply the other maps."""
+        if not texture_path:
+            return
+        self._controller.set_asset_texture_source(item.path, texture_path)
+
+    def _clear_texture_source(self, item: ScatterAssetItem) -> None:
+        """Drop the hand-picked texture set and detect the asset's textures again."""
+        self._controller.set_asset_texture_source(item.path, "")
+
     def _add_from_selection(self) -> None:
         """Add the asset referenced by the selected prim, or explain why nothing was added."""
         path = resolve_reference_asset_from_selection(omni.usd.get_context(self._context_name))
@@ -484,3 +638,5 @@ class ScatterAssetListWidget:
         """Re-list the ingested models when a project opens."""
         if event.type == int(omni.usd.StageEventType.OPENED):
             self.refresh_ingested_models()
+            # A different project means different ingested textures, so every cached texture set is suspect.
+            self._controller.ensure_asset_textures()

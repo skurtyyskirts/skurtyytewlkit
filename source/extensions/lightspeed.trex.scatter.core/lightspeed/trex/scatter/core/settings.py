@@ -18,11 +18,14 @@
 from __future__ import annotations
 
 __all__ = [
+    "RANGE_PAIRS",
     "ApplyTo",
     "EraseScope",
     "Falloff",
     "ScatterAssetEntry",
     "ScatterBrushSettings",
+    "ScatterMaterialOverride",
+    "ScatterTextureSet",
     "TargetMode",
     "UpAxis",
     "load_assets_from_carb",
@@ -72,6 +75,52 @@ class UpAxis(StrEnum):
     Z = "Z"
 
 
+class ScatterMaterialOverride(BaseModel):
+    """The texture inputs the brush authors on one shader of a scattered asset.
+
+    Frozen so it can be shared by the shallow ``model_copy`` the controller hands out for every palette read.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    shader_rel_path: str = Field(min_length=1)
+    """Shader prim path relative to the asset default prim, e.g. ``XForms/grass/Looks/grass/Shader``.
+
+    A reference without a ``primPath`` maps the referenced default prim's children onto the referencing prim, so the
+    default prim name itself is not part of the path under a placement.
+    """
+
+    inputs: dict[str, str] = Field(default_factory=dict)
+    """Shader input name (``inputs:normalmap_texture``) to texture path."""
+
+    encoding: int | None = None
+    """``inputs:encoding`` to author with a normal map, or None to leave the asset's own value alone."""
+
+
+class ScatterTextureSet(BaseModel):
+    """What ``resolve_asset_texture_set`` found for one palette asset."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    source_hash: str = ""
+    """The asset's ingestion ``base_hash`` when it was resolved, used to notice a re-ingested asset."""
+
+    overrides: tuple[ScatterMaterialOverride, ...] = ()
+    """Per-shader inputs the brush will author; empty when the asset needs nothing."""
+
+    assigned: tuple[str, ...] = ()
+    """Input names the asset already authors itself, which are never touched."""
+
+    unresolved: tuple[str, ...] = ()
+    """Input names that are still missing because no matching texture was found."""
+
+    reason: str = ""
+    """Why nothing could be resolved, or empty when the asset was inspected successfully."""
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+
 class ScatterAssetEntry(BaseModel):
     """One scatterable asset: an ingested USD file with a selection weight and its authored up axis."""
 
@@ -81,9 +130,14 @@ class ScatterAssetEntry(BaseModel):
     enabled: bool = True
     weight: float = Field(1.0, ge=0.0, le=100.0)
     up_axis: UpAxis = UpAxis.Z
+    texture_source: str = ""
+    """A texture the user picked for this asset, whose siblings drive resolution instead of auto-detection."""
+
+    textures: ScatterTextureSet | None = Field(default=None, exclude=True)
+    """Resolved texture set, rebuilt from disk on demand and deliberately never persisted."""
 
 
-_RANGE_PAIRS = (
+RANGE_PAIRS = (
     ("rotation_x_min", "rotation_x_max"),
     ("rotation_y_min", "rotation_y_max"),
     ("rotation_z_min", "rotation_z_max"),
@@ -92,6 +146,7 @@ _RANGE_PAIRS = (
     ("scale_y_min", "scale_y_max"),
     ("scale_z_min", "scale_z_max"),
 )
+"""Settings fields that form a low/high pair and must stay ordered."""
 
 
 class ScatterBrushSettings(BaseModel):
@@ -145,9 +200,12 @@ class ScatterBrushSettings(BaseModel):
     erase_scope: EraseScope = EraseScope.ALL_SCATTERED
     flood_max_instances: int = Field(300, ge=1, le=100000)
 
+    # Materials
+    assign_textures: bool = True
+
     @model_validator(mode="after")
     def _check_ranges(self) -> ScatterBrushSettings:
-        for low_name, high_name in _RANGE_PAIRS:
+        for low_name, high_name in RANGE_PAIRS:
             low, high = getattr(self, low_name), getattr(self, high_name)
             if low > high:
                 raise ValueError(f"{low_name} ({low}) must be lower than or equal to {high_name} ({high})")

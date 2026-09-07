@@ -57,6 +57,7 @@ class ScatterStrokeCommand(omni.kit.commands.Command):
         prim_paths: Sequence[str] | None = None,
         snapshot_layer: Sdf.Layer | None = None,
         already_applied: bool = True,
+        materials: Mapping[str, Any] | None = None,
     ):
         """Create the command.
 
@@ -68,11 +69,14 @@ class ScatterStrokeCommand(omni.kit.commands.Command):
             prim_paths: ERASE only: the erased prim paths.
             snapshot_layer: ERASE only: anonymous layer holding copies of the erased specs.
             already_applied: True when the edit already happened live and the first ``do()`` must not repeat it.
+            materials: PLACE only: the shader overrides to author, kept on the command so a redo still has them once
+                the asset has left the brush palette.
         """
         self._context_name = context_name
         self._layer_identifier = layer_identifier
         self._kind = ScatterStrokeKind(kind)
         self._records = _coerce_records(records)
+        self._materials = dict(materials or {})
         self._prim_paths = [str(path) for path in prim_paths or []]
         self._snapshot_layer = snapshot_layer
         self._skip_next_do = already_applied
@@ -87,7 +91,7 @@ class ScatterStrokeCommand(omni.kit.commands.Command):
         if layer is None:
             return []
         if self._kind == ScatterStrokeKind.PLACE:
-            self._created_paths = author_placements(layer, self._records)
+            self._created_paths = author_placements(layer, self._records, self._materials)
             return list(self._created_paths)
         if self._snapshot_layer is None:
             self._snapshot_layer = snapshot_prims(layer, self._prim_paths)
@@ -112,7 +116,11 @@ class ScatterFloodCommand(omni.kit.commands.Command):
     """Author a batch of flood placements; undo removes them again."""
 
     def __init__(
-        self, context_name: str, layer_identifier: str, records: Sequence[Mapping[str, Any] | PlacementRecord]
+        self,
+        context_name: str,
+        layer_identifier: str,
+        records: Sequence[Mapping[str, Any] | PlacementRecord],
+        materials: Mapping[str, Any] | None = None,
     ):
         """Create the command.
 
@@ -120,10 +128,13 @@ class ScatterFloodCommand(omni.kit.commands.Command):
             context_name: Name of the USD context the flood was requested in.
             layer_identifier: Identifier of the layer to author the placements in.
             records: The placement records (``PlacementRecord.to_dict()`` payloads or records).
+            materials: The shader overrides to author, kept on the command so a redo still has them once the asset
+                has left the brush palette.
         """
         self._context_name = context_name
         self._layer_identifier = layer_identifier
         self._records = _coerce_records(records)
+        self._materials = dict(materials or {})
         self._created_paths: list[str] = []
 
     def do(self) -> list[str]:
@@ -132,7 +143,7 @@ class ScatterFloodCommand(omni.kit.commands.Command):
         if layer is None:
             self._created_paths = []
             return []
-        self._created_paths = author_placements(layer, self._records)
+        self._created_paths = author_placements(layer, self._records, self._materials)
         return list(self._created_paths)
 
     def undo(self) -> None:

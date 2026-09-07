@@ -20,7 +20,7 @@ from __future__ import annotations
 __all__ = ["StrokeSession"]
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import carb
 import numpy as np
@@ -30,6 +30,7 @@ from omni.flux.utils.common.interactive_usd_notices import begin_interaction, en
 from pxr import Gf, Sdf, Usd
 
 from .commands import ScatterStrokeKind
+from .materials import build_materials_payload
 from .placement import (
     author_placements,
     erase_candidates,
@@ -97,6 +98,7 @@ class StrokeSession:
         self._layer: Sdf.Layer | None = None
         self._interaction_token: InteractionToken | None = None
         self._padding_index: PaddingIndex | None = None
+        self._materials: dict[str, list[dict[str, Any]]] = {}
         self._seeded_prototypes: set[Sdf.Path] = set()
         self._stamp_index = 0
         self._records: list[PlacementRecord] = []
@@ -142,6 +144,8 @@ class StrokeSession:
         self._stage = stage
         self._layer = stage.GetEditTarget().GetLayer()
         self._padding_index = PaddingIndex(max(self._settings.padding, 1.0))
+        # Resolved once per stroke: the payload is the same for every stamp and touches disk to relativize paths.
+        self._materials = build_materials_payload(self._layer, self._assets) if self._settings.assign_textures else {}
         self._interaction_token = begin_interaction(stage)
         self._active = True
         self._start_segment(target, sample)
@@ -242,7 +246,7 @@ class StrokeSession:
         )
         if not records:
             return
-        author_placements(self._layer, records)
+        author_placements(self._layer, records, self._materials)
         self._records.extend(records)
 
     def _erase_at(self, target: ScatterTarget, center: SurfaceSample) -> None:
@@ -313,6 +317,7 @@ class StrokeSession:
             kind=ScatterStrokeKind.PLACE.value,
             records=[record.to_dict() for record in self._records],
             already_applied=True,
+            materials=self._materials,
         )
         return len(self._records)
 
