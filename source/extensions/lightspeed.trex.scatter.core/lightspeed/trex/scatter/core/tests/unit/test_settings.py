@@ -15,7 +15,12 @@
 * limitations under the License.
 """
 
-__all__ = ["TestAssetsCarbPersistence", "TestScatterAssetEntry", "TestScatterBrushSettings"]
+__all__ = [
+    "TestAssetsCarbPersistence",
+    "TestPrimBudgetStatus",
+    "TestScatterAssetEntry",
+    "TestScatterBrushSettings",
+]
 
 import json
 from unittest import mock
@@ -79,6 +84,7 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
             "anchor_prototype_path": "",
             "erase_scope": settings_module.EraseScope.ALL_SCATTERED,
             "flood_max_instances": 300,
+            "prim_budget": 10000,
             "assign_textures": True,
         }
 
@@ -221,6 +227,17 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(loaded, settings_module.ScatterBrushSettings())
 
+    async def test_from_json_dict_without_scale_mode_defaults_to_absolute_size(self):
+        # Arrange - settings persisted before the mode existed must still load.
+        blob = {"preset_name": "Grass", "radius": 40.0, "scale_min": 0.8, "scale_max": 1.2}
+
+        # Act
+        loaded = settings_module.ScatterBrushSettings.from_json_dict(blob)
+
+        # Assert
+        self.assertEqual(loaded.scale_mode, settings_module.ScaleMode.ABSOLUTE_SIZE)
+        self.assertEqual(loaded.radius, 40.0)
+
 
 class TestScatterAssetEntry(omni.kit.test.AsyncTestCase):
     async def test_init_with_path_only_uses_defaults(self):
@@ -293,7 +310,7 @@ class TestAssetsCarbPersistence(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(dumped["texture_source"], "rock.a.rtex.dds")
 
-    async def test_asset_entry_from_an_older_persisted_blob_defaults_the_texture_fields(self):
+    async def test_asset_entry_from_an_older_persisted_blob_defaults_the_texture_and_measurement_fields(self):
         # Arrange
         blob = {"path": "rock.usd", "enabled": True, "weight": 1.0, "up_axis": "Z"}
 
@@ -303,6 +320,33 @@ class TestAssetsCarbPersistence(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertIsNone(entry.textures)
         self.assertEqual(entry.texture_source, "")
+        self.assertEqual(entry.meters_per_unit, 1.0)
+        self.assertEqual(entry.natural_extent, (0.0, 0.0, 0.0))
+
+    async def test_natural_height_returns_the_extent_component_of_the_entrys_up_axis(self):
+        cases = [(settings_module.UpAxis.Y, 2.0), (settings_module.UpAxis.Z, 3.0)]
+        for up_axis, expected in cases:
+            with self.subTest(up_axis=up_axis):
+                # Arrange
+                entry = settings_module.ScatterAssetEntry(
+                    path="rock.usd", up_axis=up_axis, natural_extent=(1.0, 2.0, 3.0)
+                )
+
+                # Act
+                height = entry.natural_height
+
+                # Assert
+                self.assertEqual(height, expected)
+
+    async def test_natural_height_without_a_measurement_returns_zero(self):
+        # Arrange
+        entry = settings_module.ScatterAssetEntry(path="rock.usd")
+
+        # Act
+        height = entry.natural_height
+
+        # Assert
+        self.assertEqual(height, 0.0)
 
     async def test_texture_set_is_frozen(self):
         # A palette read hands out shallow copies, so a mutable set would be shared by every copy and every stroke.
@@ -332,7 +376,17 @@ class TestAssetsCarbPersistence(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(
             json.loads(store[constants_module.ASSETS_SETTING_PATH]),
-            [{"path": "rock.usd", "enabled": True, "weight": 1.0, "up_axis": "Z", "texture_source": ""}],
+            [
+                {
+                    "path": "rock.usd",
+                    "enabled": True,
+                    "weight": 1.0,
+                    "up_axis": "Z",
+                    "meters_per_unit": 1.0,
+                    "natural_extent": [0.0, 0.0, 0.0],
+                    "texture_source": "",
+                }
+            ],
         )
 
     async def test_load_assets_from_carb_with_invalid_json_returns_empty_list(self):
@@ -364,3 +418,55 @@ class TestAssetsCarbPersistence(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(loaded, [])
+
+
+class TestPrimBudgetStatus(omni.kit.test.AsyncTestCase):
+    async def test_prim_budget_status_with_total_below_budget_returns_ok(self):
+        # Arrange
+        budget = 10000
+
+        # Act
+        status = settings_module.prim_budget_status(9999, budget)
+
+        # Assert
+        self.assertEqual(status, settings_module.PrimBudgetStatus.OK)
+
+    async def test_prim_budget_status_with_total_at_budget_returns_warning(self):
+        # Arrange
+        budget = 10000
+
+        # Act
+        status = settings_module.prim_budget_status(budget, budget)
+
+        # Assert
+        self.assertEqual(status, settings_module.PrimBudgetStatus.WARNING)
+
+    async def test_prim_budget_status_with_total_at_alert_multiple_returns_alert(self):
+        # Arrange
+        budget = 10000
+
+        # Act
+        status = settings_module.prim_budget_status(budget * settings_module.ALERT_BUDGET_MULTIPLE, budget)
+
+        # Assert
+        self.assertEqual(status, settings_module.PrimBudgetStatus.ALERT)
+
+    async def test_prim_budget_status_with_zero_total_returns_ok(self):
+        # Arrange
+        budget = 10000
+
+        # Act
+        status = settings_module.prim_budget_status(0, budget)
+
+        # Assert
+        self.assertEqual(status, settings_module.PrimBudgetStatus.OK)
+
+    async def test_prim_budget_status_with_non_positive_budget_returns_ok(self):
+        # Arrange
+        total = 1_000_000
+
+        # Act
+        status = settings_module.prim_budget_status(total, 0)
+
+        # Assert
+        self.assertEqual(status, settings_module.PrimBudgetStatus.OK)

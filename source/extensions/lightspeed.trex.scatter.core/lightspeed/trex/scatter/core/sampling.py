@@ -19,27 +19,33 @@ from __future__ import annotations
 
 __all__ = [
     "PaddingIndex",
+    "ParentSpaceOrigin",
     "asset_up_correction",
     "choose_asset",
     "compose_parent_space_transform",
     "falloff_weight",
+    "parent_uniform_scale",
+    "placement_rng",
     "rotation_to_xyz_degrees",
     "sample_disk",
     "sample_rotation_degrees",
     "sample_scale",
+    "stage_meters_per_unit",
     "stage_up_axis",
     "stamp_rng",
     "tangent_basis",
+    "to_parent_space_origin",
     "up_axis_vector",
 ]
 
 import math
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 from pxr import Gf, Usd, UsdGeom
 
-from .settings import Falloff, ScatterAssetEntry, ScatterBrushSettings, UpAxis
+from .settings import Falloff, ScaleMode, ScatterAssetEntry, ScatterBrushSettings, UpAxis
 
 _MIN_CELL_SIZE = 1e-6
 _EPSILON = 1e-9
@@ -164,10 +170,20 @@ def _shape_unit_sample(u: float, weight: float, bias: float) -> float:
 def sample_scale(rng: np.random.Generator, settings: ScatterBrushSettings) -> tuple[float, float, float]:
     """Draw a placement scale from the brush scale settings.
 
+    In ``ABSOLUTE_SIZE`` the draw is a target height in stage units rather than a multiplier, so one value always
+    drives all three axes: a height has no per-axis meaning. Disabling randomness there pins every placement to
+    ``size_min``, not to a multiplier of 1, because a fixed height is still a height.
+
     Returns:
-        (x, y, z) scale factors; (1, 1, 1) when scaling is disabled. Uniform mode returns the same factor on every
+        (x, y, z) scale factors, or target heights in ``ABSOLUTE_SIZE``. Uniform mode returns the same value on every
         axis, per-axis mode draws each axis independently from its own range.
     """
+    if settings.scale_mode == ScaleMode.ABSOLUTE_SIZE:
+        if not settings.scale_enabled:
+            return (settings.size_min, settings.size_min, settings.size_min)
+        t = _shape_unit_sample(rng.random(), settings.scale_weight, settings.scale_bias)
+        height = settings.size_min + t * (settings.size_max - settings.size_min)
+        return (height, height, height)
     if not settings.scale_enabled:
         return (1.0, 1.0, 1.0)
     if settings.scale_uniform:
@@ -200,6 +216,24 @@ def stamp_rng(seed: int, stroke_index: int, stamp_index: int) -> np.random.Gener
     return np.random.default_rng([int(seed), int(stroke_index), int(stamp_index)])
 
 
+def placement_rng(key: int, seed: int) -> np.random.Generator:
+    """Create the generator that composes one placement, from its own key and the brush seed.
+
+    Giving every placement its own generator is what lets a placement be recomposed on its own: the stamp generator
+    is shared by all the placements of a stamp, so no placement's draws can be replayed from it afterwards. The brush
+    seed is mixed in so that changing the seed, or rerolling it, draws a new arrangement for placements that already
+    exist; the stroke seed is already part of ``key`` through the stamp generator that drew it.
+
+    Args:
+        key: The placement's own key, drawn once when it was painted.
+        seed: ``ScatterBrushSettings.seed``.
+
+    Returns:
+        The generator the placement's rotation and scale are drawn from.
+    """
+    return np.random.default_rng([int(key), int(seed)])
+
+
 def up_axis_vector(up_axis: UpAxis) -> Gf.Vec3d:
     """Unit vector of a stage or asset up axis."""
     if UpAxis(up_axis) == UpAxis.Y:
@@ -210,6 +244,39 @@ def up_axis_vector(up_axis: UpAxis) -> Gf.Vec3d:
 def stage_up_axis(stage: Usd.Stage) -> UpAxis:
     """Up axis authored on the stage (UsdGeom fallback is Y)."""
     return UpAxis.Z if UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.z else UpAxis.Y
+
+
+def stage_meters_per_unit(stage: Usd.Stage) -> float:
+    """Meters per stage unit.
+
+    Returns:
+        The authored unit scale; 1.0 when the stage authors none, which matches ``read_asset_meters_per_unit`` so an
+        asset and a stage that both declare nothing convert into each other unchanged.
+    """
+    if not stage.HasAuthoredMetadata(UsdGeom.Tokens.metersPerUnit):
+        return 1.0
+    return float(UsdGeom.GetStageMetersPerUnit(stage))
+
+
+def parent_uniform_scale(matrix: Gf.Matrix4d) -> float:
+    """Average scale a transform applies, as the cube root of the absolute determinant of its linear part.
+
+    The absolute value keeps a mirroring parent positive: the mirror itself is already carried by the parent's linear
+    map, so only its magnitude belongs here.
+
+    Returns:
+        The factor; 1.0 for a near-degenerate matrix, so a collapsed instance cannot divide a placement's size up to
+        infinity.
+    """
+    linear = Gf.Matrix3d(
+        matrix[0][0], matrix[0][1], matrix[0][2],
+        matrix[1][0], matrix[1][1], matrix[1][2],
+        matrix[2][0], matrix[2][1], matrix[2][2],
+    )  # fmt: skip
+    determinant = abs(linear.GetDeterminant())
+    if determinant < _EPSILON:
+        return 1.0
+    return float(determinant ** (1.0 / 3.0))
 
 
 def asset_up_correction(asset_up: UpAxis, stage_up: UpAxis) -> Gf.Rotation:
@@ -278,15 +345,85 @@ def _heading_yaw_degrees(heading: Gf.Vec3d, effective_up: Gf.Vec3d, conform: Gf.
     return math.degrees(math.atan2(across, along))
 
 
-def compose_parent_space_transform(
+@dataclass(frozen=True)
+class ParentSpaceOrigin:
+    """The surface a placement was composed from, in the space of the instance that parents the placement.
+
+    Held in parent space rather than world space so that it survives the instance moving: a placement is a child of
+    that instance and keeps its relationship to the surface, which a stored world point would not.
+
+    Attributes:
+        position: Surface point the placement sits on, before the vertical offset is applied.
+        normal: Surface normal at that point, normalized.
+        heading: Stroke direction the stamp travelled in, or None when the stamp had none.
+    """
+
+    position: Gf.Vec3d
+    normal: Gf.Vec3d
+    heading: Gf.Vec3d | None = None
+
+    def to_values(self) -> tuple[float, ...]:
+        """Flatten the origin into the six or nine doubles a placement authors; no heading means six."""
+        values = [*self.position, *self.normal, *(self.heading or ())]
+        return tuple(float(value) for value in values)
+
+    @classmethod
+    def from_values(cls, values: Sequence[float]) -> ParentSpaceOrigin | None:
+        """Rebuild an origin from authored doubles.
+
+        Args:
+            values: Six or nine doubles as produced by :meth:`to_values`.
+
+        Returns:
+            The origin, or None when the values are neither six nor nine, which is how a placement authored by
+            something other than this brush is recognized.
+        """
+        if len(values) not in (6, 9):
+            return None
+        heading = Gf.Vec3d(*(float(value) for value in values[6:9])) if len(values) == 9 else None
+        return cls(
+            position=Gf.Vec3d(*(float(value) for value in values[0:3])),
+            normal=Gf.Vec3d(*(float(value) for value in values[3:6])),
+            heading=heading,
+        )
+
+
+def to_parent_space_origin(
     position_world: Gf.Vec3d,
     normal_world: Gf.Vec3d,
+    parent_world: Gf.Matrix4d,
+    heading_world: Gf.Vec3d | None = None,
+) -> ParentSpaceOrigin:
+    """Bring a sampled surface into the space of the instance that will parent the placement.
+
+    Args:
+        position_world: Surface point in world space.
+        normal_world: Surface normal in world space.
+        parent_world: World transform of the instance that parents the placement.
+        heading_world: Stroke direction in world space, or None when the stamp had none.
+
+    Returns:
+        The origin :func:`compose_parent_space_transform` composes from.
+
+    Raises:
+        ValueError: If normal_world has zero length.
+    """
+    inverse_parent = parent_world.GetInverse()
+    return ParentSpaceOrigin(
+        position=inverse_parent.Transform(_as_vec3d(position_world)),
+        normal=_normal_to_parent_space(_as_vec3d(normal_world), parent_world),
+        heading=None if heading_world is None else inverse_parent.TransformDir(_as_vec3d(heading_world)),
+    )
+
+
+def compose_parent_space_transform(
+    origin: ParentSpaceOrigin,
     parent_world: Gf.Matrix4d,
     settings: ScatterBrushSettings,
     rng: np.random.Generator,
     stage_up: UpAxis,
     asset_up: UpAxis,
-    heading_world: Gf.Vec3d | None,
+    asset_scale_factor: float | None = 1.0,
 ) -> tuple[Gf.Vec3d, Gf.Vec3f, Gf.Vec3f]:
     """Compute the translate / rotateXYZ / scale ops of one placement in the space of its parent instance.
 
@@ -294,40 +431,53 @@ def compose_parent_space_transform(
     yaw about the stage up axis (random spin plus stroke heading), then the rotation taking the stage up axis onto
     the surface normal when conform_to_surface is set.
 
+    The parent's own scale is divided out of both the authored scale and the vertical offset, so a placement comes
+    out the same size wherever it is painted; this makes them world-space quantities like radius, padding and
+    stamp_spacing. Only the average magnitude is compensated, so a non-uniform parent still stretches its placements
+    along its own axes.
+
+    Composing from a stored origin rather than from the sampled surface is what lets a placement that already exists
+    be recomposed under new settings, with the same code that painted it.
+
     Args:
-        position_world: Surface point in world space.
-        normal_world: Surface normal in world space.
+        origin: Surface the placement sits on, in the space of its parent instance.
         parent_world: World transform of the instance that parents the placement.
         settings: Brush settings providing offsets, rotation and scale ranges.
         rng: Random generator for the rotation and scale draws.
         stage_up: Up axis of the stage.
         asset_up: Up axis the asset was authored with.
-        heading_world: Stroke direction in world space, used when settings.align_to_stroke is set.
+        asset_scale_factor: Multiplier turning a sampled scale value into what is authored: 1.0 leaves the sample a
+            plain multiplier, the reciprocal of the asset's height in stage units turns a sampled target height into
+            one. None means the asset could not be measured, so the placement keeps its own size.
 
     Returns:
         (translate, rotate_xyz_degrees, scale) such that authoring them with xformOpOrder
         [translate, rotateXYZ, scale] reproduces the composed transform.
-
-    Raises:
-        ValueError: If normal_world has zero length.
     """
-    inverse_parent = parent_world.GetInverse()
-    position = inverse_parent.Transform(_as_vec3d(position_world))
-    normal = _normal_to_parent_space(_as_vec3d(normal_world), parent_world)
+    parent_scale = parent_uniform_scale(parent_world)
+    normal = origin.normal
     up = up_axis_vector(stage_up)
+    # The axis both the offset and the yaw are measured about. Without conform this stays the plain axis: it is the
+    # one the asset ends up standing on, and it is also the axis the yaw below is applied about before conform.
     effective_up = normal if settings.conform_to_surface else up
-    position = position + effective_up * settings.vertical_offset
+    # Only the magnitude needs the parent out of it; vertical_offset is a world distance like radius and padding.
+    position = origin.position + effective_up * (settings.vertical_offset / parent_scale)
 
     rotate_x, rotate_y, rotate_z = sample_rotation_degrees(rng, settings)
-    scale = sample_scale(rng, settings)
+    # Drawn even when the sample goes unused, so an unmeasured asset does not shift the stamp's random stream.
+    sampled_scale = sample_scale(rng, settings)
+    if asset_scale_factor is None:
+        scale = (1.0 / parent_scale, 1.0 / parent_scale, 1.0 / parent_scale)
+    else:
+        factor = asset_scale_factor / parent_scale
+        scale = (sampled_scale[0] * factor, sampled_scale[1] * factor, sampled_scale[2] * factor)
 
     conform = Gf.Matrix4d(1.0)
     if settings.conform_to_surface:
         conform = Gf.Matrix4d().SetRotate(Gf.Rotation(up, normal))
     yaw = rotate_z
-    if settings.align_to_stroke and heading_world is not None:
-        heading = inverse_parent.TransformDir(_as_vec3d(heading_world))
-        yaw += _heading_yaw_degrees(heading, effective_up, conform)
+    if settings.align_to_stroke and origin.heading is not None:
+        yaw += _heading_yaw_degrees(origin.heading, effective_up, conform)
 
     # Row-vector products: the first rotation applied to the asset is on the left
     rotation = (

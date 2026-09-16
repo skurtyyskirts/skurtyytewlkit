@@ -46,7 +46,14 @@ from lightspeed.trex.scatter.core.placement import (
     snapshot_prims,
 )
 from lightspeed.trex.scatter.core.sampling import PaddingIndex
-from lightspeed.trex.scatter.core.settings import EraseScope, Falloff, ScatterAssetEntry, ScatterBrushSettings, UpAxis
+from lightspeed.trex.scatter.core.settings import (
+    EraseScope,
+    Falloff,
+    ScaleMode,
+    ScatterAssetEntry,
+    ScatterBrushSettings,
+    UpAxis,
+)
 from lightspeed.trex.scatter.core.targets import ScatterTarget
 from pxr import Gf, Sdf, Usd, UsdGeom
 
@@ -212,6 +219,7 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         assets: list[ScatterAssetEntry] | None = None,
         padding_index: PaddingIndex | None = None,
         seed: int = 1234,
+        stage_meters_per_unit: float = 1.0,
     ) -> list[PlacementRecord]:
         return generate_stamp(
             self._cache,
@@ -223,10 +231,16 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
             PaddingIndex(1.0) if padding_index is None else padding_index,
             None,
             UpAxis.Z,
+            stage_meters_per_unit,
             self._layer,
         )
 
-    def _flood(self, max_count: int, settings: ScatterBrushSettings | None = None) -> list[PlacementRecord]:
+    def _flood(
+        self,
+        max_count: int,
+        settings: ScatterBrushSettings | None = None,
+        stage_meters_per_unit: float = 1.0,
+    ) -> list[PlacementRecord]:
         return generate_flood(
             self._cache,
             self._target,
@@ -235,6 +249,7 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
             np.random.default_rng(42),
             PaddingIndex(1.0),
             UpAxis.Z,
+            stage_meters_per_unit,
             self._layer,
             max_count,
         )
@@ -396,6 +411,141 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
             self.assertLessEqual((world - center).GetLength(), self._settings.radius + 1e-3)
             self.assertAlmostEqual(world[2], 0.0, places=3)
             self.assertAlmostEqual(record.translate[0] + _PARENT_OFFSET[0], world[0], places=6)
+
+    async def test_generate_stamp_in_absolute_size_mode_authors_the_requested_world_height(self):
+        # Arrange - a 20 unit tall asset asked to come in at 5 units needs a scale of 0.25.
+        settings = ScatterBrushSettings(
+            radius=50.0,
+            density=8.0,
+            strength=1.0,
+            padding=0.0,
+            falloff=Falloff.CONSTANT,
+            vertical_offset=0.0,
+            scale_mode=ScaleMode.ABSOLUTE_SIZE,
+            scale_enabled=False,
+            size_min=5.0,
+        )
+        assets = [ScatterAssetEntry(path=self._asset_a, up_axis=UpAxis.Z, natural_extent=(3.0, 3.0, 20.0))]
+
+        # Act
+        records = self._stamp(settings=settings, assets=assets)
+
+        # Assert
+        self.assertTrue(records)
+        for record in records:
+            for component in record.scale:
+                self.assertAlmostEqual(component, 0.25, places=6)
+
+    async def test_generate_stamp_in_absolute_size_mode_measures_along_the_assets_own_up_axis(self):
+        # Arrange - a Y-up asset is 20 tall along Y, so that is the extent the height has to be divided by.
+        settings = ScatterBrushSettings(
+            radius=50.0,
+            density=8.0,
+            strength=1.0,
+            padding=0.0,
+            falloff=Falloff.CONSTANT,
+            vertical_offset=0.0,
+            scale_mode=ScaleMode.ABSOLUTE_SIZE,
+            scale_enabled=False,
+            size_min=5.0,
+        )
+        assets = [ScatterAssetEntry(path=self._asset_a, up_axis=UpAxis.Y, natural_extent=(3.0, 20.0, 3.0))]
+
+        # Act
+        records = self._stamp(settings=settings, assets=assets)
+
+        # Assert
+        self.assertTrue(records)
+        for record in records:
+            for component in record.scale:
+                self.assertAlmostEqual(component, 0.25, places=6)
+
+    async def test_generate_stamp_in_absolute_size_mode_converts_the_assets_unit_scale(self):
+        # Arrange - 20 asset units at 0.01 m per unit is 0.2 m, which is 0.2 stage units at 1 m per unit.
+        settings = ScatterBrushSettings(
+            radius=50.0,
+            density=8.0,
+            strength=1.0,
+            padding=0.0,
+            falloff=Falloff.CONSTANT,
+            vertical_offset=0.0,
+            scale_mode=ScaleMode.ABSOLUTE_SIZE,
+            scale_enabled=False,
+            size_min=5.0,
+        )
+        assets = [
+            ScatterAssetEntry(
+                path=self._asset_a, up_axis=UpAxis.Z, natural_extent=(3.0, 3.0, 20.0), meters_per_unit=0.01
+            )
+        ]
+
+        # Act
+        records = self._stamp(settings=settings, assets=assets, stage_meters_per_unit=1.0)
+
+        # Assert
+        self.assertTrue(records)
+        for record in records:
+            for component in record.scale:
+                self.assertAlmostEqual(component, 25.0, places=4)
+
+    async def test_generate_stamp_in_absolute_size_mode_with_unmeasured_asset_authors_the_assets_own_size(self):
+        # Arrange - the sampled 5 is a height, so authoring it as a multiplier would place the asset five times over.
+        settings = ScatterBrushSettings(
+            radius=50.0,
+            density=8.0,
+            strength=1.0,
+            padding=0.0,
+            falloff=Falloff.CONSTANT,
+            vertical_offset=0.0,
+            scale_mode=ScaleMode.ABSOLUTE_SIZE,
+            scale_enabled=False,
+            size_min=5.0,
+        )
+        assets = [ScatterAssetEntry(path=self._asset_a, up_axis=UpAxis.Z)]
+
+        # Act
+        records = self._stamp(settings=settings, assets=assets)
+
+        # Assert
+        self.assertTrue(records)
+        for record in records:
+            for component in record.scale:
+                self.assertAlmostEqual(component, 1.0, places=6)
+
+    async def test_generate_stamp_under_a_scaled_instance_divides_the_scale_by_the_instance_scale(self):
+        # Arrange
+        settings = ScatterBrushSettings(
+            radius=50.0,
+            density=8.0,
+            strength=1.0,
+            padding=0.0,
+            falloff=Falloff.CONSTANT,
+            vertical_offset=0.0,
+            scale_mode=ScaleMode.MULTIPLIER,
+            scale_enabled=True,
+            scale_min=2.0,
+            scale_max=2.0,
+        )
+        scaled_target = ScatterTarget(
+            prototype_root=self._target.prototype_root,
+            parent_instance_root=self._target.parent_instance_root,
+            mesh_path=self._target.mesh_path,
+            parent_world=self._target.parent_world * Gf.Matrix4d().SetScale(Gf.Vec3d(4.0, 4.0, 4.0)),
+            instance_count=1,
+        )
+        original_target, self._target = self._target, scaled_target
+
+        # Act
+        try:
+            records = self._stamp(settings=settings)
+        finally:
+            self._target = original_target
+
+        # Assert - 2 divided by the instance's 4, so the placement is still 2 across in world space
+        self.assertTrue(records)
+        for record in records:
+            for component in record.scale:
+                self.assertAlmostEqual(component, 0.5, places=6)
 
     async def test_generate_stamp_without_enabled_assets_returns_no_records(self):
         # Arrange

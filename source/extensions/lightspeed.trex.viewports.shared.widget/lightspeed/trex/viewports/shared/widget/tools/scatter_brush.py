@@ -42,10 +42,12 @@ from lightspeed.trex.hotkeys import get_global_hotkey_manager as _get_global_hot
 from lightspeed.trex.scatter.core import (
     ApplyTo,
     MeshSurfaceCache,
+    PrimBudgetStatus,
     ScatterMode,
     StrokeSession,
     SurfaceSample,
     get_scatter_brush_controller,
+    prim_budget_status,
     resolve_target,
     selected_prototypes,
     stage_up_axis,
@@ -78,6 +80,14 @@ _ERASE_COLOR = (0.95, 0.3, 0.25, 1.0)
 _NOT_APPLICABLE_COLOR = (0.6, 0.6, 0.6, 0.6)
 # Length of the normal tick relative to the brush radius.
 _NORMAL_TICK_LENGTH = 0.35
+# Live stroke counter, drawn just outside the cursor ring in cursor-local units so it tracks the brush radius.
+_COUNTER_OFFSET = 1.2
+_COUNTER_TEXT_SIZE = 16
+_BUDGET_COLORS = {
+    PrimBudgetStatus.OK: (0.8, 0.88, 0.8, 1.0),
+    PrimBudgetStatus.WARNING: (0.96, 0.75, 0.2, 1.0),
+    PrimBudgetStatus.ALERT: (0.95, 0.3, 0.25, 1.0),
+}
 # One wheel notch while B is held multiplies (or divides) the radius by this factor, within the settings bounds.
 _RADIUS_WHEEL_FACTOR = 1.1
 _RADIUS_MIN = 1.0
@@ -319,7 +329,16 @@ class ScatterBrushTool:
             self._outer_ring = sc.Arc(1.0, axis=2, wireframe=True, tesselation=64, thickness=2, color=color)
             self._inner_ring = sc.Arc(0.5, axis=2, wireframe=True, tesselation=48, thickness=1, color=color)
             self._normal_tick = sc.Line([0.0, 0.0, 0.0], [0.0, 0.0, _NORMAL_TICK_LENGTH], thickness=2, color=color)
+            with sc.Transform(transform=sc.Matrix44.get_translation_matrix(0.0, _COUNTER_OFFSET, 0.0)):
+                self._counter_label = sc.Label(
+                    "",
+                    alignment=ui.Alignment.CENTER,
+                    color=list(_BUDGET_COLORS[PrimBudgetStatus.OK]),
+                    size=_COUNTER_TEXT_SIZE,
+                    visible=False,
+                )
         self._cursor_color: tuple[float, float, float, float] = _PAINT_COLOR
+        self._counter_status: PrimBudgetStatus | None = None
 
         self._hotkey_subscription = _get_global_hotkey_manager().subscribe_hotkey_event(
             TrexHotkeyEvent.CTRL_B, self._on_toggle_hotkey, enable_fn=self._is_viewport_active
@@ -378,6 +397,7 @@ class ScatterBrushTool:
         self._outer_ring = None
         self._inner_ring = None
         self._normal_tick = None
+        self._counter_label = None
         self._cursor = None
         self._screen = None
         self._drag = None
@@ -562,12 +582,15 @@ class ScatterBrushTool:
         except Exception as exc:  # noqa: BLE001 - runs from a pick callback; the stroke must end instead of leaking.
             carb.log_error(f"{_LOG_PREFIX} Scatter stroke failed and was ended: {exc}")
             self._end_stroke()
+            return
+        self._update_counter(session)
 
     def _end_stroke(self) -> None:
         """Commit whatever the current stroke authored, release the layer guard and notify listeners."""
         session, self._session = self._session, None
         self._layer_guard = None
         touched, self._stroke_prototypes = self._stroke_prototypes, {}
+        self._hide_counter()
         if session is None:
             return
         try:
@@ -626,6 +649,33 @@ class ScatterBrushTool:
         self._last_hover = None
         if self._cursor is not None:
             self._cursor.visible = False
+
+    def _update_counter(self, session: StrokeSession) -> None:
+        """Show what the stroke has cost so far, coloured by how it compares with the brush prim budget.
+
+        An erase stroke removes prims rather than adding them, so it shows no counter.
+        """
+        if self._counter_label is None or session.erase:
+            return
+        rendered = session.rendered_prims
+        if not rendered:
+            return
+        placed = session.placed_count
+        # Showing both makes the instance multiplier visible; they only differ on a replicated prototype.
+        self._counter_label.text = (
+            f"{rendered:,} prims" if rendered == placed else f"{placed:,} placed  ->  {rendered:,} prims"
+        )
+        status = prim_budget_status(rendered, session.settings.prim_budget)
+        if status != self._counter_status:
+            self._counter_status = status
+            self._counter_label.color = list(_BUDGET_COLORS[status])
+        self._counter_label.visible = True
+
+    def _hide_counter(self) -> None:
+        """Hide the stroke counter so it never lingers over a hover between strokes."""
+        self._counter_status = None
+        if self._counter_label is not None:
+            self._counter_label.visible = False
 
 
 def scatter_brush_factory(desc: dict[str, Any]) -> ScatterBrushTool:

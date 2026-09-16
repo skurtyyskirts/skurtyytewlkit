@@ -35,6 +35,7 @@ from lightspeed.common.constants import INSTANCE_PATH, ROOTNODE_INSTANCES, ROOTN
 from lightspeed.trex.scatter.core import (
     ApplyTo,
     Falloff,
+    PrimBudgetStatus,
     ScatterBrushSettings,
     ScatterMode,
     SurfaceHit,
@@ -931,6 +932,71 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
         self.assertEqual(tool.name, "Scatter Brush")
         self.assertEqual(tool.categories, ["tools"])
         self.assertTrue(tool.visible)
+
+    async def test_begin_stroke_shows_counter_with_rendered_prim_total(self):
+        # Arrange
+        # (setUp authors a single instance, so rendered prims equal the placements authored)
+
+        # Act
+        self._begin_stroke()
+
+        # Assert
+        self.assertTrue(self._tool._counter_label.visible)
+        self.assertEqual(self._tool._counter_label.text, f"{len(self._placements()):,} prims")
+
+    async def test_begin_stroke_on_replicated_prototype_shows_placed_and_rendered_totals(self):
+        # Arrange
+        _author_instance(self._stage, 1)
+        _author_instance(self._stage, 2)
+
+        # Act
+        self._begin_stroke()
+
+        # Assert
+        placed = len(self._placements())
+        self.assertEqual(self._tool._counter_label.text, f"{placed:,} placed  ->  {placed * 3:,} prims")
+
+    async def test_begin_stroke_within_prim_budget_keeps_counter_status_ok(self):
+        # Arrange
+        self._controller.update_settings(prim_budget=10000)
+
+        # Act
+        self._begin_stroke()
+
+        # Assert
+        self.assertEqual(self._tool._counter_status, PrimBudgetStatus.OK)
+
+    async def test_begin_stroke_past_alert_multiple_of_budget_sets_counter_status_alert(self):
+        # Arrange
+        self._controller.update_settings(prim_budget=1)
+
+        # Act
+        self._begin_stroke()
+
+        # Assert
+        self.assertEqual(self._tool._counter_status, PrimBudgetStatus.ALERT)
+
+    async def test_drag_ended_hides_counter(self):
+        # Arrange
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        self.assertFalse(self._tool._counter_label.visible)
+
+    async def test_begin_erase_stroke_leaves_counter_hidden(self):
+        # Arrange
+        self._controller.set_mode(ScatterMode.ERASE)
+        self._ndc = (0.0, 0.0)
+        self._tool._on_update(None)
+
+        # Act
+        self._tool._on_drag_began(self._tool._drag)
+
+        # Assert
+        self.assertFalse(self._tool._counter_label.visible)
 
 
 class TestBrushCursorMatrix(omni.kit.test.AsyncTestCase):

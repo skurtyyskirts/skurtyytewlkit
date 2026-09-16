@@ -558,3 +558,81 @@ class TestTargets(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(result, set())
+
+    async def test_build_prototype_target_uses_the_canonical_instance_for_geometry_and_transform(self):
+        # Arrange
+        stage = _build_capture_stage(instance_indices=(2, 0, 1))
+
+        # Act
+        target = targets.build_prototype_target(stage, _PROTOTYPE)
+
+        # Assert
+        self.assertEqual(target.prototype_root, _PROTOTYPE)
+        self.assertEqual(target.parent_instance_root, _INSTANCE_0)
+        self.assertEqual(target.mesh_path, _INSTANCE_0.AppendChild("mesh"))
+        self.assertEqual(target.parent_world, _translation_matrix(_INSTANCE_TRANSLATES[0]))
+        self.assertEqual(target.instance_count, 3)
+
+    async def test_build_prototype_target_without_instances_falls_back_to_the_prototype_itself(self):
+        # Arrange
+        stage = _build_capture_stage(instance_indices=())
+
+        # Act
+        target = targets.build_prototype_target(stage, _PROTOTYPE)
+
+        # Assert
+        self.assertIsNone(target.parent_instance_root)
+        self.assertEqual(target.mesh_path, _PROTOTYPE.AppendChild("mesh"))
+        self.assertEqual(target.parent_world, Gf.Matrix4d(1.0))
+        self.assertEqual(target.instance_count, 0)
+
+    async def test_build_prototype_target_without_a_capture_mesh_returns_none(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        stage.DefinePrim(_PROTOTYPE, "Xform")
+
+        # Act
+        target = targets.build_prototype_target(stage, _PROTOTYPE)
+
+        # Assert
+        self.assertIsNone(target)
+
+    async def test_prototype_side_path_rewrites_a_path_seen_through_an_instance(self):
+        # Arrange
+        instance_side = _INSTANCE_1.AppendChild(_CONTAINER_NAME).AppendChild(_PLACEMENT_NAME)
+
+        # Act
+        result = targets.prototype_side_path(instance_side)
+
+        # Assert
+        self.assertEqual(result, _PROTOTYPE.AppendChild(_CONTAINER_NAME).AppendChild(_PLACEMENT_NAME))
+
+    async def test_prototype_side_path_of_an_instance_root_returns_the_prototype_root(self):
+        # Arrange
+        instance_root = _INSTANCE_0
+
+        # Act
+        result = targets.prototype_side_path(instance_root)
+
+        # Assert
+        self.assertEqual(result, _PROTOTYPE)
+
+    async def test_prototype_side_path_leaves_a_prototype_side_path_alone(self):
+        # Arrange
+        prototype_side = _PROTOTYPE.AppendChild(_CONTAINER_NAME)
+
+        # Act
+        result = targets.prototype_side_path(prototype_side)
+
+        # Assert
+        self.assertEqual(result, prototype_side)
+
+    async def test_prototype_side_path_outside_the_capture_topology_returns_none(self):
+        # Arrange
+        outside = Sdf.Path("/World/Something")
+
+        # Act
+        result = targets.prototype_side_path(outside)
+
+        # Assert
+        self.assertIsNone(result)

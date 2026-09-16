@@ -24,7 +24,6 @@ __all__ = [
     "get_scatter_brush_controller",
 ]
 
-import os
 import secrets
 from collections.abc import Callable, Sequence
 from enum import Enum
@@ -37,15 +36,22 @@ import omni.kit.undo
 import omni.usd
 from omni.flux.utils.common import Event, EventSubscription
 from omni.flux.utils.common.omni_url import OmniUrl
-from pxr import Gf, Sdf, Usd, UsdGeom
+from pxr import Sdf, Usd
 from pydantic import ValidationError
 
-from .assets import read_asset_up_axis
+from .assets import (
+    asset_comparison_key,
+    normalize_asset_path,
+    read_asset_meters_per_unit,
+    read_asset_natural_extent,
+    read_asset_up_axis,
+    read_authored_asset_up_axis,
+)
 from .materials import asset_source_hash, build_materials_payload, resolve_asset_texture_set
 from .picking import create_surface_picker
 from .placement import existing_placement_points, generate_flood
 from .presets import PresetStore, get_default_presets_directory
-from .sampling import PaddingIndex, stage_up_axis, stamp_rng
+from .sampling import PaddingIndex, stage_meters_per_unit, stage_up_axis, stamp_rng
 from .settings import (
     RANGE_PAIRS,
     ScatterAssetEntry,
@@ -57,9 +63,7 @@ from .settings import (
 )
 from .targets import (
     ScatterTarget,
-    canonical_instance,
-    find_capture_mesh,
-    instance_count,
+    build_prototype_target,
     selected_prototypes,
     validated_anchor_prototype,
 )
@@ -77,16 +81,6 @@ class ScatterMode(Enum):
     OFF = 0
     PAINT = 1
     ERASE = 2
-
-
-def _normalize_asset_path(path: str) -> str:
-    """Return the asset path trimmed and with forward slashes."""
-    return str(path).strip().replace("\\", "/")
-
-
-def _asset_key(path: str) -> str:
-    """Return the comparison key used to detect duplicate asset paths on the current platform."""
-    return os.path.normcase(os.path.normpath(_normalize_asset_path(path)))
 
 
 def _asset_display_name(path: str) -> str:
@@ -141,6 +135,8 @@ class ScatterBrushController:
         self._presets = PresetStore(get_default_presets_directory())
         self._mode = ScatterMode.OFF
         self._stroke_index = 0
+        # Paths already reported as disagreeing with their file, so a stroke does not repeat the warning.
+        self._up_axis_warned: set[str] = set()
         self._picker_factory: Callable[[object, MeshSurfaceCache], SurfacePicker] | None = None
 
         self.__on_mode_changed = Event(copy=True)
@@ -204,9 +200,10 @@ class ScatterBrushController:
         """Append an ingested asset to the palette.
 
         Paths are compared after normalization so the same file cannot be added twice. When no up axis is given it is
-        read from the asset file. Returns False when the path is empty or already present.
+        read from the asset file, as are the unit scale and natural size the brush needs to place the asset at a
+        predictable world size. Returns False when the path is empty or already present.
         """
-        normalized = _normalize_asset_path(path)
+        normalized = normalize_asset_path(path)
         if not normalized:
             self.post_status("Cannot add an empty asset path to the brush", is_error=True)
             return False
@@ -215,7 +212,12 @@ class ScatterBrushController:
             return False
         if up_axis is None:
             up_axis = read_asset_up_axis(normalized)
-        entry = ScatterAssetEntry(path=normalized, up_axis=up_axis)
+        entry = ScatterAssetEntry(
+            path=normalized,
+            up_axis=up_axis,
+            meters_per_unit=read_asset_meters_per_unit(normalized),
+            natural_extent=read_asset_natural_extent(normalized),
+        )
         entry.textures = resolve_asset_texture_set(normalized)
         self._assets.append(entry)
         self._report_texture_set(entry)
@@ -241,6 +243,8 @@ class ScatterBrushController:
 
     def set_asset_up_axis(self, path: str, up_axis: UpAxis) -> bool:
         """Override the authored up axis of a palette entry. Returns False when the path is unknown."""
+        # Forgotten so the entry is judged again: an override that still disagrees with the file is worth saying.
+        self._up_axis_warned.discard(normalize_asset_path(path))
         return self._update_asset(path, "up_axis", up_axis)
 
     def set_asset_texture_source(self, path: str, texture_path: str) -> bool:
@@ -252,7 +256,7 @@ class ScatterBrushController:
         entry = self._find_asset(path)
         if entry is None:
             return False
-        entry.texture_source = _normalize_asset_path(texture_path)
+        entry.texture_source = normalize_asset_path(texture_path)
         entry.textures = resolve_asset_texture_set(entry.path, entry.texture_source)
         self._report_texture_set(entry)
         self._assets_changed()
@@ -277,6 +281,58 @@ class ScatterBrushController:
         if changed:
             self._assets_changed()
         return changed
+
+    def ensure_asset_measurements(self) -> bool:
+        """Read the unit scale and natural size of every palette entry that has none.
+
+        Entries restored from carb never went through ``add_asset``, so this is what fills them in. Without a
+        measurement the brush cannot turn a target height into a scale, so an unmeasured asset falls back to its own
+        size instead of being placed at the height the user asked for.
+
+        Returns:
+            Whether any entry changed.
+        """
+        changed = False
+        for entry in self._assets:
+            if entry.natural_extent != (0.0, 0.0, 0.0):
+                continue
+            extent = read_asset_natural_extent(entry.path)
+            if extent == (0.0, 0.0, 0.0):
+                # Left unmeasured rather than recorded as measured-and-empty, so the next call retries once the file
+                # is readable again. Staying silent is deliberate: this runs on every stroke, and an asset that is
+                # simply gone is already reported by the palette.
+                continue
+            entry.meters_per_unit = read_asset_meters_per_unit(entry.path)
+            entry.natural_extent = extent
+            changed = True
+        if changed:
+            self._assets_changed()
+        return changed
+
+    def report_mismatched_asset_up_axes(self) -> list[str]:
+        """Report palette entries whose up axis disagrees with the one their own file authors.
+
+        A mismatch is silent otherwise: the up-axis correction is skipped and the asset is scattered lying on its
+        side, which looks like a brush fault rather than a palette setting. Files that author no axis are left alone,
+        because there is nothing to disagree with.
+
+        Returns:
+            The paths reported by this call; each path is reported once until its up axis is set again.
+        """
+        reported: list[str] = []
+        for entry in self._assets:
+            if entry.path in self._up_axis_warned:
+                continue
+            authored = read_authored_asset_up_axis(entry.path)
+            if authored is None or authored == entry.up_axis:
+                continue
+            self._up_axis_warned.add(entry.path)
+            reported.append(entry.path)
+            self.post_status(
+                f"{_asset_display_name(entry.path)} is authored {authored.value}-up but the brush is set to "
+                f"{entry.up_axis.value}-up, so it will be scattered on its side"
+            )
+        return reported
 
     def materials_payload(self, layer: Sdf.Layer, assets: Sequence[ScatterAssetEntry] | None = None) -> dict:
         """Build the shader-override payload for ``assets`` (the enabled palette by default).
@@ -367,7 +423,16 @@ class ScatterBrushController:
         """Return ``(seed, stroke_index)`` for a new stroke and advance the stroke counter.
 
         The seed is the configured one unless ``randomize_seed`` is set, in which case a fresh 31-bit value is drawn.
+
+        This is also where a stroke's palette is brought up to date. Textures and measurements are not persisted, so
+        a palette restored from carb has neither until something resolves them; the Scatter window does it when it
+        opens, but the brush can be used from the viewport without ever opening that window. Resolving here, rather
+        than in ``StrokeSession``, is what makes it take effect: the session is handed a copy of the palette taken
+        straight after this call.
         """
+        self.ensure_asset_textures()
+        self.ensure_asset_measurements()
+        self.report_mismatched_asset_up_axes()
         seed = secrets.randbits(31) if self._settings.randomize_seed else self._settings.seed
         stroke_index = self._stroke_index
         self._stroke_index += 1
@@ -400,7 +465,10 @@ class ScatterBrushController:
         if stage is None:
             self.post_status("Open a project before flooding", is_error=True)
             return 0
+        # Resolved before the palette is copied; next_stroke() below is too late for the copy taken here.
         self.ensure_asset_textures()
+        self.ensure_asset_measurements()
+        self.report_mismatched_asset_up_axes()
         assets = self.enabled_assets()
         if not assets:
             self.post_status("Add and enable at least one asset before flooding", is_error=True)
@@ -417,6 +485,7 @@ class ScatterBrushController:
         layer = stage.GetEditTarget().GetLayer()
         materials = self.materials_payload(layer, assets)
         stage_up = stage_up_axis(stage)
+        stage_units = stage_meters_per_unit(stage)
         seed, stroke_index = self.next_stroke()
         remaining = self._settings.flood_max_instances
         total = 0
@@ -436,6 +505,7 @@ class ScatterBrushController:
                     stamp_rng(seed, stroke_index, target_index),
                     padding_index,
                     stage_up,
+                    stage_units,
                     layer,
                     remaining,
                 )
@@ -502,8 +572,8 @@ class ScatterBrushController:
 
     def _find_asset(self, path: str) -> ScatterAssetEntry | None:
         """Return the palette entry whose normalized path matches, or None."""
-        key = _asset_key(path)
-        return next((entry for entry in self._assets if _asset_key(entry.path) == key), None)
+        key = asset_comparison_key(path)
+        return next((entry for entry in self._assets if asset_comparison_key(entry.path) == key), None)
 
     def _update_asset(self, path: str, field_name: str, value: object) -> bool:
         """Assign one validated field on a palette entry, persist and notify."""
@@ -548,31 +618,10 @@ class ScatterBrushController:
             prototypes = sorted(selected_prototypes(usd_context), key=str)
         targets = []
         for prototype_root in prototypes:
-            target = self._build_target(stage, prototype_root)
+            target = build_prototype_target(stage, prototype_root)
             if target is not None:
                 targets.append(target)
         return targets
-
-    @staticmethod
-    def _build_target(stage: Usd.Stage, prototype_root: Sdf.Path) -> ScatterTarget | None:
-        """Build a flood target from a prototype using its canonical instance for geometry and transform."""
-        instance_root = canonical_instance(stage, prototype_root)
-        mesh_path = find_capture_mesh(stage, prototype_root if instance_root is None else instance_root)
-        if mesh_path is None:
-            carb.log_warn(f"{_LOG_PREFIX} No capture mesh found under {prototype_root}; skipping flood target")
-            return None
-        parent_world = Gf.Matrix4d(1.0)
-        if instance_root is not None:
-            instance_prim = stage.GetPrimAtPath(instance_root)
-            if instance_prim and instance_prim.IsValid():
-                parent_world = UsdGeom.Xformable(instance_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        return ScatterTarget(
-            prototype_root=prototype_root,
-            parent_instance_root=instance_root,
-            mesh_path=mesh_path,
-            parent_world=parent_world,
-            instance_count=instance_count(stage, prototype_root),
-        )
 
 
 _CONTROLLER_INSTANCE: ScatterBrushController | None = None

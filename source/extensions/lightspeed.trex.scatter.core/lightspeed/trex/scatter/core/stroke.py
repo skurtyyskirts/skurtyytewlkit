@@ -39,7 +39,7 @@ from .placement import (
     remove_placements,
     snapshot_prims,
 )
-from .sampling import PaddingIndex, stamp_rng
+from .sampling import PaddingIndex, stage_meters_per_unit, stamp_rng
 from .settings import ScatterAssetEntry, ScatterBrushSettings, UpAxis
 
 if TYPE_CHECKING:
@@ -95,6 +95,8 @@ class StrokeSession:
 
         self._active = False
         self._stage: Usd.Stage | None = None
+        # Derived in begin() rather than taken from the caller, so the viewport tool's constructor call is unchanged.
+        self._stage_meters_per_unit = 1.0
         self._layer: Sdf.Layer | None = None
         self._interaction_token: InteractionToken | None = None
         self._padding_index: PaddingIndex | None = None
@@ -102,6 +104,7 @@ class StrokeSession:
         self._seeded_prototypes: set[Sdf.Path] = set()
         self._stamp_index = 0
         self._records: list[PlacementRecord] = []
+        self._rendered_prims = 0
         self._erased_paths: list[str] = []
         self._snapshot: Sdf.Layer | None = None
         self._current_prototype: Sdf.Path | None = None
@@ -129,6 +132,15 @@ class StrokeSession:
         """Number of placements authored so far, or of prims removed so far for an erase stroke."""
         return len(self._erased_paths) if self._erase else len(self._records)
 
+    @property
+    def rendered_prims(self) -> int:
+        """Prims the placements authored so far add to the rendered stage; 0 for an erase stroke.
+
+        A placement authored under a prototype renders once per instance of that prototype's hash, so this is the
+        cost the player pays, while ``placed_count`` is only what the stroke wrote.
+        """
+        return self._rendered_prims
+
     def begin(self, hit: SurfaceHit, target: ScatterTarget, sample: SurfaceSample) -> None:
         """Start the stroke on the stage of the USD context and stamp once at the sample.
 
@@ -142,6 +154,7 @@ class StrokeSession:
             carb.log_warn(f"{_LOG_PREFIX} Cannot start a scatter stroke without an open stage")
             return
         self._stage = stage
+        self._stage_meters_per_unit = stage_meters_per_unit(stage)
         self._layer = stage.GetEditTarget().GetLayer()
         self._padding_index = PaddingIndex(max(self._settings.padding, 1.0))
         # Resolved once per stroke: the payload is the same for every stamp and touches disk to relativize paths.
@@ -242,12 +255,15 @@ class StrokeSession:
             self._padding_index,
             heading_world,
             self._stage_up,
+            self._stage_meters_per_unit,
             self._layer,
         )
         if not records:
             return
         author_placements(self._layer, records, self._materials)
         self._records.extend(records)
+        # A prototype with no instance on the stage still renders its own placements once.
+        self._rendered_prims += len(records) * max(target.instance_count, 1)
 
     def _erase_at(self, target: ScatterTarget, center: SurfaceSample) -> None:
         """Snapshot and remove every placement of the target within the brush radius of the sample.

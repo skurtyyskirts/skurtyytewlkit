@@ -31,6 +31,9 @@ from lightspeed.trex.scatter.core import (
     EraseScope,
     Falloff,
     MeshSurfaceCache,
+    ReapplyDriver,
+    ReapplyScope,
+    ScaleMode,
     ScatterBrushSettings,
     ScatterMode,
     TargetMode,
@@ -54,6 +57,12 @@ from .value_model import DragValueModel as _DragValueModel
 from .value_model import field_bounds
 
 _ANCHOR_NONE_TEXT = "<none>"
+_LIVE_EDIT_TOOLTIP = (
+    "Apply placement, scale and seed changes to the scatter that is selected, as well as to the next stroke.\n\n"
+    "- Select painted placements or a scatter container to edit exactly those\n"
+    "- Select a mesh or an instance to edit what the current preset painted on it\n"
+    "- Brush and density settings always apply to the next stroke only, never to what is already painted"
+)
 _STATUS_STYLE = "PropertiesPaneSectionTreeItem"
 _STATUS_ERROR_STYLE = "PropertiesPaneSectionTreeItemError"
 # Floods above the default cap can take a while to author and render, so they ask for confirmation first.
@@ -105,7 +114,9 @@ class ScatterPane(_WorkspaceWidget):
         self._context_name = context_name
         self._controller = get_scatter_brush_controller()
         self._surface_cache = MeshSurfaceCache(self._get_stage)
+        self._reapply_driver = ReapplyDriver(self._controller, context_name, self._surface_cache)
         self._syncing = False
+        self._in_field_edit = False
         self._instance_warning_key: tuple[TargetMode, str] | None = None
         self._anchor_instance_count = 0
 
@@ -121,6 +132,8 @@ class ScatterPane(_WorkspaceWidget):
         self._erase_button: ui.ToolButton | None = None
         self._flood_button: ui.Button | None = None
         self._status_label: ui.Label | None = None
+        self._size_stack: ui.VStack | None = None
+        self._multiplier_scale_stack: ui.VStack | None = None
         self._per_axis_scale_stack: ui.VStack | None = None
         self._seed_field: _IntBoundedDrag | None = None
         self._reroll_button: ui.Button | None = None
@@ -128,6 +141,7 @@ class ScatterPane(_WorkspaceWidget):
         self._anchor_use_selection_button: ui.Button | None = None
         self._flood_estimate_label: ui.Label | None = None
         self._instance_warning_label: ui.Label | None = None
+        self._live_edit_label: ui.Label | None = None
         self._asset_list_widget: ScatterAssetListWidget | None = None
         self._presets_widget: PresetsWidget | None = None
 
@@ -143,6 +157,7 @@ class ScatterPane(_WorkspaceWidget):
         self._mode_changed_sub = self._controller.subscribe_mode_changed(self._on_mode_changed)
         self._assets_changed_sub = self._controller.subscribe_assets_changed(self._on_assets_changed)
         self._status_message_sub = self._controller.subscribe_status_message(self._on_status_message)
+        self._scope_changed_sub = self._reapply_driver.subscribe_scope_changed(self._on_scope_changed)
 
     def __create_ui(self):
         settings = self._controller.settings
@@ -247,6 +262,7 @@ class ScatterPane(_WorkspaceWidget):
         )
         with frame:
             with ui.VStack(height=0, spacing=self._SPACING_XS):
+                self.__build_row("Edit Selection Live", _LIVE_EDIT_TOOLTIP, self.__build_live_edit_control)
                 self.__build_float_row(
                     "Vertical Offset",
                     "vertical_offset",
@@ -289,48 +305,85 @@ class ScatterPane(_WorkspaceWidget):
                             "Rotation Y Max", "rotation_y_max", "scatter_rot_y_max", 1.0, "Highest tilt around Y."
                         )
 
+    def __build_live_edit_control(self):
+        # Built without the trailing spacer of __build_bool_field so the scope readout sits beside the checkbox
+        # rather than at the far edge of the row.
+        model = ui.SimpleBoolModel(self._controller.settings.edit_selection_live)
+        ui.CheckBox(model=model, width=0, identifier="scatter_edit_selection_live", tooltip=_LIVE_EDIT_TOOLTIP)
+        self.__bind("edit_selection_live", model, lambda m: m.as_bool, lambda m, value: m.set_value(bool(value)))
+        ui.Spacer(width=self._SPACING_MD)
+        self._live_edit_label = ui.Label(
+            self._reapply_driver.summary(),
+            name=_STATUS_STYLE,
+            identifier="scatter_live_edit_scope",
+            tooltip=_LIVE_EDIT_TOOLTIP,
+        )
+
     def __build_scale_section(self, settings: ScatterBrushSettings):
         frame = self.__build_section(
             "SCALE",
-            "Random scale applied to each placement.\n\n"
+            "How large each placement is.\n\n"
+            "- Absolute Size sets the height in stage units, measured along the asset's up axis\n"
+            "- Multiplier scales the asset by a factor of the size it was authored at\n"
             "- Bias pushes the distribution toward the minimum (-1) or the maximum (1)\n"
             "- Weight sharpens (above 1) or flattens (below 1) the distribution\n"
             "- Disable Uniform to set a range per axis",
         )
         with frame:
             with ui.VStack(height=0, spacing=self._SPACING_XS):
-                self.__build_bool_row(
-                    "Random Scale", "scale_enabled", "scatter_scale_enabled", "Apply a random scale to placements."
+                self.__build_enum_row(
+                    "Scale Mode",
+                    "scale_mode",
+                    "scatter_scale_mode",
+                    ScaleMode,
+                    "Absolute Size gives every placement a height in stage units; Multiplier scales the asset by a "
+                    "factor of its own size.",
                 )
                 self.__build_bool_row(
-                    "Uniform", "scale_uniform", "scatter_scale_uniform", "Use one range for all three axes."
+                    "Random Scale",
+                    "scale_enabled",
+                    "scatter_scale_enabled",
+                    "Vary the size within the range below; off pins every placement to the minimum.",
                 )
-                self.__build_float_row("Scale Min", "scale_min", "scatter_scale_min", 0.01, "Lowest uniform scale.")
-                self.__build_float_row("Scale Max", "scale_max", "scatter_scale_max", 0.01, "Highest uniform scale.")
+                self._size_stack = ui.VStack(height=0, spacing=self._SPACING_XS)
+                with self._size_stack:
+                    self.__build_float_row(
+                        "Size Min", "size_min", "scatter_size_min", 1.0, "Lowest height in stage units."
+                    )
+                    self.__build_float_row(
+                        "Size Max", "size_max", "scatter_size_max", 1.0, "Highest height in stage units."
+                    )
+                self._multiplier_scale_stack = ui.VStack(height=0, spacing=self._SPACING_XS)
+                with self._multiplier_scale_stack:
+                    self.__build_bool_row(
+                        "Uniform", "scale_uniform", "scatter_scale_uniform", "Use one range for all three axes."
+                    )
+                    self.__build_float_row("Scale Min", "scale_min", "scatter_scale_min", 0.01, "Lowest scale factor.")
+                    self.__build_float_row("Scale Max", "scale_max", "scatter_scale_max", 0.01, "Highest scale factor.")
+                    self._per_axis_scale_stack = ui.VStack(height=0, spacing=self._SPACING_XS)
+                    with self._per_axis_scale_stack:
+                        for axis in ("x", "y", "z"):
+                            axis_label = axis.upper()
+                            self.__build_float_row(
+                                f"Scale {axis_label} Min",
+                                f"scale_{axis}_min",
+                                f"scatter_scale_{axis}_min",
+                                0.01,
+                                f"Lowest scale along {axis_label}.",
+                            )
+                            self.__build_float_row(
+                                f"Scale {axis_label} Max",
+                                f"scale_{axis}_max",
+                                f"scatter_scale_{axis}_max",
+                                0.01,
+                                f"Highest scale along {axis_label}.",
+                            )
                 self.__build_float_row(
                     "Bias", "scale_bias", "scatter_scale_bias", 0.01, "Skew toward the minimum (-1) or maximum (1)."
                 )
                 self.__build_float_row(
                     "Weight", "scale_weight", "scatter_scale_weight", 0.1, "Sharpness of the scale distribution."
                 )
-                self._per_axis_scale_stack = ui.VStack(height=0, spacing=self._SPACING_XS)
-                with self._per_axis_scale_stack:
-                    for axis in ("x", "y", "z"):
-                        axis_label = axis.upper()
-                        self.__build_float_row(
-                            f"Scale {axis_label} Min",
-                            f"scale_{axis}_min",
-                            f"scatter_scale_{axis}_min",
-                            0.01,
-                            f"Lowest scale along {axis_label}.",
-                        )
-                        self.__build_float_row(
-                            f"Scale {axis_label} Max",
-                            f"scale_{axis}_max",
-                            f"scatter_scale_{axis}_max",
-                            0.01,
-                            f"Highest scale along {axis_label}.",
-                        )
 
     def __build_random_section(self, settings: ScatterBrushSettings):
         frame = self.__build_section(
@@ -413,6 +466,13 @@ class ScatterPane(_WorkspaceWidget):
                             "instances that show the anchor prototype."
                         ),
                     )
+                budget_tooltip = (
+                    "Prims a single stroke is expected to render before the counter on the brush turns amber, and "
+                    "five times that before it turns red. The counter only reports; it never stops a stroke."
+                )
+                with ui.HStack(height=self._ROW_HEIGHT, spacing=self._SPACING_MD):
+                    ui.Label("Prim Budget", width=self._LABEL_WIDTH, tooltip=budget_tooltip)
+                    self.__build_int_field("prim_budget", "scatter_prim_budget", 500, budget_tooltip)
                 self._instance_warning_label = ui.Label(
                     "",
                     name="Warning",
@@ -537,6 +597,11 @@ class ScatterPane(_WorkspaceWidget):
         self._field_subs.append(model.subscribe_value_changed_fn(on_edit))
         if end_edit:
             self._field_subs.append(model.subscribe_end_edit_fn(on_edit))
+            self._field_subs.append(model.subscribe_end_edit_fn(self._on_edit_finished))
+            return
+        # A checkbox or a combo box has no drag to end, so its value change is the whole edit. Subscribed after the
+        # edit itself so the live edit is committed with the change already applied.
+        self._field_subs.append(model.subscribe_value_changed_fn(self._on_edit_finished))
 
     def _get_stage(self):
         """Return the stage of the pane's USD context, or None when the context or the stage does not exist."""
@@ -558,7 +623,12 @@ class ScatterPane(_WorkspaceWidget):
         value = self._bindings[field_name].read(model)
         if value == getattr(self._controller.settings, field_name):
             return
-        if not self._controller.update_settings(**{field_name: value}):
+        self._in_field_edit = True
+        try:
+            applied = self._controller.update_settings(**{field_name: value})
+        finally:
+            self._in_field_edit = False
+        if not applied:
             self.__write_field(field_name, getattr(self._controller.settings, field_name))
 
     def _on_mode_toggled(self, mode: ScatterMode, model: ui.AbstractValueModel):
@@ -584,6 +654,28 @@ class ScatterPane(_WorkspaceWidget):
         """
         if self.window_visible:
             self.__push_settings(settings)
+        if not self._in_field_edit:
+            # The change came from outside this pane's controls, from a preset or the reroll button, so no field
+            # will report the end of an edit and the live edit it opened has to be committed here.
+            self._reapply_driver.edit_finished()
+
+    def _on_edit_finished(self, _model: ui.AbstractValueModel):
+        """Commit the live edit a control opened, so one drag of that control is one undo step.
+
+        Args:
+            _model: Value model that finished being edited; the live edit spans every field, so it is not needed.
+        """
+        if self._syncing:
+            return
+        self._reapply_driver.edit_finished()
+
+    def _on_scope_changed(self, _scope: ReapplyScope):
+        """Show what a settings change would update now that the selection or the last live edit changed.
+
+        Args:
+            _scope: The new scope; the readout is built from the driver, which also knows the last outcome.
+        """
+        self.__refresh_live_edit_label()
 
     def _on_mode_changed(self, mode: ScatterMode):
         """Reflect a controller mode change on the header buttons while the pane is visible.
@@ -653,11 +745,12 @@ class ScatterPane(_WorkspaceWidget):
             self.__push_mode(self._controller.mode)
 
     def destroy(self):
-        """Release the controller subscriptions, the surface cache and the child widgets."""
+        """Commit any open live edit, then release the subscriptions, the surface cache and the child widgets."""
         self._settings_changed_sub = None
         self._mode_changed_sub = None
         self._assets_changed_sub = None
         self._status_message_sub = None
+        self._scope_changed_sub = None
         self._paint_sub = None
         self._erase_sub = None
         self._field_subs.clear()
@@ -673,6 +766,9 @@ class ScatterPane(_WorkspaceWidget):
                 widget.destroy()
         self._asset_list_widget = None
         self._presets_widget = None
+        if self._reapply_driver is not None:
+            self._reapply_driver.destroy()
+            self._reapply_driver = None
         if self._surface_cache is not None:
             self._surface_cache.destroy()
             self._surface_cache = None
@@ -698,6 +794,10 @@ class ScatterPane(_WorkspaceWidget):
             self._syncing = False
         self.__refresh_derived(settings, force_instance_warning=force_instance_warning)
 
+    def __refresh_live_edit_label(self):
+        if self._live_edit_label is not None:
+            self._live_edit_label.text = self._reapply_driver.summary()
+
     def __push_mode(self, mode: ScatterMode):
         self._syncing = True
         try:
@@ -707,15 +807,24 @@ class ScatterPane(_WorkspaceWidget):
             self._syncing = False
 
     def __refresh_derived(self, settings: ScatterBrushSettings, force_instance_warning: bool = False):
+        # The per-axis stack lives inside the multiplier stack, so hiding that one hides it too.
+        self.__refresh_live_edit_label()
+        absolute_size = settings.scale_mode == ScaleMode.ABSOLUTE_SIZE
+        self._size_stack.visible = absolute_size
+        self._multiplier_scale_stack.visible = not absolute_size
         self._per_axis_scale_stack.visible = not settings.scale_uniform
         seed_editable = not settings.randomize_seed
         self._seed_field.enabled = seed_editable
         self._reroll_button.enabled = seed_editable
         self._anchor_path_label.text = settings.anchor_prototype_path or _ANCHOR_NONE_TEXT
         self.__refresh_instance_warning(settings, force_instance_warning)
-        # Every placement authored under the anchor prototype renders under each of its instances.
-        prims = settings.flood_max_instances * max(self._anchor_instance_count, 1)
-        self._flood_estimate_label.text = f"Up to {prims} prims"
+        # Every placement authored under a prototype renders under each instance of that prototype's hash. Only the
+        # anchor is known ahead of the flood; in hit-surface mode the multiplier is whatever is selected when it runs.
+        if settings.target_mode == TargetMode.ANCHOR and self._anchor_instance_count:
+            prims = settings.flood_max_instances * self._anchor_instance_count
+            self._flood_estimate_label.text = f"Up to {prims} prims"
+        else:
+            self._flood_estimate_label.text = f"Up to {settings.flood_max_instances} prims per instance"
 
     def __refresh_instance_warning(self, settings: ScatterBrushSettings, force: bool):
         # Counting instances walks /RootNode/instances, so only redo it when the anchor inputs change.

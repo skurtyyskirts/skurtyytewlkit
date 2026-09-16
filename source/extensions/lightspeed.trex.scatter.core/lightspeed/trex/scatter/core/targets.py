@@ -19,6 +19,7 @@ from __future__ import annotations
 
 __all__ = [
     "ScatterTarget",
+    "build_prototype_target",
     "canonical_instance",
     "find_capture_mesh",
     "get_instance_root",
@@ -26,6 +27,7 @@ __all__ = [
     "has_scatter_ancestor",
     "instance_count",
     "is_scatter_prim",
+    "prototype_side_path",
     "resolve_target",
     "selected_prototypes",
     "validated_anchor_prototype",
@@ -35,6 +37,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import carb
 import omni.usd
 from lightspeed.common import constants as common_constants
 from pxr import Gf, Sdf, Usd, UsdGeom
@@ -45,6 +48,7 @@ from .settings import TargetMode
 if TYPE_CHECKING:
     from .picking import SurfaceHit
 
+_LOG_PREFIX = "[lightspeed.trex.scatter.core]"
 _HASH_PATTERN = r"[A-Z0-9]{16}"
 # <inst_|mesh_ path><HASH>[_N]... optionally followed by descendants; group 1 is the hash.
 _PROTOTYPE_ROOT_REGEX = re.compile(
@@ -225,6 +229,52 @@ def resolve_target(
         mesh_path=mesh_path,
         parent_world=_local_to_world(stage, parent_instance),
         instance_count=instance_count(stage, prototype),
+    )
+
+
+def prototype_side_path(path: Sdf.Path | str) -> Sdf.Path | None:
+    """Rewrite a path that goes through an instance into the equivalent path under the prototype.
+
+    Scatter placements are authored under the prototype and seen through instance proxies, so a path picked up from
+    the selection has to be brought back to the side it was authored on before anything can be read or written.
+
+    Args:
+        path: Any prim path inside the capture topology.
+
+    Returns:
+        The prototype-side path, or None when ``path`` lies outside the capture topology.
+    """
+    prototype = get_prototype_root(path)
+    if prototype is None:
+        return None
+    instance_root = get_instance_root(path)
+    if instance_root is None:
+        return Sdf.Path(path)
+    relative = str(path)[len(str(instance_root)) :].lstrip("/")
+    return prototype.AppendPath(relative) if relative else prototype
+
+
+def build_prototype_target(stage: Usd.Stage, prototype_root: Sdf.Path) -> ScatterTarget | None:
+    """Build a target for a whole prototype, using its canonical instance for geometry and transform.
+
+    Args:
+        stage: Stage the prototype belongs to.
+        prototype_root: ``/RootNode/meshes/mesh_<HASH>``.
+
+    Returns:
+        The target, or None (logged) when the prototype holds no capture mesh.
+    """
+    instance_root = canonical_instance(stage, prototype_root)
+    mesh_path = find_capture_mesh(stage, prototype_root if instance_root is None else instance_root)
+    if mesh_path is None:
+        carb.log_warn(f"{_LOG_PREFIX} No capture mesh found under {prototype_root}; skipping scatter target")
+        return None
+    return ScatterTarget(
+        prototype_root=prototype_root,
+        parent_instance_root=instance_root,
+        mesh_path=mesh_path,
+        parent_world=_local_to_world(stage, instance_root),
+        instance_count=instance_count(stage, prototype_root),
     )
 
 

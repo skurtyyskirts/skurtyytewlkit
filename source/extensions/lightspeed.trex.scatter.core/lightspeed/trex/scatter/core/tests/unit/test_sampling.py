@@ -22,14 +22,25 @@ import omni.kit.test
 from pxr import Gf, Usd, UsdGeom
 
 from lightspeed.trex.scatter.core import sampling
-from lightspeed.trex.scatter.core.settings import Falloff, ScatterAssetEntry, ScatterBrushSettings, UpAxis
+from lightspeed.trex.scatter.core.settings import (
+    Falloff,
+    ScaleMode,
+    ScatterAssetEntry,
+    ScatterBrushSettings,
+    UpAxis,
+)
 
 _SQRT_HALF = math.sqrt(0.5)
 
 
 def _settings(**overrides) -> ScatterBrushSettings:
-    """Deterministic brush: no random rotation, no scale, conform on, align off, no offset."""
+    """Deterministic brush: no random rotation, no scale, conform on, align off, no offset.
+
+    Pinned to MULTIPLIER because these cases are about the geometry, and a unit scale is only what "scale off"
+    means in that mode; ABSOLUTE_SIZE has its own cases.
+    """
     values = {
+        "scale_mode": ScaleMode.MULTIPLIER,
         "rotation_x_min": 0.0,
         "rotation_x_max": 0.0,
         "rotation_y_min": 0.0,
@@ -461,6 +472,65 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
                 # Assert
                 self.assertEqual(up_axis, expected)
 
+    async def test_stage_meters_per_unit_reads_authored_stage_metadata(self):
+        cases = [0.01, 1.0, 100.0]
+        for authored in cases:
+            with self.subTest(authored=authored):
+                # Arrange
+                stage = Usd.Stage.CreateInMemory()
+                UsdGeom.SetStageMetersPerUnit(stage, authored)
+
+                # Act
+                result = sampling.stage_meters_per_unit(stage)
+
+                # Assert
+                self.assertAlmostEqual(result, authored)
+
+    async def test_stage_meters_per_unit_without_authored_metadata_returns_one(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+
+        # Act
+        result = sampling.stage_meters_per_unit(stage)
+
+        # Assert
+        self.assertAlmostEqual(result, 1.0)
+
+    async def test_sample_scale_in_absolute_size_mode_draws_one_height_for_every_axis(self):
+        # Arrange - per-axis ranges are set and deliberately ignored: a height has no per-axis meaning.
+        settings = _settings(
+            scale_mode=ScaleMode.ABSOLUTE_SIZE,
+            scale_enabled=True,
+            scale_uniform=False,
+            size_min=10.0,
+            size_max=20.0,
+            scale_x_min=0.1,
+            scale_x_max=0.1,
+            scale_y_min=5.0,
+            scale_y_max=5.0,
+        )
+        rng = np.random.default_rng(7)
+
+        # Act
+        samples = [sampling.sample_scale(rng, settings) for _ in range(64)]
+
+        # Assert
+        for sample in samples:
+            self.assertEqual(sample[0], sample[1])
+            self.assertEqual(sample[1], sample[2])
+            self.assertGreaterEqual(sample[0], 10.0)
+            self.assertLessEqual(sample[0], 20.0)
+
+    async def test_sample_scale_in_absolute_size_mode_without_randomness_returns_the_minimum_height(self):
+        # Arrange
+        settings = _settings(scale_mode=ScaleMode.ABSOLUTE_SIZE, scale_enabled=False, size_min=12.0, size_max=30.0)
+
+        # Act
+        sample = sampling.sample_scale(np.random.default_rng(0), settings)
+
+        # Assert - a fixed height, not a multiplier of 1, because the value still means a height
+        self.assertEqual(sample, (12.0, 12.0, 12.0))
+
     async def test_asset_up_correction_with_matching_axes_returns_identity(self):
         cases = [UpAxis.Y, UpAxis.Z]
         for up_axis in cases:
@@ -570,14 +640,12 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
         # Act
         translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-            position_world,
-            normal_world,
+            sampling.to_parent_space_origin(position_world, normal_world, parent_world, None),
             parent_world,
             settings,
             np.random.default_rng(3),
             UpAxis.Z,
             UpAxis.Y,
-            None,
         )
 
         # Assert
@@ -605,14 +673,12 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
                 # Act
                 translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-                    Gf.Vec3d(1.0, 2.0, 3.0),
-                    normal,
+                    sampling.to_parent_space_origin(Gf.Vec3d(1.0, 2.0, 3.0), normal, _identity_parent(), None),
                     _identity_parent(),
                     settings,
                     np.random.default_rng(0),
                     UpAxis.Z,
                     UpAxis.Z,
-                    None,
                 )
 
                 # Assert
@@ -628,14 +694,12 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
         # Act
         translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-            Gf.Vec3d(0.0, 0.0, 0.0),
-            normal,
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), normal, _identity_parent(), None),
             _identity_parent(),
             settings,
             np.random.default_rng(0),
             UpAxis.Y,
             UpAxis.Y,
-            None,
         )
 
         # Assert
@@ -650,14 +714,12 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
         # Act
         translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-            Gf.Vec3d(0.0, 0.0, 0.0),
-            normal,
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), normal, _identity_parent(), None),
             _identity_parent(),
             settings,
             np.random.default_rng(0),
             UpAxis.Z,
             UpAxis.Z,
-            None,
         )
 
         # Assert
@@ -684,14 +746,12 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
                 # Act
                 translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-                    Gf.Vec3d(0.0, 0.0, 0.0),
-                    normal,
+                    sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), normal, _identity_parent(), heading),
                     _identity_parent(),
                     settings,
                     np.random.default_rng(0),
                     stage_up,
                     stage_up,
-                    heading,
                 )
 
                 # Assert
@@ -707,14 +767,14 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
         # Act
         translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-            Gf.Vec3d(0.0, 0.0, 0.0),
-            Gf.Vec3d(0.0, 0.0, 1.0),
+            sampling.to_parent_space_origin(
+                Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d(0.0, 0.0, 1.0), parent_world, Gf.Vec3d(0.0, 1.0, 0.0)
+            ),
             parent_world,
             settings,
             np.random.default_rng(0),
             UpAxis.Z,
             UpAxis.Z,
-            Gf.Vec3d(0.0, 1.0, 0.0),
         )
 
         # Assert
@@ -736,14 +796,14 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
                 # Act
                 translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-                    Gf.Vec3d(0.0, 0.0, 0.0),
-                    Gf.Vec3d(0.0, 0.0, 1.0),
+                    sampling.to_parent_space_origin(
+                        Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d(0.0, 0.0, 1.0), _identity_parent(), heading
+                    ),
                     _identity_parent(),
                     settings,
                     np.random.default_rng(0),
                     UpAxis.Z,
                     UpAxis.Z,
-                    heading,
                 )
 
                 # Assert
@@ -763,14 +823,12 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
                 # Act
                 translate, _rotate_xyz, _scale = sampling.compose_parent_space_transform(
-                    Gf.Vec3d(1.0, 2.0, 3.0),
-                    normal,
+                    sampling.to_parent_space_origin(Gf.Vec3d(1.0, 2.0, 3.0), normal, _identity_parent(), None),
                     _identity_parent(),
                     settings,
                     np.random.default_rng(0),
                     stage_up,
                     stage_up,
-                    None,
                 )
 
                 # Assert
@@ -802,18 +860,16 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
         # Act
         translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-            position_world,
-            normal_world,
+            sampling.to_parent_space_origin(position_world, normal_world, parent_world, None),
             parent_world,
             settings,
             np.random.default_rng(0),
             UpAxis.Z,
             UpAxis.Z,
-            None,
         )
 
-        # Assert
-        self._assert_vec_close(scale, Gf.Vec3f(2.0, 0.5, 1.0))
+        # Assert - the requested scale divided by the parent's uniform scale of 2, so the world size is what was asked
+        self._assert_vec_close(scale, Gf.Vec3f(1.0, 0.25, 0.5))
         authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
         world = authored * parent_world
         self._assert_vec_close(world.Transform(Gf.Vec3d(0.0, 0.0, 0.0)), position_world, 1e-4)
@@ -830,8 +886,155 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
         # Act
         translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-            Gf.Vec3d(0.0, 0.0, 0.0),
-            normal_world,
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), normal_world, parent_world, None),
+            parent_world,
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+        )
+
+        # Assert - normalized because the authored scale now also carries the parent's uniform scale compensation
+        authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
+        up_in_parent = authored.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0)).GetNormalized()
+        self._assert_vec_close(up_in_parent, expected_normal_parent, 1e-4)
+
+    async def test_compose_parent_space_transform_accepts_numpy_vectors(self):
+        # Arrange
+        settings = _settings(conform_to_surface=False, vertical_offset=1.0)
+
+        # Act
+        translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(
+                np.array([1.0, 2.0, 3.0]), np.array([0.0, 0.0, 1.0]), _identity_parent(), np.array([0.0, 1.0, 0.0])
+            ),
+            _identity_parent(),
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+        )
+
+        # Assert
+        self._assert_vec_close(translate, Gf.Vec3d(1.0, 2.0, 4.0))
+        self._assert_vec_close(rotate_xyz, Gf.Vec3f(0.0, 0.0, 0.0))
+        self._assert_vec_close(scale, Gf.Vec3f(1.0, 1.0, 1.0))
+
+    async def test_parent_uniform_scale_for_each_transform_returns_expected_factor(self):
+        cases = [
+            ("identity", Gf.Matrix4d(1.0), 1.0),
+            ("uniform", Gf.Matrix4d().SetScale(Gf.Vec3d(3.0, 3.0, 3.0)), 3.0),
+            ("non_uniform", Gf.Matrix4d().SetScale(Gf.Vec3d(8.0, 1.0, 1.0)), 2.0),
+            ("mirrored", Gf.Matrix4d().SetScale(Gf.Vec3d(-2.0, 2.0, 2.0)), 2.0),
+            (
+                "rigid",
+                _rotation_matrix(Gf.Vec3d.XAxis(), 30.0) * Gf.Matrix4d().SetTranslate(Gf.Vec3d(9.0, 9.0, 9.0)),
+                1.0,
+            ),
+            (
+                "scaled_and_rotated",
+                Gf.Matrix4d().SetScale(Gf.Vec3d(4.0, 4.0, 4.0)) * _rotation_matrix(Gf.Vec3d.ZAxis(), 25.0),
+                4.0,
+            ),
+            ("collapsed", Gf.Matrix4d().SetScale(Gf.Vec3d(0.0, 0.0, 0.0)), 1.0),
+        ]
+        for title, matrix, expected in cases:
+            with self.subTest(title=title):
+                # Act
+                result = sampling.parent_uniform_scale(matrix)
+
+                # Assert
+                self.assertAlmostEqual(result, expected, places=5)
+
+    async def test_compose_parent_space_transform_with_scaled_parent_divides_authored_scale_by_parent_scale(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        settings = _settings(scale_enabled=True, scale_min=2.0, scale_max=2.0)
+        parent_world = Gf.Matrix4d().SetScale(Gf.Vec3d(4.0, 4.0, 4.0))
+
+        # Act
+        translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d.ZAxis(), parent_world, None),
+            parent_world,
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+        )
+
+        # Assert - authored at 0.5 so that the parent's scale of 4 brings it back to the requested 2 in world space
+        self._assert_vec_close(scale, Gf.Vec3f(0.5, 0.5, 0.5))
+        authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
+        world_size = (authored * parent_world).TransformDir(Gf.Vec3d.ZAxis()).GetLength()
+        self.assertAlmostEqual(world_size, 2.0, places=5)
+
+    async def test_compose_parent_space_transform_with_scaled_parent_divides_vertical_offset_by_parent_scale(self):
+        # Arrange
+        settings = _settings(conform_to_surface=False, vertical_offset=10.0)
+        parent_world = Gf.Matrix4d().SetScale(Gf.Vec3d(2.0, 2.0, 2.0))
+
+        # Act
+        translate, _, _ = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d.ZAxis(), parent_world, None),
+            parent_world,
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+        )
+
+        # Assert - half in parent space, so the parent's scale of 2 makes it the requested 10 in world space
+        self._assert_vec_close(translate, Gf.Vec3d(0.0, 0.0, 5.0))
+        self._assert_vec_close(parent_world.Transform(translate), Gf.Vec3d(0.0, 0.0, 10.0))
+
+    async def test_compose_parent_space_transform_without_conform_offsets_along_the_axis_the_asset_stands_on(self):
+        # Arrange - the parent is rolled 90 degrees about X, and the parent's scale must not stretch the offset.
+        stage = Usd.Stage.CreateInMemory()
+        settings = _settings(conform_to_surface=False, vertical_offset=4.0)
+        parent_world = _rotation_matrix(Gf.Vec3d.XAxis(), 90.0) * Gf.Matrix4d().SetScale(Gf.Vec3d(2.0, 2.0, 2.0))
+
+        # Act
+        translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d.ZAxis(), parent_world, None),
+            parent_world,
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+        )
+
+        # Assert - the offset follows the asset's own up axis and covers the requested world distance
+        authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
+        asset_up_world = (authored * parent_world).TransformDir(Gf.Vec3d.ZAxis()).GetNormalized()
+        offset_world = parent_world.Transform(translate) - parent_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+        self._assert_vec_close(offset_world, asset_up_world * 4.0, 1e-4)
+
+    async def test_compose_parent_space_transform_with_asset_scale_factor_scales_the_sampled_value(self):
+        # Arrange
+        settings = _settings(scale_enabled=True, scale_min=2.0, scale_max=2.0)
+
+        # Act
+        _, _, scale = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d.ZAxis(), _identity_parent(), None),
+            _identity_parent(),
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+            0.25,
+        )
+
+        # Assert
+        self._assert_vec_close(scale, Gf.Vec3f(0.5, 0.5, 0.5))
+
+    async def test_compose_parent_space_transform_without_asset_scale_factor_authors_the_assets_own_size(self):
+        # Arrange - an unmeasured asset in absolute size mode; the sampled 30 is a height, not a multiplier.
+        settings = _settings(scale_mode=ScaleMode.ABSOLUTE_SIZE, scale_enabled=True, size_min=30.0, size_max=30.0)
+        parent_world = Gf.Matrix4d().SetScale(Gf.Vec3d(2.0, 2.0, 2.0))
+
+        # Act
+        _, _, scale = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d.ZAxis(), parent_world, None),
             parent_world,
             settings,
             np.random.default_rng(0),
@@ -840,47 +1043,49 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
             None,
         )
 
-        # Assert
-        authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
-        self._assert_vec_close(authored.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0)), expected_normal_parent, 1e-4)
+        # Assert - unit scale in world space, which is 0.5 under a parent scaled by 2
+        self._assert_vec_close(scale, Gf.Vec3f(0.5, 0.5, 0.5))
 
-    async def test_compose_parent_space_transform_accepts_numpy_vectors(self):
+    async def test_to_parent_space_origin_with_zero_normal_raises_value_error(self):
         # Arrange
-        settings = _settings(conform_to_surface=False, vertical_offset=1.0)
-
-        # Act
-        translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
-            np.array([1.0, 2.0, 3.0]),
-            np.array([0.0, 0.0, 1.0]),
-            _identity_parent(),
-            settings,
-            np.random.default_rng(0),
-            UpAxis.Z,
-            UpAxis.Z,
-            np.array([0.0, 1.0, 0.0]),
-        )
-
-        # Assert
-        self._assert_vec_close(translate, Gf.Vec3d(1.0, 2.0, 4.0))
-        self._assert_vec_close(rotate_xyz, Gf.Vec3f(0.0, 0.0, 0.0))
-        self._assert_vec_close(scale, Gf.Vec3f(1.0, 1.0, 1.0))
-
-    async def test_compose_parent_space_transform_with_zero_normal_raises_value_error(self):
-        # Arrange
-        settings = _settings()
+        parent_world = _identity_parent()
 
         # Act / Assert
         with self.assertRaises(ValueError):
-            sampling.compose_parent_space_transform(
-                Gf.Vec3d(0.0, 0.0, 0.0),
-                Gf.Vec3d(0.0, 0.0, 0.0),
-                _identity_parent(),
-                settings,
-                np.random.default_rng(0),
-                UpAxis.Z,
-                UpAxis.Z,
-                None,
-            )
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d(0.0, 0.0, 0.0), parent_world, None)
+
+    async def test_to_parent_space_origin_without_heading_keeps_six_values_for_authoring(self):
+        # Arrange
+        parent_world = Gf.Matrix4d().SetTranslate(Gf.Vec3d(5.0, 0.0, 0.0))
+
+        # Act
+        origin = sampling.to_parent_space_origin(Gf.Vec3d(7.0, 0.0, 0.0), Gf.Vec3d(0.0, 0.0, 1.0), parent_world)
+
+        # Assert
+        self.assertEqual(origin.to_values(), (2.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+        self.assertEqual(sampling.ParentSpaceOrigin.from_values(origin.to_values()), origin)
+
+    async def test_to_parent_space_origin_with_heading_round_trips_nine_values(self):
+        # Arrange
+        parent_world = _identity_parent()
+
+        # Act
+        origin = sampling.to_parent_space_origin(
+            Gf.Vec3d(1.0, 2.0, 3.0), Gf.Vec3d(0.0, 0.0, 1.0), parent_world, Gf.Vec3d(1.0, 0.0, 0.0)
+        )
+
+        # Assert
+        self.assertEqual(sampling.ParentSpaceOrigin.from_values(origin.to_values()), origin)
+
+    async def test_parent_space_origin_from_values_with_wrong_length_returns_none(self):
+        # Arrange
+        values = (1.0, 2.0, 3.0, 4.0)
+
+        # Act
+        origin = sampling.ParentSpaceOrigin.from_values(values)
+
+        # Assert
+        self.assertIsNone(origin)
 
 
 class TestPaddingIndex(omni.kit.test.AsyncTestCase):

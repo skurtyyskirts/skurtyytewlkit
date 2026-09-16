@@ -631,6 +631,31 @@ class TestScatterAssetDelegate(_AssetListTestCase):
         self.assertEqual(self.controller.assets[0].weight, 100.0)
 
 
+class TestSizeTooltip(omni.kit.test.AsyncTestCase):
+    """Tests the size line under an asset's path, which is what Absolute Size divides by."""
+
+    async def test_tooltip_for_a_measured_asset_reports_its_height_and_unit_scale(self):
+        # Arrange
+        entry = ScatterAssetEntry(path=_ROCK, natural_extent=(1.0, 2.0, 30.0), meters_per_unit=0.01)
+
+        # Act
+        tooltip = asset_list_module.size_tooltip(entry)
+
+        # Assert
+        self.assertIn("30", tooltip)
+        self.assertIn("0.01", tooltip)
+
+    async def test_tooltip_without_a_measurement_says_the_asset_keeps_its_own_size(self):
+        # Arrange
+        entry = ScatterAssetEntry(path=_ROCK)
+
+        # Act
+        tooltip = asset_list_module.size_tooltip(entry)
+
+        # Assert
+        self.assertIn("not measured", tooltip)
+
+
 class TestMapsSummary(omni.kit.test.AsyncTestCase):
     """Tests the Maps cell text, which tells the user what the brush will paint before they paint it."""
 

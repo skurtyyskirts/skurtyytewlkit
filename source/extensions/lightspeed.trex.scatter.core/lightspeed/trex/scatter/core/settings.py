@@ -18,10 +18,15 @@
 from __future__ import annotations
 
 __all__ = [
+    "ALERT_BUDGET_MULTIPLE",
+    "LIVE_EDIT_SOFT_LIMIT",
     "RANGE_PAIRS",
+    "REAPPLIABLE_FIELDS",
     "ApplyTo",
     "EraseScope",
     "Falloff",
+    "PrimBudgetStatus",
+    "ScaleMode",
     "ScatterAssetEntry",
     "ScatterBrushSettings",
     "ScatterMaterialOverride",
@@ -29,6 +34,7 @@ __all__ = [
     "TargetMode",
     "UpAxis",
     "load_assets_from_carb",
+    "prim_budget_status",
     "save_assets_to_carb",
 ]
 
@@ -70,9 +76,29 @@ class EraseScope(StrEnum):
     BRUSH_ASSETS = "BRUSH_ASSETS"
 
 
+class ScaleMode(StrEnum):
+    """What the placement scale range means.
+
+    ``ABSOLUTE_SIZE`` is the default because a multiplier is meaningless without knowing how large the asset already
+    is: ingestion bakes the source file's unit scale into the asset, so the same multiplier gives wildly different
+    sizes for two assets that look the same in a DCC.
+    """
+
+    ABSOLUTE_SIZE = "ABSOLUTE_SIZE"
+    MULTIPLIER = "MULTIPLIER"
+
+
 class UpAxis(StrEnum):
     Y = "Y"
     Z = "Z"
+
+
+class PrimBudgetStatus(StrEnum):
+    """How the prims a stroke would render compare with the brush prim budget."""
+
+    OK = "OK"
+    WARNING = "WARNING"
+    ALERT = "ALERT"
 
 
 class ScatterMaterialOverride(BaseModel):
@@ -130,23 +156,87 @@ class ScatterAssetEntry(BaseModel):
     enabled: bool = True
     weight: float = Field(1.0, ge=0.0, le=100.0)
     up_axis: UpAxis = UpAxis.Z
+
+    meters_per_unit: float = Field(1.0, gt=0.0)
+    """Meters per unit of the asset file, so its size can be converted into the units of whatever stage it lands on."""
+
+    natural_extent: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Size of the asset's default prim along each axis in the asset's own units, or zeros when it was not measured.
+
+    All three components are stored rather than the height alone because the up axis can be overridden after the
+    asset was measured, and the height has to follow without re-opening the file.
+    """
+
     texture_source: str = ""
     """A texture the user picked for this asset, whose siblings drive resolution instead of auto-detection."""
 
     textures: ScatterTextureSet | None = Field(default=None, exclude=True)
     """Resolved texture set, rebuilt from disk on demand and deliberately never persisted."""
 
+    @property
+    def natural_height(self) -> float:
+        """Size of the asset along its own up axis in its own units; 0.0 when it has not been measured."""
+        return self.natural_extent[1 if UpAxis(self.up_axis) == UpAxis.Y else 2]
+
+
+ALERT_BUDGET_MULTIPLE = 5
+"""Multiple of the prim budget at which a stroke counter goes from a warning to an alert."""
+
+LIVE_EDIT_SOFT_LIMIT = 2000
+"""Placements above which a live edit waits for the edit to finish instead of following every drag step.
+
+Like the prim budget this only changes how an edit is paced; it never stops one, because the count the artist is
+working with is theirs to decide.
+"""
 
 RANGE_PAIRS = (
     ("rotation_x_min", "rotation_x_max"),
     ("rotation_y_min", "rotation_y_max"),
     ("rotation_z_min", "rotation_z_max"),
+    ("size_min", "size_max"),
     ("scale_min", "scale_max"),
     ("scale_x_min", "scale_x_max"),
     ("scale_y_min", "scale_y_max"),
     ("scale_z_min", "scale_z_max"),
 )
 """Settings fields that form a low/high pair and must stay ordered."""
+
+REAPPLIABLE_FIELDS = frozenset(
+    {
+        "vertical_offset",
+        "conform_to_surface",
+        "align_to_stroke",
+        "rotation_x_min",
+        "rotation_x_max",
+        "rotation_y_min",
+        "rotation_y_max",
+        "rotation_z_min",
+        "rotation_z_max",
+        "scale_mode",
+        "size_min",
+        "size_max",
+        "scale_enabled",
+        "scale_uniform",
+        "scale_min",
+        "scale_max",
+        "scale_x_min",
+        "scale_x_max",
+        "scale_y_min",
+        "scale_y_max",
+        "scale_z_min",
+        "scale_z_max",
+        "scale_bias",
+        "scale_weight",
+        "seed",
+    }
+)
+"""Settings fields a live edit can re-apply to placements that already exist.
+
+Every one of them is an input of ``compose_parent_space_transform``, so a placement that recorded the surface point
+it was composed from can be recomposed without knowing anything about the stroke that painted it. The brush fields
+(radius, density, strength, stamp_spacing, padding) are absent because they decide where stamps land, which depends
+on the mouse path the stroke followed and is not recorded.
+"""
 
 
 class ScatterBrushSettings(BaseModel):
@@ -176,6 +266,9 @@ class ScatterBrushSettings(BaseModel):
     rotation_z_max: float = Field(360.0, ge=-360.0, le=360.0)
 
     # Scale
+    scale_mode: ScaleMode = ScaleMode.ABSOLUTE_SIZE
+    size_min: float = Field(10.0, ge=0.001, le=100000.0)
+    size_max: float = Field(15.0, ge=0.001, le=100000.0)
     scale_enabled: bool = True
     scale_uniform: bool = True
     scale_min: float = Field(0.8, ge=0.01, le=1000.0)
@@ -199,9 +292,25 @@ class ScatterBrushSettings(BaseModel):
     anchor_prototype_path: str = ""
     erase_scope: EraseScope = EraseScope.ALL_SCATTERED
     flood_max_instances: int = Field(300, ge=1, le=100000)
+    """Placements one flood may author across every target it fills."""
+
+    prim_budget: int = Field(10000, ge=1, le=10000000)
+    """Prims a single stroke is expected to render before the brush flags it as expensive.
+
+    Counted in rendered prims rather than authored placements: a placement under a prototype renders once per
+    instance of that prototype's hash, so a stroke on a mesh with many instances costs far more than it authors. The
+    budget only colours the stroke counter; it never stops or trims a stroke.
+    """
 
     # Materials
     assign_textures: bool = True
+
+    # Live editing
+    edit_selection_live: bool = True
+    """Whether changing a re-appliable setting also updates the placements the user has selected.
+
+    Off, a settings change only affects the next stroke, which is how the brush behaved before live editing existed.
+    """
 
     @model_validator(mode="after")
     def _check_ranges(self) -> ScatterBrushSettings:
@@ -243,6 +352,26 @@ class ScatterBrushSettings(BaseModel):
         except (ValueError, TypeError, ValidationError) as exc:
             carb.log_warn(f"[lightspeed.trex.scatter.core] Ignoring invalid persisted brush settings: {exc}")
             return cls()
+
+
+def prim_budget_status(rendered_prims: int, budget: int) -> PrimBudgetStatus:
+    """Classify the prims a stroke would render against the brush prim budget.
+
+    Args:
+        rendered_prims: Placements authored so far multiplied by the instance count of the prototype each landed on.
+        budget: ``prim_budget`` of the brush settings.
+
+    Returns:
+        ``WARNING`` from the budget upward, ``ALERT`` from ``ALERT_BUDGET_MULTIPLE`` times the budget upward, and
+        ``OK`` below the budget or when the budget is not positive.
+    """
+    if budget <= 0:
+        return PrimBudgetStatus.OK
+    if rendered_prims >= budget * ALERT_BUDGET_MULTIPLE:
+        return PrimBudgetStatus.ALERT
+    if rendered_prims >= budget:
+        return PrimBudgetStatus.WARNING
+    return PrimBudgetStatus.OK
 
 
 def save_assets_to_carb(assets: Sequence[ScatterAssetEntry], settings: carb.settings.ISettings | None = None) -> None:

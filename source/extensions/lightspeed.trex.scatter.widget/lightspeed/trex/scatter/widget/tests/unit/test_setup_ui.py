@@ -26,7 +26,13 @@ import omni.kit.app
 import omni.kit.test
 from lightspeed.trex.scatter.core import controller as _controller_module
 from lightspeed.trex.scatter.core.controller import ScatterMode
-from lightspeed.trex.scatter.core.settings import Falloff, ScatterBrushSettings, TargetMode, UpAxis
+from lightspeed.trex.scatter.core.settings import (
+    Falloff,
+    ScaleMode,
+    ScatterBrushSettings,
+    TargetMode,
+    UpAxis,
+)
 from lightspeed.trex.scatter.widget import setup_ui as _setup_ui_module
 from omni import ui
 from omni.kit import ui_test
@@ -61,7 +67,10 @@ _EXPECTED_CONTROLS = (
     ("FloatBoundedDrag", "scatter_rot_x_max"),
     ("FloatBoundedDrag", "scatter_rot_y_min"),
     ("FloatBoundedDrag", "scatter_rot_y_max"),
+    ("ComboBox", "scatter_scale_mode"),
     ("CheckBox", "scatter_scale_enabled"),
+    ("FloatBoundedDrag", "scatter_size_min"),
+    ("FloatBoundedDrag", "scatter_size_max"),
     ("CheckBox", "scatter_scale_uniform"),
     ("FloatBoundedDrag", "scatter_scale_min"),
     ("FloatBoundedDrag", "scatter_scale_max"),
@@ -83,6 +92,7 @@ _EXPECTED_CONTROLS = (
     ("ComboBox", "scatter_erase_scope"),
     ("IntBoundedDrag", "scatter_flood_cap"),
     ("Label", "scatter_flood_estimate"),
+    ("IntBoundedDrag", "scatter_prim_budget"),
     ("Label", "scatter_instance_warning"),
     ("CheckBox", "scatter_assign_textures"),
 )
@@ -379,6 +389,40 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         # Assert
         flood_mock.assert_called_once_with(_CONTEXT_NAME, self.pane._surface_cache)
 
+    async def test_build_pane_in_absolute_size_mode_shows_size_rows_and_hides_the_multiplier_rows(self):
+        # Arrange - Absolute Size is the default, so this is what a freshly built pane shows.
+
+        # Act
+        size_visible = self.pane._size_stack.visible
+        multiplier_visible = self.pane._multiplier_scale_stack.visible
+
+        # Assert
+        self.assertTrue(size_visible)
+        self.assertFalse(multiplier_visible)
+
+    async def test_select_multiplier_scale_mode_swaps_the_size_rows_for_the_multiplier_rows(self):
+        # Arrange
+        model = self._model("scale_mode")
+
+        # Act
+        model.set_value(list(ScaleMode).index(ScaleMode.MULTIPLIER))
+
+        # Assert
+        self.assertEqual(self.controller.settings.scale_mode, ScaleMode.MULTIPLIER)
+        self.assertFalse(self.pane._size_stack.visible)
+        self.assertTrue(self.pane._multiplier_scale_stack.visible)
+
+    async def test_update_settings_back_to_absolute_size_restores_the_size_rows(self):
+        # Arrange
+        self.controller.update_settings(scale_mode=ScaleMode.MULTIPLIER)
+
+        # Act
+        self.controller.update_settings(scale_mode=ScaleMode.ABSOLUTE_SIZE)
+
+        # Assert
+        self.assertTrue(self.pane._size_stack.visible)
+        self.assertFalse(self.pane._multiplier_scale_stack.visible)
+
     async def test_build_pane_with_uniform_scale_hides_per_axis_rows(self):
         # Arrange
         stack = self.pane._per_axis_scale_stack
@@ -437,7 +481,7 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         self.controller.update_settings(flood_max_instances=42)
 
         # Assert
-        self.assertEqual(label.text, "Up to 42 prims")
+        self.assertEqual(label.text, "Up to 42 prims per instance")
 
     async def test_select_anchor_mode_with_replicated_anchor_multiplies_flood_estimate_by_instances(self):
         # Arrange
@@ -464,7 +508,7 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
             self.controller.update_settings(target_mode=TargetMode.HIT_SURFACE)
 
         # Assert
-        self.assertEqual(self.pane._flood_estimate_label.text, f"Up to {cap} prims")
+        self.assertEqual(self.pane._flood_estimate_label.text, f"Up to {cap} prims per instance")
 
     async def test_select_anchor_mode_with_replicated_anchor_shows_instance_warning(self):
         # Arrange

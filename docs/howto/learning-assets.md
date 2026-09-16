@@ -191,15 +191,29 @@ The Scatter window groups the brush parameters into collapsible sections:
   the center to the edge: Constant, Linear, Smooth, Sphere, or Gaussian), **Density** (candidates drawn per stamp),
   **Strength** (the share of those candidates that is kept), **Stamp Spacing** (distance between stamps along a
   stroke), and **Padding** (minimum distance kept between placements).
-* **PLACEMENT** — how each placement sits on the surface: **Vertical Offset** along the surface normal, **Conform to
-  Surface** (aligns the asset's up axis with the surface normal), **Align to Stroke** (turns the asset to face the
-  stroke direction), and random rotation ranges (yaw at the top level, with tilt around the other two axes under an
-  **ADVANCED ROTATION** sub-section).
-* **SCALE** — random scale per placement, with an enable toggle, a uniform **Min**/**Max** range, **Bias** (skews the
-  distribution toward the minimum at -1 or the maximum at 1), **Weight** (sharpens the distribution above 1 or
-  flattens it below 1), and, once **Uniform** is turned off, a separate Min/Max range per axis. Dragging a **Min**
-  above its **Max**, or a **Max** below its **Min**, carries the other end along, so either end can be moved
-  anywhere without first making room for it. The same applies to the rotation ranges.
+* **PLACEMENT** — how each placement sits on the surface: **Edit Selection Live** (see
+  [Tuning What You Already Painted](#tuning-what-you-already-painted)), **Vertical Offset** along the surface normal,
+  **Conform to Surface** (aligns the asset's up axis with the surface normal), **Align to Stroke** (turns the asset to
+  face the stroke direction), and random rotation ranges (yaw at the top level, with tilt around the other two axes
+  under an **ADVANCED ROTATION** sub-section).
+* **SCALE** — how large each placement is. **Scale Mode** decides what the range means. **Absolute Size** (the
+  default) reads the range as a height in stage units, measured along the asset's up axis, so setting grass to 30
+  gives grass 30 units tall no matter how large the asset file happens to be; the brush measures each asset when it
+  joins the palette, and its tooltip reports that measurement. **Multiplier** reads the range as a factor of the
+  asset's own size, and adds the **Uniform** toggle with a separate Min/Max range per axis once it is turned off.
+  **Random Scale** varies the size within the range; with it off, every placement uses the minimum. **Bias** skews
+  the distribution toward the minimum at -1 or the maximum at 1, and **Weight** sharpens it above 1 or flattens it
+  below 1. Dragging a **Min** above its **Max**, or a **Max** below its **Min**, carries the other end along, so
+  either end can be moved anywhere without first making room for it. The same applies to the rotation ranges.
+
+  Sizes are world-space: a placement comes out the same size whether the captured mesh under it was scaled by the
+  game or not, and **Vertical Offset** is likewise a distance in stage units. An asset the brush cannot open is
+  scattered at its own size and says so in its palette tooltip.
+
+  Both the height and the upright orientation depend on the **Up** column in the ASSETS list, which is the axis
+  the *asset file* was authored along — not the up axis of the scene. It is read from the file when the asset is
+  added; setting it to match the stage instead tells the brush no correction is needed, and the asset is scattered
+  lying on its side. The brush reports a disagreement between the column and the file when a stroke starts.
 * **RANDOM** — the stroke's random **Seed**, with **Reroll** drawing a new one on demand, and **Randomize**, which
   draws a fresh seed for every stroke instead of reusing the fixed one.
 * **TARGET** — which captured meshes receive placements: **Apply To** (All or Selected), **Target Mode** (Hit
@@ -207,7 +221,90 @@ The Scatter window groups the brush parameters into collapsible sections:
   the **Use Selection** button), **Erase Scope** (All Scattered or Brush Assets, controlling what Shift+drag or Erase
   mode removes), and **Flood Cap**, the placement limit for the **Flood** button, which fills the anchor or the
   selected captured meshes with placements in a single undoable step; requesting more than the default cap asks for
-  confirmation first.
+  confirmation first. **Prim Budget** sets when the brush's live stroke counter reports a stroke as expensive.
+
+### Tuning What You Already Painted
+
+A stroke bakes the settings it was painted with into each placement, so changing a setting afterwards would normally
+only affect your next stroke. With **Edit Selection Live** on — it is on by default — a settings change also updates
+the scatter you have selected, so you can paint a patch of grass first and find its size, rotation and offset
+afterwards, watching the viewport while you drag the slider.
+
+Select what you want to change, then drag. What you selected decides what moves:
+
+| What you select | What a settings change updates |
+|---|---|
+| Painted placements | Exactly those placements. |
+| A `scatter_<preset>` container | Every placement in that container. |
+| A mesh or an instance | What the preset currently loaded in the window painted on it. |
+| Nothing | Nothing already painted; the setting applies to your next stroke only. |
+
+The readout beside the toggle always names what is in scope before you touch anything, for example
+`428 placements - mesh_A64083D9 / grass`.
+
+Because a plain mesh selection resolves through the preset name, two patches on the same mesh stay independent as
+long as you painted them under different presets. Paint glass under a `Glass` preset and grass under a `Grass`
+preset, and selecting that mesh with `Grass` loaded moves only the grass. If both were painted under the same
+preset, select one patch's container or its placements directly instead.
+
+A whole slider drag is a single undo step, so one `Ctrl+Z` puts the patch back the way it was.
+
+```{note}
+Only the **PLACEMENT**, **SCALE** and **RANDOM** settings re-apply. **Radius**, **Density**, **Strength**, **Stamp
+Spacing** and **Padding** decide *where* stamps land, which depends on the path your mouse followed, and that path is
+not recorded — those always apply to your next stroke only. Changing **Seed**, or pressing **Reroll**, draws a fresh
+random arrangement for the placements you have selected, which is the quickest way to try a different look without
+repainting.
+```
+
+Two kinds of placement are deliberately left alone, and the readout says how many:
+
+* **Placements you moved by hand.** A placement remembers the transform the brush gave it, so one you have since
+  nudged, turned or rescaled yourself keeps your change instead of being overwritten.
+* **Placements painted before this feature existed.** They never recorded the surface they were placed on, so the
+  brush projects them back onto their mesh to recover it. They follow every setting, but their original random
+  rotation and scale cannot be recovered and are drawn afresh, so expect that patch to re-roll the first time you
+  edit it.
+
+Placements authored in a layer other than your current edit target are also skipped, the same way erasing skips them;
+set that layer as the edit target to change them.
+
+### Keeping a scattered scene fast in game
+
+A placement is authored under a captured mesh's prototype, so it is drawn once for **every instance of that
+prototype's hash**. Painting 200 rocks onto a floor tile that appears 50 times in the level puts 10,000 rocks in
+front of the player. That multiplier, not the number of strokes, is what decides the cost of a scattered scene.
+
+While a paint stroke is running, the brush prints a running total next to the cursor. It reads `1,200 prims` on a
+prototype with a single instance, and `1,200 placed  ->  60,000 prims` on one that replicates, so the multiplier is
+visible while there is still time to undo. The text turns amber once the stroke passes **Prim Budget** and red at
+five times it. It only reports: no stroke is ever cut short, and the counter is not shown while erasing.
+
+Three settings decide how much a stroke can author:
+
+* **Padding** is the real limit. It is the minimum distance between placements and it holds for the whole stroke, so
+  it caps the total no matter how high **Density** goes. At the default of 10, a 1000-unit drag with a 50-unit radius
+  cannot exceed about 1,250 placements. **Setting Padding to 0 removes the limit entirely** and lets one long drag
+  author an unbounded number of placements.
+* **Density** and **Stamp Spacing** decide how quickly the stroke approaches that cap. The defaults (density 8,
+  spacing 25, Smooth falloff) author about 96 placements over a 1000-unit drag, which stays inside a 10,000-prim
+  budget until the target has more than about 100 instances.
+* **Falloff** thins every stamp: Smooth and Linear keep roughly 30% of the candidates drawn, Sphere about 67%, and
+  Constant all of them. Switching from Smooth to Constant roughly triples a stroke.
+
+If a stroke needs to stay inside 10,000 rendered prims, raise **Padding** as the instance count of the target rises:
+
+| Instances of the target | Placements that fit the budget | Minimum Padding |
+|---|---|---|
+| 1 | 10,000 | 4 |
+| 5 | 2,000 | 8 |
+| 20 | 500 | 16 |
+| 50 | 200 | 25 |
+| 200 | 50 | 50 |
+
+Prim count is not the whole cost. A scattered asset's triangle count and its material both multiply the same way, so
+300 copies of a 50,000-triangle rock is 15 million triangles however modest the prim count looks. Prefer low-polygon
+assets for anything scattered densely, and profile the result in game rather than trusting the counter alone.
 
 ### Presets
 

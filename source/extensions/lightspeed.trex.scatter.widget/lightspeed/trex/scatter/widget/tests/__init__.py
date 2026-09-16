@@ -29,6 +29,7 @@ __all__ = [
     "TestScatterPane",
     "TestScatterWindow",
     "TestScatterWindowE2E",
+    "TestSizeTooltip",
     "TestTrexScatterWindowExtension",
 ]
 
@@ -40,6 +41,7 @@ from .unit.test_asset_list import (
     TestScatterAssetListWidget,
     TestScatterAssetModel,
     TestScatterAssetTextureSource,
+    TestSizeTooltip,
 )
 from .unit.test_combo_model import TestChoicesComboModel
 from .unit.test_extension import TestTrexScatterWindowExtension

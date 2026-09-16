@@ -30,16 +30,26 @@ __all__ = [
     "PRESETS_SUBDIRECTORY",
     "SCATTER_ASSET_ATTR",
     "SCATTER_BRUSH_ID_ATTR",
+    "SCATTER_KEY_ATTR",
+    "SCATTER_ORIGIN_ATTR",
+    "SCATTER_TRANSFORM_KEY_ATTR",
     "SCENE_FACTORY_ID",
     "TOOLBAR_PRIORITY",
 ]
 
 EXTENSION_NAME = "lightspeed.trex.scatter.core"
 
-# Prim attributes authored on scattered prims. The container carries the marker only; placements carry all three.
+# Prim attributes authored on scattered prims. The container carries the marker and the brush id; placements carry
+# the marker, the asset path and the three attributes a re-apply needs to recompose them.
 IS_REMIX_SCATTER_ATTR = "IsRemixScatter"
 SCATTER_BRUSH_ID_ATTR = "remixScatterBrushId"
 SCATTER_ASSET_ATTR = "remixScatterAsset"
+# Parent-space surface point, surface normal and, when the stamp had one, the stroke heading: 6 or 9 doubles.
+SCATTER_ORIGIN_ATTR = "remixScatterOrigin"
+# The placement's own random key, so its rotation and scale draws can be reproduced without replaying its stamp.
+SCATTER_KEY_ATTR = "remixScatterKey"
+# Checksum of the transform the brush authored, so a transform the user changed by hand can be left alone.
+SCATTER_TRANSFORM_KEY_ATTR = "remixScatterTransformKey"
 
 # Prim naming: <prototype>/scatter_<preset slug>/s_<uuid>
 CONTAINER_PREFIX = "scatter_"

@@ -15,7 +15,8 @@ camera-mutating action is canceled and a warning explains that the capture game 
 - Host the viewport/Properties pane splitter and keep the Properties pane at least 240 pixels wide.
 - Coordinate viewport layers, tools, statistics, activation, and renderer startup behavior.
 - Host the viewport toolbar tools: Teleport and the Scatter Brush (toolbar toggle, `Ctrl+B`, `B`+wheel radius
-  sizing, paint/erase strokes with a surface-following cursor).
+  sizing, paint/erase strokes with a surface-following cursor, and a live counter of the prims the stroke is adding
+  to the rendered stage).
 - Let viewport tools claim the mouse wheel before the camera zooms through the mouse-wheel interceptor hook on
   `ViewportEventDelegate`.
 - Retry supported viewport initialization once and report terminal startup failures through an Exit-only dialog.

@@ -81,13 +81,13 @@ def _authored_inputs(entry: ScatterAssetEntry) -> list[str]:
     return ordered + sorted(authored.difference(dict(_MAP_LETTERS)))
 
 
-def _row_signature(entry: ScatterAssetEntry) -> tuple[str, str, str]:
+def _row_signature(entry: ScatterAssetEntry) -> tuple[str, str, str, str]:
     """Return what a row shows through widgets the delegate builds once rather than through a bound model.
 
     The enabled, weight and up-axis cells follow their value models, so a change there only needs a push. The maps
     cell is a plain label beside a button whose label depends on the override, so those have to force a rebuild.
     """
-    return entry.path, entry.texture_source, maps_summary(entry)
+    return entry.path, entry.texture_source, maps_summary(entry), size_tooltip(entry)
 
 
 def maps_summary(entry: ScatterAssetEntry) -> str:
@@ -104,6 +104,18 @@ def maps_summary(entry: ScatterAssetEntry) -> str:
     if not authored:
         return _ASSET_MAPS if texture_set.assigned else _NO_MAPS
     return " ".join(_map_letter(name) for name in authored)
+
+
+def size_tooltip(entry: ScatterAssetEntry) -> str:
+    """Return the line describing how large the asset is, shown under its path.
+
+    The height is what Absolute Size divides by, so an asset the brush could not measure has to say so: it is
+    scattered at its own size instead of the height the user asked for.
+    """
+    height = entry.natural_height
+    if height <= 0.0:
+        return "Size not measured; it will be scattered at its own size"
+    return f"Natural height: {height:.4g} ({entry.meters_per_unit:g} m per unit)"
 
 
 def maps_tooltip(entry: ScatterAssetEntry) -> str:
@@ -366,7 +378,7 @@ class ScatterAssetDelegate(ui.AbstractItemDelegate):
                     ui.Label(
                         item.display_name,
                         name="PropertiesPaneSectionTreeItem",
-                        tooltip=item.path,
+                        tooltip=f"{item.path}\n{size_tooltip(item.entry)}",
                         elided_text=True,
                         identifier=f"{identifier_prefix}_path",
                     )

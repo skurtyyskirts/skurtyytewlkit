@@ -20,25 +20,45 @@ import tempfile
 from pathlib import Path
 
 import carb.settings
+import numpy as np
+import omni.kit.undo
 import omni.ui as ui
+import omni.usd
 from carb.input import KeyboardInput
 from lightspeed.common.constants import WindowNames
+from lightspeed.trex.contexts.setup import Contexts as _TrexContexts
 from lightspeed.trex.scatter.core import (
     Falloff,
+    MeshSurfaceCache,
+    PaddingIndex,
+    ScatterAssetEntry,
     ScatterBrushSettings,
     ScatterMode,
+    ScatterTarget,
+    UpAxis,
+    author_placements,
     destroy_scatter_brush_controller,
+    generate_stamp,
     get_scatter_brush_controller,
 )
-from lightspeed.trex.scatter.core.constants import BRUSH_SETTINGS_PATH, PRESETS_DIR_SETTING
+from lightspeed.trex.scatter.core.constants import BRUSH_SETTINGS_PATH, CONTAINER_PREFIX, PRESETS_DIR_SETTING
 from omni.kit import ui_test
 from omni.kit.test import AsyncTestCase
+from pxr import Gf, Sdf, UsdGeom
 
 _WINDOW_TITLE = WindowNames.SCATTER.value
 _SAVE_AS_PROMPT_TITLE = "Save Preset As"
 _WINDOW_WIDTH = 520
 _WINDOW_HEIGHT = 680
 _PRESET_NAME = "E2E Grass"
+_CONTEXT_NAME = _TrexContexts.STAGE_CRAFT.value
+_HASH = "0123456789ABCDEF"
+_PROTOTYPE_ROOT = f"/RootNode/meshes/mesh_{_HASH}"
+_INSTANCE_ROOT = f"/RootNode/instances/inst_{_HASH}_0"
+_MESH_PATH = f"{_INSTANCE_ROOT}/mesh"
+_GLASS_CONTAINER = f"{_PROTOTYPE_ROOT}/{CONTAINER_PREFIX}glass"
+_SCATTER_ASSET = "C:/assets/blade.usda"
+_QUAD_HALF_SIZE = 500.0
 
 
 def _control_query(window_title: str, widget_type: str, identifier: str) -> str:
@@ -47,7 +67,14 @@ def _control_query(window_title: str, widget_type: str, identifier: str) -> str:
 
 
 class TestScatterWindowE2E(AsyncTestCase):
-    """Drives the docked Scatter window like a user and checks that the shared brush controller follows."""
+    """Drives the docked Scatter window like a user and checks that the shared brush controller follows.
+
+    Every end-to-end test of this window belongs in this class. The pane binds to the brush controller once, when the
+    window first builds it, and is never rebuilt; ``setUpClass`` below relies on that by dropping the controller
+    before any test has shown the window. A second class that showed the window first would leave this one's
+    ``setUpClass`` destroying the controller the pane is bound to, and every test here would then drive a pane wired
+    to a controller nothing else can see.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -79,6 +106,7 @@ class TestScatterWindowE2E(AsyncTestCase):
 
     async def setUp(self):
         self._settings = carb.settings.get_settings()
+        self._painted_stage = False
         self._controller = get_scatter_brush_controller()
         self._controller.set_mode(ScatterMode.OFF)
         self._controller.replace_settings(ScatterBrushSettings())
@@ -106,6 +134,10 @@ class TestScatterWindowE2E(AsyncTestCase):
         self._controller.set_mode(ScatterMode.OFF)
         ui.Workspace.show_window(_WINDOW_TITLE, False)
         await ui_test.human_delay(2)
+        if self._painted_stage:
+            usd_context = omni.usd.get_context(_CONTEXT_NAME)
+            usd_context.get_selection().clear_selected_prim_paths()
+            await usd_context.new_stage_async()
 
     async def _find_control(self, widget_type: str, identifier: str):
         """Find a pane control by identifier and scroll it into view so emulated input lands on it."""
@@ -206,3 +238,150 @@ class TestScatterWindowE2E(AsyncTestCase):
         self.assertEqual(preset_combo.widget.model.current_choice, _PRESET_NAME)
         prompt = ui.Workspace.get_window(_SAVE_AS_PROMPT_TITLE)
         self.assertTrue(prompt is None or not prompt.visible, "The preset name prompt stayed open after OK")
+
+    async def _paint_two_patches(self) -> tuple[list[str], list[str]]:
+        """Open a capture-like stage and author a grass patch and a glass patch on the same mesh.
+
+        Returns:
+            The placement paths of the grass patch and of the glass patch.
+        """
+        usd_context = omni.usd.get_context(_CONTEXT_NAME)
+        await usd_context.new_stage_async()
+        self._painted_stage = True
+        stage = usd_context.get_stage()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        stage.DefinePrim(_PROTOTYPE_ROOT, "Xform")
+        UsdGeom.Xform.Define(stage, _INSTANCE_ROOT)
+        mesh = UsdGeom.Mesh.Define(stage, _MESH_PATH)
+        mesh.GetPointsAttr().Set(
+            [
+                (-_QUAD_HALF_SIZE, -_QUAD_HALF_SIZE, 0.0),
+                (_QUAD_HALF_SIZE, -_QUAD_HALF_SIZE, 0.0),
+                (_QUAD_HALF_SIZE, _QUAD_HALF_SIZE, 0.0),
+                (-_QUAD_HALF_SIZE, _QUAD_HALF_SIZE, 0.0),
+            ]
+        )
+        mesh.GetFaceVertexCountsAttr().Set([4])
+        mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
+        self._controller.replace_settings(ScatterBrushSettings(randomize_seed=False, size_min=10.0, size_max=20.0))
+        return (self._paint_patch(stage, "Grass", 7), self._paint_patch(stage, "Glass", 99))
+
+    def _paint_patch(self, stage, preset_name: str, seed: int) -> list[str]:
+        """Author one stamp of a preset onto the quad the way a brush stroke does, and return its placements."""
+        target = ScatterTarget(
+            prototype_root=Sdf.Path(_PROTOTYPE_ROOT),
+            parent_instance_root=Sdf.Path(_INSTANCE_ROOT),
+            mesh_path=Sdf.Path(_MESH_PATH),
+            parent_world=Gf.Matrix4d(1.0),
+            instance_count=1,
+        )
+        settings = ScatterBrushSettings(
+            preset_name=preset_name, seed=seed, randomize_seed=False, padding=0.0, size_min=10.0, size_max=20.0
+        )
+        asset = ScatterAssetEntry(path=_SCATTER_ASSET, up_axis=UpAxis.Z, natural_extent=(1.0, 1.0, 2.0))
+        cache = MeshSurfaceCache(lambda: stage)
+        sample = cache.closest_point(_MESH_PATH, Gf.Vec3d(0.0, 0.0, 0.0), 10.0)
+        records = generate_stamp(
+            cache,
+            target,
+            sample,
+            settings,
+            [asset],
+            np.random.default_rng(1),
+            PaddingIndex(1.0),
+            None,
+            UpAxis.Z,
+            1.0,
+            stage.GetRootLayer(),
+        )
+        created = author_placements(stage.GetRootLayer(), records)
+        cache.destroy()
+        self.assertTrue(created, f"The {preset_name} patch authored no placement")
+        return created
+
+    def _scales(self, paths: list[str]) -> list[tuple]:
+        """Return the authored scale of every placement, as the edit layer holds it."""
+        layer = omni.usd.get_context(_CONTEXT_NAME).get_stage().GetRootLayer()
+        return [tuple(layer.GetPrimAtPath(Sdf.Path(path)).attributes["xformOp:scale"].default) for path in paths]
+
+    async def test_editing_size_resizes_the_selected_patch_and_leaves_the_other_one_alone(self):
+        # The user has painted grass and glass on one mesh, and selects the glass patch.
+        grass, glass = await self._paint_two_patches()
+        omni.usd.get_context(_CONTEXT_NAME).get_selection().set_selected_prim_paths([_GLASS_CONTAINER], True)
+        await ui_test.human_delay(10)
+
+        # The window tells them what is in scope before they change anything.
+        scope_label = await self._find_control("Label", "scatter_live_edit_scope")
+        self.assertIn("glass", scope_label.widget.text)
+        grass_before = self._scales(grass)
+        glass_before = self._scales(glass)
+
+        # They raise the smallest size the brush places.
+        size_min = await self._find_control("FloatBoundedDrag", "scatter_size_min")
+        await size_min.input("60", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(20)
+
+        # The selected glass patch followed the setting and the unselected grass patch is exactly as it was.
+        self.assertEqual(self._controller.settings.size_min, 60.0)
+        self.assertNotEqual(self._scales(glass), glass_before)
+        self.assertEqual(self._scales(grass), grass_before)
+
+    async def test_undoing_a_size_edit_puts_the_whole_selected_patch_back(self):
+        # The user resizes the selected glass patch.
+        _grass, glass = await self._paint_two_patches()
+        omni.usd.get_context(_CONTEXT_NAME).get_selection().set_selected_prim_paths([_GLASS_CONTAINER], True)
+        await ui_test.human_delay(10)
+        glass_before = self._scales(glass)
+        size_min = await self._find_control("FloatBoundedDrag", "scatter_size_min")
+        await size_min.input("60", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(20)
+        self.assertNotEqual(self._scales(glass), glass_before)
+
+        # They change their mind and undo once.
+        omni.kit.undo.undo()
+        await ui_test.human_delay(10)
+
+        # The whole patch came back in that single undo, not one placement at a time.
+        self.assertEqual(self._scales(glass), glass_before)
+
+    async def test_editing_size_with_nothing_selected_leaves_every_painted_patch_alone(self):
+        # Nothing is selected, so the user is only setting the brush up for their next stroke.
+        grass, glass = await self._paint_two_patches()
+        omni.usd.get_context(_CONTEXT_NAME).get_selection().clear_selected_prim_paths()
+        await ui_test.human_delay(10)
+        grass_before = self._scales(grass)
+        glass_before = self._scales(glass)
+
+        # They raise the smallest size the brush places.
+        size_min = await self._find_control("FloatBoundedDrag", "scatter_size_min")
+        await size_min.input("60", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(20)
+
+        # The brush took the value and nothing already painted moved.
+        self.assertEqual(self._controller.settings.size_min, 60.0)
+        self.assertEqual(self._scales(grass), grass_before)
+        self.assertEqual(self._scales(glass), glass_before)
+
+    async def test_turning_off_live_editing_leaves_the_selected_patch_alone(self):
+        # The user turns "Edit Selection Live" off before selecting anything.
+        _grass, glass = await self._paint_two_patches()
+        live_edit = await self._find_control("CheckBox", "scatter_edit_selection_live")
+        self.assertTrue(live_edit.widget.model.get_value_as_bool())
+        await live_edit.click()
+        await ui_test.human_delay(20)
+        self.assertFalse(self._controller.settings.edit_selection_live)
+
+        # They then select the glass patch, which would otherwise be what a settings change updates.
+        omni.usd.get_context(_CONTEXT_NAME).get_selection().set_selected_prim_paths([_GLASS_CONTAINER], True)
+        await ui_test.human_delay(20)
+        glass_before = self._scales(glass)
+
+        # They raise the smallest size the brush places.
+        size_min = await self._find_control("FloatBoundedDrag", "scatter_size_min")
+        await size_min.input("60", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(20)
+
+        # The setting changed for the next stroke only; the selected patch did not move.
+        self.assertEqual(self._controller.settings.size_min, 60.0)
+        self.assertEqual(self._scales(glass), glass_before)

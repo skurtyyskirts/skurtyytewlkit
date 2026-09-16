@@ -29,8 +29,14 @@ from .unit.test_picking import (
 )
 from .unit.test_placement import TestPlacementFunctions, TestPlacementRecord
 from .unit.test_presets import TestGetDefaultPresetsDirectory, TestPresetStore
+from .unit.test_reapply import TestReapplyHelpers, TestReapplyTransforms, TestResolveScope
 from .unit.test_sampling import TestPaddingIndex, TestSamplingFunctions
-from .unit.test_settings import TestAssetsCarbPersistence, TestScatterAssetEntry, TestScatterBrushSettings
+from .unit.test_settings import (
+    TestAssetsCarbPersistence,
+    TestPrimBudgetStatus,
+    TestScatterAssetEntry,
+    TestScatterBrushSettings,
+)
 from .unit.test_stroke import TestStrokeSession
 from .unit.test_targets import TestTargets
 
@@ -50,7 +56,11 @@ __all__ = (
     "TestPlacementFunctions",
     "TestPlacementRecord",
     "TestPresetStore",
+    "TestPrimBudgetStatus",
+    "TestReapplyHelpers",
+    "TestReapplyTransforms",
     "TestResolveAssetTextureSet",
+    "TestResolveScope",
     "TestSamplingFunctions",
     "TestScatterAssetEntry",
     "TestScatterBrushController",

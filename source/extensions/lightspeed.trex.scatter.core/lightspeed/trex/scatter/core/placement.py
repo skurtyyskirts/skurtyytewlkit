@@ -19,6 +19,9 @@ from __future__ import annotations
 
 __all__ = [
     "PlacementRecord",
+    "PlacementTransform",
+    "asset_scale_factor",
+    "author_placement_transforms",
     "author_placements",
     "container_path_for",
     "erase_candidates",
@@ -30,9 +33,12 @@ __all__ = [
     "remove_placements",
     "restore_prims",
     "snapshot_prims",
+    "transform_key",
 ]
 
+import hashlib
 import math
+import struct
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -50,6 +56,9 @@ from .constants import (
     PLACEMENT_PREFIX,
     SCATTER_ASSET_ATTR,
     SCATTER_BRUSH_ID_ATTR,
+    SCATTER_KEY_ATTR,
+    SCATTER_ORIGIN_ATTR,
+    SCATTER_TRANSFORM_KEY_ATTR,
 )
 from .geometry import MeshSurfaceCache, SurfaceSample, area_weighted_triangle_samples
 from .sampling import (
@@ -57,16 +66,26 @@ from .sampling import (
     choose_asset,
     compose_parent_space_transform,
     falloff_weight,
+    placement_rng,
     sample_disk,
     tangent_basis,
+    to_parent_space_origin,
 )
-from .settings import EraseScope, ScatterAssetEntry, ScatterBrushSettings, UpAxis
+from .settings import EraseScope, ScaleMode, ScatterAssetEntry, ScatterBrushSettings, UpAxis
 from .targets import ScatterTarget
 
 _LOG_PREFIX = "[lightspeed.trex.scatter.core]"
 _XFORM_TYPE_NAME = "Xform"
 _XFORM_OP_ORDER = ("xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale")
 _ENCODING_INPUT = "inputs:encoding"
+# Below this the asset is a sliver or was never measured, and dividing a target height by it would explode the scale.
+_MIN_NATURAL_HEIGHT = 1e-6
+# Exclusive upper bound of a placement key. Stays inside a signed 64-bit integer so numpy can draw it and Sdf can
+# author it as a uint64 without either end having to care about the sign bit.
+_PLACEMENT_KEY_LIMIT = 2**63
+# Authored transform layout: translate keeps its doubles, rotation and scale are float3 on the prim and are packed as
+# 32-bit floats so a checksum taken here matches one taken after reading the values back from a layer.
+_TRANSFORM_PACK_FORMAT = "<3d6f"
 
 
 @dataclass
@@ -84,6 +103,15 @@ class PlacementRecord:
     rotate_xyz: tuple[float, float, float]
     scale: tuple[float, float, float]
     brush_id: str
+    origin: tuple[float, ...] = ()
+    """Parent-space surface the placement was composed from, as ``ParentSpaceOrigin.to_values()``.
+
+    Authored on the prim so that changing a setting later can recompose the placement instead of only affecting the
+    next stroke.
+    """
+
+    key: int = 0
+    """The placement's own random key, so its rotation and scale draws can be replayed without its stamp."""
 
     @property
     def prim_path(self) -> str:
@@ -101,6 +129,8 @@ class PlacementRecord:
             "rotate_xyz": list(self.rotate_xyz),
             "scale": list(self.scale),
             "brush_id": self.brush_id,
+            "origin": list(self.origin),
+            "key": self.key,
         }
 
     @classmethod
@@ -122,7 +152,65 @@ class PlacementRecord:
             rotate_xyz=_as_float_triple(data["rotate_xyz"]),
             scale=_as_float_triple(data["scale"]),
             brush_id=str(data.get("brush_id", "")),
+            origin=tuple(float(value) for value in data.get("origin", ())),
+            key=int(data.get("key", 0)),
         )
+
+
+@dataclass
+class PlacementTransform:
+    """The three transform ops of one placement that already exists, as they are authored on its prim.
+
+    Both directions of a re-apply are expressed with these: the values to write, and the values to write back when
+    the edit is undone.
+    """
+
+    prim_path: str
+    translate: tuple[float, float, float]
+    rotate_xyz: tuple[float, float, float]
+    scale: tuple[float, float, float]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize into a JSON-friendly dictionary (vectors become lists)."""
+        return {
+            "prim_path": self.prim_path,
+            "translate": list(self.translate),
+            "rotate_xyz": list(self.rotate_xyz),
+            "scale": list(self.scale),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PlacementTransform:
+        """Build a transform from a dictionary produced by :meth:`to_dict`."""
+        return cls(
+            prim_path=str(data["prim_path"]),
+            translate=_as_float_triple(data["translate"]),
+            rotate_xyz=_as_float_triple(data["rotate_xyz"]),
+            scale=_as_float_triple(data["scale"]),
+        )
+
+
+def transform_key(translate: Sequence[float], rotate_xyz: Sequence[float], scale: Sequence[float]) -> int:
+    """Return the checksum of an authored placement transform.
+
+    A placement records the checksum of the transform the brush gave it, so a re-apply can tell a placement it still
+    owns from one the user has moved by hand and must leave alone.
+
+    Args:
+        translate: Authored ``xformOp:translate``.
+        rotate_xyz: Authored ``xformOp:rotateXYZ``.
+        scale: Authored ``xformOp:scale``.
+
+    Returns:
+        A 64-bit checksum.
+    """
+    packed = struct.pack(
+        _TRANSFORM_PACK_FORMAT,
+        *(float(value) for value in translate),
+        *(float(value) for value in rotate_xyz),
+        *(float(value) for value in scale),
+    )
+    return int.from_bytes(hashlib.blake2b(packed, digest_size=8).digest(), "big")
 
 
 def container_path_for(prototype_root: Sdf.Path | str, brush_slug: str) -> Sdf.Path:
@@ -190,6 +278,7 @@ def generate_stamp(
     padding_index: PaddingIndex,
     heading_world: Gf.Vec3d | None,
     stage_up: UpAxis,
+    stage_meters_per_unit: float,
     layer: Sdf.Layer,
 ) -> list[PlacementRecord]:
     """Generate the placements of one brush stamp centered on ``center``.
@@ -207,6 +296,7 @@ def generate_stamp(
         padding_index: Spatial index of already placed points; accepted points are added to it.
         heading_world: Normalized stroke direction in world space, or None for the first stamp.
         stage_up: Up axis of the stage.
+        stage_meters_per_unit: Meters per stage unit, used to convert each asset's own size into stage units.
         layer: Layer the placements will be authored in (used to relativize asset paths).
 
     Returns:
@@ -230,7 +320,18 @@ def generate_stamp(
     )
     positions, normals, valid = cache.closest_points(target.mesh_path, candidates, settings.radius)
     return _build_records(
-        positions, normals, valid, target, settings, assets, rng, padding_index, heading_world, stage_up, layer
+        positions,
+        normals,
+        valid,
+        target,
+        settings,
+        assets,
+        rng,
+        padding_index,
+        heading_world,
+        stage_up,
+        stage_meters_per_unit,
+        layer,
     )
 
 
@@ -242,6 +343,7 @@ def generate_flood(
     rng: np.random.Generator,
     padding_index: PaddingIndex,
     stage_up: UpAxis,
+    stage_meters_per_unit: float,
     layer: Sdf.Layer,
     max_count: int,
 ) -> list[PlacementRecord]:
@@ -257,6 +359,7 @@ def generate_flood(
         rng: Random generator driving every random decision of the flood.
         padding_index: Spatial index of already placed points; accepted points are added to it.
         stage_up: Up axis of the stage.
+        stage_meters_per_unit: Meters per stage unit, used to convert each asset's own size into stage units.
         layer: Layer the placements will be authored in (used to relativize asset paths).
         max_count: Hard cap on the number of generated placements.
 
@@ -274,7 +377,18 @@ def generate_flood(
     positions, normals = area_weighted_triangle_samples(rng, geometry, count)
     valid = np.ones(len(positions), dtype=bool)
     return _build_records(
-        positions, normals, valid, target, settings, assets, rng, padding_index, None, stage_up, layer
+        positions,
+        normals,
+        valid,
+        target,
+        settings,
+        assets,
+        rng,
+        padding_index,
+        None,
+        stage_up,
+        stage_meters_per_unit,
+        layer,
     )
 
 
@@ -353,9 +467,7 @@ def author_placements(
             _set_attribute(spec, IS_REMIX_REF_ATTR, Sdf.ValueTypeNames.Bool, True, custom=True)
             _set_attribute(spec, IS_REMIX_SCATTER_ATTR, Sdf.ValueTypeNames.Bool, True, custom=True)
             _set_attribute(spec, SCATTER_ASSET_ATTR, Sdf.ValueTypeNames.String, record.asset_rel_path, custom=True)
-            _set_attribute(spec, "xformOp:translate", Sdf.ValueTypeNames.Double3, Gf.Vec3d(*record.translate))
-            _set_attribute(spec, "xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3, Gf.Vec3f(*record.rotate_xyz))
-            _set_attribute(spec, "xformOp:scale", Sdf.ValueTypeNames.Float3, Gf.Vec3f(*record.scale))
+            _set_transform_ops(spec, record.translate, record.rotate_xyz, record.scale)
             _set_attribute(
                 spec,
                 "xformOpOrder",
@@ -363,10 +475,63 @@ def author_placements(
                 Vt.TokenArray(list(_XFORM_OP_ORDER)),
                 variability=Sdf.VariabilityUniform,
             )
+            if record.origin:
+                _set_attribute(
+                    spec,
+                    SCATTER_ORIGIN_ATTR,
+                    Sdf.ValueTypeNames.DoubleArray,
+                    Vt.DoubleArray(list(record.origin)),
+                    custom=True,
+                )
+            _set_attribute(spec, SCATTER_KEY_ATTR, Sdf.ValueTypeNames.UInt64, record.key, custom=True)
             if materials:
                 _author_material_overrides(layer, spec, materials.get(record.asset_rel_path))
             created.append(str(spec.path))
     return created
+
+
+def author_placement_transforms(layer: Sdf.Layer, transforms: Sequence[PlacementTransform]) -> list[str]:
+    """Author the transform ops of placements that already exist, refreshing each one's transform checksum.
+
+    Only the three ops and the checksum are touched, so everything else a placement carries, including its reference
+    and any material override beneath it, is left exactly as it was. Paths without a spec in ``layer`` are skipped:
+    a placement authored in another layer is not this layer's to change.
+
+    Args:
+        layer: Layer to author in, normally the stage's edit target.
+        transforms: The placements to rewrite.
+
+    Returns:
+        The paths that were written.
+    """
+    written: list[str] = []
+    with Sdf.ChangeBlock():
+        for transform in transforms:
+            spec = layer.GetPrimAtPath(Sdf.Path(transform.prim_path))
+            if spec is None:
+                continue
+            _set_transform_ops(spec, transform.translate, transform.rotate_xyz, transform.scale)
+            written.append(transform.prim_path)
+    return written
+
+
+def _set_transform_ops(
+    spec: Sdf.PrimSpec,
+    translate: Sequence[float],
+    rotate_xyz: Sequence[float],
+    scale: Sequence[float],
+) -> None:
+    """Author the three transform ops on a placement spec together with the checksum that stamps them as the brush's."""
+    _set_attribute(spec, "xformOp:translate", Sdf.ValueTypeNames.Double3, Gf.Vec3d(*translate))
+    _set_attribute(spec, "xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3, Gf.Vec3f(*rotate_xyz))
+    _set_attribute(spec, "xformOp:scale", Sdf.ValueTypeNames.Float3, Gf.Vec3f(*scale))
+    _set_attribute(
+        spec,
+        SCATTER_TRANSFORM_KEY_ATTR,
+        Sdf.ValueTypeNames.UInt64,
+        transform_key(translate, rotate_xyz, scale),
+        custom=True,
+    )
 
 
 def _author_material_overrides(
@@ -465,6 +630,25 @@ def restore_prims(layer: Sdf.Layer, snapshot: Sdf.Layer, prim_paths: Sequence[st
             _copy_container_definition(snapshot, layer, path.GetParentPath())
 
 
+def asset_scale_factor(
+    asset: ScatterAssetEntry, settings: ScatterBrushSettings, stage_meters_per_unit: float
+) -> float | None:
+    """Factor turning a sampled scale value into the multiplier a placement authors.
+
+    ``MULTIPLIER`` samples the multiplier directly, so the factor is 1. ``ABSOLUTE_SIZE`` samples a height in stage
+    units, so the factor is the reciprocal of the asset's own height once converted into those units.
+
+    Returns:
+        The factor, or None when the asset has no usable measurement. None keeps the placement at the asset's own
+        size rather than authoring a height as if it were a multiplier, which is what made unmeasured assets come out
+        enormous in the first place.
+    """
+    if settings.scale_mode != ScaleMode.ABSOLUTE_SIZE:
+        return 1.0
+    height = asset.natural_height * (asset.meters_per_unit / stage_meters_per_unit)
+    return 1.0 / height if height > _MIN_NATURAL_HEIGHT else None
+
+
 def _as_float_triple(values: Sequence[float]) -> tuple[float, float, float]:
     """Return ``values`` as a tuple of three Python floats."""
     x, y, z = (float(value) for value in values)
@@ -524,6 +708,7 @@ def _build_records(
     padding_index: PaddingIndex,
     heading_world: Gf.Vec3d | None,
     stage_up: UpAxis,
+    stage_meters_per_unit: float,
     layer: Sdf.Layer,
 ) -> list[PlacementRecord]:
     """Turn the ``valid`` sample positions into placement records for ``target``.
@@ -544,15 +729,23 @@ def _build_records(
         if asset is None:
             return []
         padding_index.add(position)
-        translate, rotate_xyz, scale = compose_parent_space_transform(
+        origin = to_parent_space_origin(
             Gf.Vec3d(*(float(value) for value in position)),
             Gf.Vec3d(*(float(value) for value in normal)),
             target.parent_world,
+            heading_world,
+        )
+        # Drawn from the stamp so the stroke stays reproducible, then used on its own: the stamp generator is shared
+        # by every placement of the stamp, so nothing could replay one placement's draws from it afterwards.
+        key = int(rng.integers(0, _PLACEMENT_KEY_LIMIT))
+        translate, rotate_xyz, scale = compose_parent_space_transform(
+            origin,
+            target.parent_world,
             settings,
-            rng,
+            placement_rng(key, settings.seed),
             stage_up,
             asset.up_axis,
-            heading_world,
+            asset_scale_factor(asset, settings, stage_meters_per_unit),
         )
         if asset.path not in relative_asset_paths:
             relative_asset_paths[asset.path] = make_relative_asset_path(layer, asset.path)
@@ -566,6 +759,8 @@ def _build_records(
                 rotate_xyz=_as_float_triple(rotate_xyz),
                 scale=_as_float_triple(scale),
                 brush_id=settings.preset_name,
+                origin=origin.to_values(),
+                key=key,
             )
         )
     return records

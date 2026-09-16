@@ -19,11 +19,17 @@ presets. It has no UI.
 - Generate stamps and floods (`placement.py`, `sampling.py`): seeded disk sampling, falloff and strength acceptance,
   padding against existing placements, weighted asset choice, parent-space transform composition with
   conform-to-surface, align-to-stroke, per-axis rotation and scale ranges, and per-asset up-axis correction
+- Keep placement size and vertical offset in world space: the parent instance's scale is divided out, each
+  asset's `metersPerUnit` and measured natural size convert its own units into stage units, and the Absolute Size
+  scale mode turns a target height into the scale a placement authors (`assets.py`, `sampling.py`)
 - Resolve the ingested texture set of a palette asset and author the inputs its material leaves empty as overrides under each placement (`materials.py`)
 - Author and remove placements with pure `Sdf` edits and wrap each stroke in one undoable command
   (`ScatterStrokeCommand`, `ScatterFloodCommand`)
 - Run the stroke state machine (`StrokeSession`) and expose the shared brush state and events through
   `ScatterBrushController`
+- Re-apply placement, scale and seed settings to scatter that already exists (`reapply.py`): resolve the selection
+  into the placements an edit may write to, recompose them under the new settings, and commit one
+  `ScatterReapplyCommand` per edit
 
 ## Non-Responsibilities
 
@@ -68,6 +74,37 @@ commits a single `ScatterStrokeCommand` on release; the first `do()` of that com
 placements and redo re-authors them. Erase strokes snapshot the removed specs with `Sdf.CopySpec` so undo restores
 them. No `omni.kit.undo` group is held open across frames.
 
+### Re-applying settings to placements that already exist
+
+A placement bakes the settings it was painted with into its three transform ops, so it records what it would need to
+be composed again: `remixScatterOrigin` (the parent-space surface point, normal and, when the stamp had one, the
+stroke heading), `remixScatterKey` (its own random key) and `remixScatterTransformKey` (a checksum of the transform
+the brush gave it). The origin is held in parent space rather than world space so it survives the instance moving.
+
+Giving every placement its own random key is what makes this possible at all: `compose_parent_space_transform` used
+to draw from the generator of the whole stamp, which several placements share, so no placement's draws could be
+replayed on their own. `_build_records` now draws a key per placement from the stamp generator and composes that
+placement from `placement_rng(key, settings.seed)`, so painting and re-applying run the same function on the same
+inputs and a re-apply at unchanged settings is a no-op. The brush seed is mixed in, which is what makes changing the
+seed, or rerolling it, draw a new arrangement for placements that already exist.
+
+`resolve_scope` decides what an edit may touch, and the narrowest selection wins: selected placements or a selected
+scatter container scope the edit to exactly those placements, and anything else inside the capture topology scopes it
+to the container of the current preset on that prototype. That last rule is what keeps two patches painted with two
+presets on one mesh independent. Instance-side paths are rewritten to the prototype side first, because placements are
+authored under the prototype and selected through instance proxies.
+
+`ReapplyDriver` follows the controller's `settings_changed`, ignores every change outside `REAPPLIABLE_FIELDS`,
+authors the recomposed transforms straight into the edit layer with notices deferred, and commits one
+`ScatterReapplyCommand` when the caller says the edit is finished, so a whole slider drag is a single undo step. Above
+`LIVE_EDIT_SOFT_LIMIT` placements it stops following every step of a drag and updates when the edit ends instead; like
+the prim budget this changes how an edit is paced, never whether it is allowed.
+
+A placement whose transform no longer matches its checksum was moved by hand and is left alone. One with no recorded
+origin was painted before the brush recorded surfaces: it is projected back onto its capture mesh, which also removes
+whatever vertical offset it was painted with, and reported, because its original random draws cannot be recovered and
+its rotation and scale are drawn afresh.
+
 ### Key Classes
 
 - `ScatterBrushSettings` / `ScatterAssetEntry` — validated settings model with JSON and carb persistence
@@ -76,8 +113,17 @@ them. No `omni.kit.undo` group is held open across frames.
 - `SurfacePicker`, `HdRemixSurfacePicker`, `CpuRaySurfacePicker`, `create_surface_picker` — picker seam
 - `ScatterTarget`, `resolve_target` — prototype, instance and capture-mesh resolution for a hit
 - `PaddingIndex`, `compose_parent_space_transform`, `generate_stamp`, `generate_flood`, `erase_candidates`
-- `ScatterStrokeCommand`, `ScatterFloodCommand` — undoable mutations
-- `StrokeSession` — spacing accumulator, per-target records, single commit
+- `parent_uniform_scale`, `stage_meters_per_unit`, `read_asset_meters_per_unit`, `read_asset_natural_extent` —
+  the unit and size facts that make a placement's scale mean a world size
+- `ScatterStrokeCommand`, `ScatterFloodCommand`, `ScatterReapplyCommand` — undoable mutations
+- `ReapplyScope`, `resolve_scope`, `reapply_transforms`, `ReapplyDriver`, `ReapplyOutcome` — what a settings change
+  may write to, the recomposed transforms, the live edit that authors them, and what it left alone
+- `ParentSpaceOrigin`, `to_parent_space_origin`, `placement_rng`, `transform_key` — the surface, the randomness and
+  the ownership checksum a placement records so it can be composed again
+- `StrokeSession` — spacing accumulator, per-target records, single commit; `rendered_prims` reports what the
+  stroke costs the rendered stage, which is the placements it authored multiplied by each target's instance count
+- `PrimBudgetStatus`, `prim_budget_status`, `ALERT_BUDGET_MULTIPLE` — classify a stroke's rendered-prim total
+  against the `prim_budget` setting so a UI can report an expensive stroke
 - `ScatterBrushController` — singleton brush state (mode, settings, assets, presets, anchor) with events
 - `resolve_asset_texture_set`, `build_materials_payload` — texture-set resolution and the authoring payload
 
@@ -94,7 +140,17 @@ them. No `omni.kit.undo` group is held open across frames.
 
 - Placements replicate onto every instance of the target hash (Remix topology); use the anchor target mode for a
   single-instance target
-- Instances with non-uniform scale pass that scale on to placements
+- An instance with non-uniform scale still stretches its placements along its own axes: only the average
+  magnitude is compensated (the cube root of the transform's determinant), so sizes are right on average but a
+  placement is squashed the way its instance is
+- Absolute Size needs the asset's bounding box; an asset that cannot be opened is scattered at its own size and
+  says so in the palette tooltip
+- The palette's up axis is read from the asset once, when it is added, and can be overridden by hand; it is never
+  re-derived afterwards. A wrong value scatters the asset on its side and skews Absolute Size, so a disagreement
+  with the file is reported at the start of a stroke
+- `prim_budget` only classifies a stroke for reporting. Nothing in this extension caps, trims or stops a paint
+  stroke: `flood_max_instances` bounds a flood, but a stroke's length is bounded only by `padding`, which stops
+  governing it at all when set to 0
 - No physics settling and no PointInstancer output
 - Erase removes only placements authored in the current edit target layer; placements that live in another layer are
   left untouched and reported once per stroke in the log
@@ -102,6 +158,14 @@ them. No `omni.kit.undo` group is held open across frames.
   stroke segment at the new sample instead of stamping the whole jump
 - Texture assignment happens when a placement is authored, so it does not reach placements that were already painted;
   erase and repaint them, or assign the textures through the Texture Replacements surface, which lists scatter shaders
+- Only placement, scale and seed settings re-apply to placements that already exist. The brush and density settings
+  (radius, density, strength, spacing, padding) decide where stamps land, which depends on the mouse path a stroke
+  followed; that path is not recorded, so changing them affects the next stroke only
+- A re-apply writes the three transform ops and nothing else: it never re-points a placement at another asset and
+  never rewrites its texture overrides
+- A placement painted before the brush recorded surfaces is recognized by projecting it back onto its capture mesh,
+  so one sitting farther from the mesh than twice the larger of the current radius and vertical offset is skipped and
+  counted rather than moved to somewhere it does not belong
 - Auto-detection claims a texture whose file name contains the material's or the asset's own name followed by the
   name of a texture type. The name may sit anywhere, so an asset pack's own prefix is fine
   (`Quaternius_Leaves_diff` belongs to a material called `Leaves`), and a descriptor may span two words (`nor_gl`).

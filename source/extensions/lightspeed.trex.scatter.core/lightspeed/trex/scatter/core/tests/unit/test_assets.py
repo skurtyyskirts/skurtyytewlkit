@@ -27,13 +27,17 @@ from lightspeed.common.constants import IS_REMIX_REF_ATTR
 from lightspeed.trex.asset_replacements.core.shared.data_models import AssetType, DefaultAssetDirectory
 from lightspeed.trex.scatter.core import assets
 from lightspeed.trex.scatter.core.settings import UpAxis
-from pxr import Sdf, Usd, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom
 
 _REF_PRIM_PATH = "/RootNode/meshes/mesh_0AB745B8BEE1F16B/ref_0123456789abcdef"
 
 
 def _write_asset_layer(
-    directory: Path, name: str, up_axis: str | None = None, default_prim: str | None = "Asset"
+    directory: Path,
+    name: str,
+    up_axis: str | None = None,
+    default_prim: str | None = "Asset",
+    meters_per_unit: float | None = None,
 ) -> str:
     """Write a small asset layer to disk and return its forward-slash path."""
     path = (directory / name).as_posix()
@@ -44,6 +48,37 @@ def _write_asset_layer(
         stage.SetDefaultPrim(root.GetPrim())
     if up_axis:
         UsdGeom.SetStageUpAxis(stage, up_axis)
+    if meters_per_unit is not None:
+        UsdGeom.SetStageMetersPerUnit(stage, meters_per_unit)
+    stage.GetRootLayer().Save()
+    return path
+
+
+def _write_ingested_shaped_asset(
+    directory: Path,
+    name: str,
+    cube_size: float,
+    wrapper_scale: float | None = None,
+    default_prim_scale: float | None = None,
+) -> str:
+    """Write an asset shaped the way ingestion leaves one: a default prim wrapping an ``XForms`` prim and geometry.
+
+    ``wrapper_scale`` stands in for the unit scale ingestion bakes onto the wrapper; ``default_prim_scale`` is the
+    op a placement would replace, so it must not reach the measurement.
+    """
+    path = (directory / name).as_posix()
+    stage = Usd.Stage.CreateNew(path)
+    root = UsdGeom.Xform.Define(stage, "/ReferenceTarget")
+    stage.SetDefaultPrim(root.GetPrim())
+    if default_prim_scale is not None:
+        root.AddScaleOp().Set(Gf.Vec3f(default_prim_scale))
+    wrapper = UsdGeom.Xform.Define(stage, "/ReferenceTarget/XForms")
+    if wrapper_scale is not None:
+        wrapper.AddScaleOp().Set(Gf.Vec3f(wrapper_scale))
+    cube = UsdGeom.Cube.Define(stage, "/ReferenceTarget/XForms/Cube")
+    cube.CreateSizeAttr(cube_size)
+    half = cube_size / 2.0
+    cube.CreateExtentAttr([Gf.Vec3f(-half, -half, -half), Gf.Vec3f(half, half, half)])
     stage.GetRootLayer().Save()
     return path
 
@@ -160,27 +195,134 @@ class TestAssets(omni.kit.test.AsyncTestCase):
                     # Assert
                     self.assertEqual(result, expected)
 
-    async def test_read_asset_up_axis_without_authored_axis_defaults_to_z(self):
+    async def test_read_asset_up_axis_without_authored_axis_or_file_defaults_to_y(self):
+        # Y is USD's own fallback. Answering Z would claim the asset already stands the way a Z-up stage does and
+        # skip the up-axis correction, which lays it on its side with nothing to point at.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            cases = [
+                ("no authored axis", _write_asset_layer(directory, "asset_no_axis.usda")),
+                ("missing file", (directory / "does_not_exist.usda").as_posix()),
+            ]
+            for title, path in cases:
+                with self.subTest(title=title):
+                    # Act
+                    result = assets.read_asset_up_axis(path)
+
+                    # Assert
+                    self.assertEqual(result, UpAxis.Y)
+
+    async def test_read_authored_asset_up_axis_returns_the_authored_axis(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for authored, expected in (("Y", UpAxis.Y), ("Z", UpAxis.Z)):
+                with self.subTest(authored=authored):
+                    # Arrange
+                    path = _write_asset_layer(Path(temp_dir), f"authored_{authored}.usda", up_axis=authored)
+
+                    # Act
+                    result = assets.read_authored_asset_up_axis(path)
+
+                    # Assert
+                    self.assertEqual(result, expected)
+
+    async def test_read_authored_asset_up_axis_without_authored_axis_or_file_returns_none(self):
+        # None is what lets the palette tell "the file says nothing" apart from "the file says Y".
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            cases = [
+                ("no authored axis", _write_asset_layer(directory, "unauthored.usda")),
+                ("missing file", (directory / "does_not_exist.usda").as_posix()),
+                ("empty path", ""),
+            ]
+            for title, path in cases:
+                with self.subTest(title=title):
+                    # Act
+                    result = assets.read_authored_asset_up_axis(path)
+
+                    # Assert
+                    self.assertIsNone(result)
+
+    async def test_read_asset_meters_per_unit_returns_authored_unit_scale(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for authored in (0.01, 1.0, 100.0):
+                with self.subTest(authored=authored):
+                    # Arrange
+                    path = _write_asset_layer(Path(temp_dir), f"asset_{authored}.usda", meters_per_unit=authored)
+
+                    # Act
+                    result = assets.read_asset_meters_per_unit(path)
+
+                    # Assert
+                    self.assertAlmostEqual(result, authored)
+
+    async def test_read_asset_meters_per_unit_without_authored_unit_or_file_defaults_to_one(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            cases = [
+                ("no authored unit", _write_asset_layer(directory, "asset_no_unit.usda")),
+                ("missing file", (directory / "does_not_exist.usda").as_posix()),
+            ]
+            for title, path in cases:
+                with self.subTest(title=title):
+                    # Act
+                    result = assets.read_asset_meters_per_unit(path)
+
+                    # Assert
+                    self.assertAlmostEqual(result, 1.0)
+
+    async def test_read_asset_natural_extent_returns_the_default_prim_size(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             # Arrange
-            path = _write_asset_layer(Path(temp_dir), "asset_no_axis.usda")
+            path = _write_ingested_shaped_asset(Path(temp_dir), "cube.usda", cube_size=10.0)
 
             # Act
-            result = assets.read_asset_up_axis(path)
+            result = assets.read_asset_natural_extent(path)
 
             # Assert
-            self.assertEqual(result, UpAxis.Z)
+            for axis, value in enumerate(result):
+                self.assertAlmostEqual(value, 10.0, places=4, msg=f"axis {axis}")
 
-    async def test_read_asset_up_axis_with_missing_file_defaults_to_z(self):
+    async def test_read_asset_natural_extent_includes_a_scale_op_below_the_default_prim(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Arrange
-            path = (Path(temp_dir) / "does_not_exist.usda").as_posix()
+            # Arrange - the shape ingestion produces: the source file's unit scale baked onto the XForms wrapper.
+            path = _write_ingested_shaped_asset(Path(temp_dir), "scaled.usda", cube_size=10.0, wrapper_scale=100.0)
 
             # Act
-            result = assets.read_asset_up_axis(path)
+            result = assets.read_asset_natural_extent(path)
 
             # Assert
-            self.assertEqual(result, UpAxis.Z)
+            for axis, value in enumerate(result):
+                self.assertAlmostEqual(value, 1000.0, places=2, msg=f"axis {axis}")
+
+    async def test_read_asset_natural_extent_ignores_the_default_prims_own_transform(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Arrange - a placement authors its own xformOpOrder, so the default prim's ops never reach the stage.
+            path = _write_ingested_shaped_asset(
+                Path(temp_dir), "outer.usda", cube_size=10.0, wrapper_scale=100.0, default_prim_scale=5.0
+            )
+
+            # Act
+            result = assets.read_asset_natural_extent(path)
+
+            # Assert
+            for axis, value in enumerate(result):
+                self.assertAlmostEqual(value, 1000.0, places=2, msg=f"axis {axis}")
+
+    async def test_read_asset_natural_extent_without_default_prim_or_file_returns_zeros(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            cases = [
+                ("no default prim", _write_asset_layer(directory, "asset_no_default.usda", default_prim=None)),
+                ("missing file", (directory / "does_not_exist.usda").as_posix()),
+                ("empty path", ""),
+            ]
+            for title, path in cases:
+                with self.subTest(title=title):
+                    # Act
+                    result = assets.read_asset_natural_extent(path)
+
+                    # Assert
+                    self.assertEqual(result, (0.0, 0.0, 0.0))
 
     async def test_asset_crate_supported_delegates_to_omni_usd(self):
         # Arrange

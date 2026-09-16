@@ -61,7 +61,7 @@ def _make_sample(position) -> SimpleNamespace:
     )
 
 
-def _make_target(prototype_name: str) -> SimpleNamespace:
+def _make_target(prototype_name: str, instance_count: int = 1) -> SimpleNamespace:
     """Build a ScatterTarget-like value for a prototype hash name."""
     hash_name = prototype_name.removeprefix("mesh_")
     return SimpleNamespace(
@@ -69,7 +69,7 @@ def _make_target(prototype_name: str) -> SimpleNamespace:
         parent_instance_root=Sdf.Path(f"/RootNode/instances/inst_{hash_name}_0"),
         mesh_path=Sdf.Path(f"/RootNode/instances/inst_{hash_name}_0/mesh"),
         parent_world=Gf.Matrix4d(1.0),
-        instance_count=1,
+        instance_count=instance_count,
     )
 
 
@@ -127,6 +127,8 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
             mock.patch.object(stroke_module, "existing_placement_points", return_value=np.empty((0, 3)))
         )
         self.padding_index_class = enter(mock.patch.object(stroke_module, "PaddingIndex"))
+        # The stage is a mock, so the real reader would raise inside the pxr binding.
+        self.stage_meters_per_unit = enter(mock.patch.object(stroke_module, "stage_meters_per_unit", return_value=1.0))
         self.begin_interaction = enter(mock.patch.object(stroke_module, "begin_interaction", return_value=self.token))
         self.end_interaction = enter(mock.patch.object(stroke_module, "end_interaction"))
         self.execute = enter(mock.patch.object(stroke_module.omni.kit.commands, "execute", return_value=(True, None)))
@@ -769,3 +771,65 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(session.placed_count, 1)
+
+    async def test_rendered_prims_before_begin_returns_zero(self):
+        # Arrange
+        session = self._make_session()
+
+        # Act
+        rendered = session.rendered_prims
+
+        # Assert
+        self.assertEqual(rendered, 0)
+
+    async def test_rendered_prims_with_single_instance_target_matches_placed_count(self):
+        # Arrange
+        self.generate_stamp.return_value = [_make_record("a"), _make_record("b")]
+        session = self._make_session()
+
+        # Act
+        session.begin(
+            _make_hit((0.0, 0.0, 0.0)), _make_target("mesh_A", instance_count=1), _make_sample((0.0, 0.0, 0.0))
+        )
+
+        # Assert
+        self.assertEqual(session.rendered_prims, session.placed_count)
+
+    async def test_rendered_prims_with_multi_instance_target_multiplies_authored_count(self):
+        # Arrange
+        self.generate_stamp.return_value = [_make_record("a"), _make_record("b")]
+        session = self._make_session()
+
+        # Act
+        session.begin(
+            _make_hit((0.0, 0.0, 0.0)), _make_target("mesh_A", instance_count=50), _make_sample((0.0, 0.0, 0.0))
+        )
+
+        # Assert
+        self.assertEqual(session.rendered_prims, 100)
+
+    async def test_rendered_prims_with_zero_instance_target_counts_placements_once(self):
+        # Arrange
+        self.generate_stamp.return_value = [_make_record("a")]
+        session = self._make_session()
+
+        # Act
+        session.begin(
+            _make_hit((0.0, 0.0, 0.0)), _make_target("mesh_A", instance_count=0), _make_sample((0.0, 0.0, 0.0))
+        )
+
+        # Assert
+        self.assertEqual(session.rendered_prims, 1)
+
+    async def test_rendered_prims_with_erase_stroke_stays_zero(self):
+        # Arrange
+        self.erase_candidates.return_value = [Sdf.Path("/RootNode/meshes/mesh_A/scatter_default/s_1")]
+        session = self._make_session(erase=True)
+
+        # Act
+        session.begin(
+            _make_hit((0.0, 0.0, 0.0)), _make_target("mesh_A", instance_count=50), _make_sample((0.0, 0.0, 0.0))
+        )
+
+        # Assert
+        self.assertEqual(session.rendered_prims, 0)

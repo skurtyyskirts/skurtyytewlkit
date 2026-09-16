@@ -39,6 +39,7 @@ from lightspeed.trex.scatter.core.settings import (
     TargetMode,
     UpAxis,
 )
+from lightspeed.trex.scatter.core.targets import ScatterTarget
 
 _ROCK = "C:/project/assets/ingested/rock.usd"
 _GRASS = "C:/project/assets/ingested/grass.usd"
@@ -294,6 +295,146 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual(self.controller.assets, [ScatterAssetEntry(path=_ROCK, up_axis=UpAxis.Y)])
         self.assertEqual(self._persisted_assets()[0]["up_axis"], "Y")
         callback.assert_called_once_with(self.controller.assets)
+
+    async def test_add_asset_stores_and_persists_the_assets_unit_scale_and_natural_extent(self):
+        # Arrange
+        with (
+            mock.patch.object(controller_module, "read_asset_meters_per_unit", return_value=0.01) as read_unit,
+            mock.patch.object(
+                controller_module, "read_asset_natural_extent", return_value=(1.0, 2.0, 3.0)
+            ) as read_size,
+        ):
+            # Act
+            result = self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        # Assert
+        self.assertTrue(result)
+        read_unit.assert_called_once_with(_ROCK)
+        read_size.assert_called_once_with(_ROCK)
+        self.assertEqual(self.controller.assets[0].meters_per_unit, 0.01)
+        self.assertEqual(self.controller.assets[0].natural_extent, (1.0, 2.0, 3.0))
+        persisted = self._persisted_assets()[0]
+        self.assertEqual(persisted["meters_per_unit"], 0.01)
+        self.assertEqual(persisted["natural_extent"], [1.0, 2.0, 3.0])
+
+    async def test_ensure_asset_measurements_backfills_entries_restored_from_carb(self):
+        # Arrange - a palette restored from carb never went through add_asset, so it carries no measurement.
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        callback = self._subscribe(self.controller.subscribe_assets_changed)
+
+        with (
+            mock.patch.object(controller_module, "read_asset_meters_per_unit", return_value=1.0),
+            mock.patch.object(controller_module, "read_asset_natural_extent", return_value=(4.0, 5.0, 6.0)),
+        ):
+            # Act
+            changed = self.controller.ensure_asset_measurements()
+
+        # Assert
+        self.assertTrue(changed)
+        self.assertEqual(self.controller.assets[0].natural_extent, (4.0, 5.0, 6.0))
+        callback.assert_called_once_with(self.controller.assets)
+
+    async def test_ensure_asset_measurements_with_measured_entries_changes_nothing(self):
+        # Arrange
+        with (
+            mock.patch.object(controller_module, "read_asset_meters_per_unit", return_value=1.0),
+            mock.patch.object(controller_module, "read_asset_natural_extent", return_value=(4.0, 5.0, 6.0)),
+        ):
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        callback = self._subscribe(self.controller.subscribe_assets_changed)
+
+        with mock.patch.object(controller_module, "read_asset_natural_extent") as read_size:
+            # Act
+            changed = self.controller.ensure_asset_measurements()
+
+        # Assert
+        self.assertFalse(changed)
+        read_size.assert_not_called()
+        callback.assert_not_called()
+
+    async def test_ensure_asset_measurements_with_unmeasurable_asset_stays_quiet_and_retries_later(self):
+        # Arrange - an asset that cannot be read must not fire an event on every stroke that asks for it.
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        callback = self._subscribe(self.controller.subscribe_assets_changed)
+
+        with mock.patch.object(controller_module, "read_asset_natural_extent", return_value=(0.0, 0.0, 0.0)):
+            # Act
+            changed = [self.controller.ensure_asset_measurements() for _ in range(3)]
+
+        # Assert
+        self.assertEqual(changed, [False, False, False])
+        callback.assert_not_called()
+
+    async def test_report_mismatched_asset_up_axes_warns_once_per_entry(self):
+        # Arrange - the file says Y, the palette says Z, so the up-axis correction would be skipped silently.
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        callback = self._subscribe(self.controller.subscribe_status_message)
+
+        with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Y):
+            # Act
+            reported = [self.controller.report_mismatched_asset_up_axes() for _ in range(3)]
+
+        # Assert
+        self.assertEqual(reported, [[_ROCK], [], []])
+        self.assertEqual(callback.call_count, 1)
+        self.assertIn("Y-up", callback.call_args.args[0])
+
+    async def test_report_mismatched_asset_up_axes_with_matching_or_unauthored_axis_says_nothing(self):
+        cases = [("matches the file", UpAxis.Z), ("file authors nothing", None)]
+        for title, authored in cases:
+            with self.subTest(title=title):
+                # Arrange
+                controller = controller_module.ScatterBrushController()
+                controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+                callback = self._subscribe(controller.subscribe_status_message)
+
+                with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=authored):
+                    # Act
+                    reported = controller.report_mismatched_asset_up_axes()
+
+                # Assert
+                self.assertEqual(reported, [])
+                callback.assert_not_called()
+
+    async def test_set_asset_up_axis_lets_a_still_wrong_axis_be_reported_again(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Y):
+            self.controller.report_mismatched_asset_up_axes()
+
+            # Act
+            self.controller.set_asset_up_axis(_ROCK, UpAxis.Z)
+            reported = self.controller.report_mismatched_asset_up_axes()
+
+        # Assert
+        self.assertEqual(reported, [_ROCK])
+
+    async def test_next_stroke_reports_a_mismatched_up_axis(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        with mock.patch.object(self.controller, "report_mismatched_asset_up_axes") as report:
+            # Act
+            self.controller.next_stroke()
+
+        # Assert
+        report.assert_called_once_with()
+
+    async def test_next_stroke_resolves_textures_and_measurements_before_handing_out_a_seed(self):
+        # Arrange - the viewport tool copies the palette straight after this call, so it has to be resolved by then.
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+
+        with (
+            mock.patch.object(self.controller, "ensure_asset_textures") as ensure_textures,
+            mock.patch.object(self.controller, "ensure_asset_measurements") as ensure_measurements,
+        ):
+            # Act
+            self.controller.next_stroke()
+
+        # Assert
+        ensure_textures.assert_called_once_with()
+        ensure_measurements.assert_called_once_with()
 
     async def test_add_asset_with_explicit_up_axis_does_not_read_file(self):
         # Arrange
@@ -933,8 +1074,9 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual([asset.path for asset in flood_args[3]], [_ROCK])
         self.assertIs(flood_args[5], patched["PaddingIndex"].return_value)
         self.assertEqual(flood_args[6], UpAxis.Y)
-        self.assertIs(flood_args[7], stage.GetEditTarget().GetLayer())
-        self.assertEqual(flood_args[8], 100)
+        self.assertEqual(flood_args[7], 1.0)
+        self.assertIs(flood_args[8], stage.GetEditTarget().GetLayer())
+        self.assertEqual(flood_args[9], 100)
         committed.assert_called_once_with(2, False)
 
     async def test_flood_seeds_padding_index_with_existing_placements(self):
@@ -980,7 +1122,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(count, 3)
-        self.assertEqual([call.args[8] for call in patched["generate_flood"].call_args_list], [3, 1])
+        self.assertEqual([call.args[9] for call in patched["generate_flood"].call_args_list], [3, 1])
         self.assertEqual(patched["execute"].call_count, 2)
 
     async def test_flood_stops_when_max_instances_cap_is_reached(self):
@@ -1015,29 +1157,30 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.controller.update_settings(target_mode=TargetMode.ANCHOR, anchor_prototype_path=_ANCHOR_PROTOTYPE)
         mesh_path = instance.GetPath().AppendChild("mesh")
 
+        anchor_target = ScatterTarget(
+            prototype_root=Sdf.Path(_ANCHOR_PROTOTYPE),
+            parent_instance_root=instance.GetPath(),
+            mesh_path=mesh_path,
+            parent_world=Gf.Matrix4d().SetTranslate(Gf.Vec3d(10.0, 20.0, 30.0)),
+            instance_count=4,
+        )
         with contextlib.ExitStack() as stack:
             patched = self._patch_flood_dependencies(
                 stack,
                 stage,
                 generate_flood={"return_value": [_make_record("s_1")]},
             )
-            stack.enter_context(
-                mock.patch.object(controller_module, "canonical_instance", return_value=instance.GetPath())
+            build_target = stack.enter_context(
+                mock.patch.object(controller_module, "build_prototype_target", return_value=anchor_target)
             )
-            stack.enter_context(mock.patch.object(controller_module, "find_capture_mesh", return_value=mesh_path))
-            stack.enter_context(mock.patch.object(controller_module, "instance_count", return_value=4))
 
             # Act
             count = self.controller.flood("", mock.Mock())
 
         # Assert
         self.assertEqual(count, 1)
-        target = patched["generate_flood"].call_args.args[1]
-        self.assertEqual(target.prototype_root, Sdf.Path(_ANCHOR_PROTOTYPE))
-        self.assertEqual(target.parent_instance_root, instance.GetPath())
-        self.assertEqual(target.mesh_path, mesh_path)
-        self.assertEqual(target.parent_world.ExtractTranslation(), Gf.Vec3d(10.0, 20.0, 30.0))
-        self.assertEqual(target.instance_count, 4)
+        self.assertEqual(build_target.call_args.args[1], Sdf.Path(_ANCHOR_PROTOTYPE))
+        self.assertIs(patched["generate_flood"].call_args.args[1], anchor_target)
 
     async def test_flood_with_malformed_anchor_path_posts_error_and_places_nothing(self):
         # Arrange
@@ -1048,8 +1191,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
 
         with contextlib.ExitStack() as stack:
             patched = self._patch_flood_dependencies(stack, stage)
-            canonical_instance = stack.enter_context(mock.patch.object(controller_module, "canonical_instance"))
-            find_capture_mesh = stack.enter_context(mock.patch.object(controller_module, "find_capture_mesh"))
+            build_target = stack.enter_context(mock.patch.object(controller_module, "build_prototype_target"))
 
             # Act
             count = self.controller.flood("", mock.Mock())
@@ -1058,8 +1200,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual(count, 0)
         patched["generate_flood"].assert_not_called()
         patched["execute"].assert_not_called()
-        canonical_instance.assert_not_called()
-        find_capture_mesh.assert_not_called()
+        build_target.assert_not_called()
         status_callback.assert_called_once()
         self.assertIn("anchor", status_callback.call_args.args[0])
         self.assertTrue(status_callback.call_args.args[1])
@@ -1073,7 +1214,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
 
         with contextlib.ExitStack() as stack:
             patched = self._patch_flood_dependencies(stack, stage)
-            find_capture_mesh = stack.enter_context(mock.patch.object(controller_module, "find_capture_mesh"))
+            build_target = stack.enter_context(mock.patch.object(controller_module, "build_prototype_target"))
 
             # Act
             count = self.controller.flood("", mock.Mock())
@@ -1081,7 +1222,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(count, 0)
         patched["execute"].assert_not_called()
-        find_capture_mesh.assert_not_called()
+        build_target.assert_not_called()
         status_callback.assert_called_once()
 
     async def test_flood_without_targets_in_hit_surface_mode_uses_selected_prototypes(self):
@@ -1097,13 +1238,13 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
                 generate_flood={"return_value": [_make_record("s_1")]},
             )
             stack.enter_context(mock.patch.object(controller_module, "selected_prototypes", return_value=prototypes))
-            stack.enter_context(mock.patch.object(controller_module, "canonical_instance", return_value=None))
             stack.enter_context(
                 mock.patch.object(
-                    controller_module, "find_capture_mesh", side_effect=lambda stage, root: root.AppendChild("mesh")
+                    controller_module,
+                    "build_prototype_target",
+                    side_effect=lambda stage, prototype: _make_target(prototype.name),
                 )
             )
-            stack.enter_context(mock.patch.object(controller_module, "instance_count", return_value=1))
 
             # Act
             count = self.controller.flood("", mock.Mock())
@@ -1114,8 +1255,6 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
             [call.args[1].prototype_root for call in patched["generate_flood"].call_args_list],
             [Sdf.Path("/RootNode/meshes/mesh_A"), Sdf.Path("/RootNode/meshes/mesh_B")],
         )
-        self.assertEqual(patched["generate_flood"].call_args_list[0].args[1].parent_world, Gf.Matrix4d(1.0))
-        self.assertIsNone(patched["generate_flood"].call_args_list[0].args[1].parent_instance_root)
 
     async def test_flood_skips_prototypes_without_capture_mesh(self):
         # Arrange
@@ -1130,8 +1269,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
                     controller_module, "selected_prototypes", return_value={Sdf.Path("/RootNode/meshes/mesh_A")}
                 )
             )
-            stack.enter_context(mock.patch.object(controller_module, "canonical_instance", return_value=None))
-            stack.enter_context(mock.patch.object(controller_module, "find_capture_mesh", return_value=None))
+            stack.enter_context(mock.patch.object(controller_module, "build_prototype_target", return_value=None))
 
             # Act
             count = self.controller.flood("", mock.Mock())
