@@ -29,6 +29,7 @@ from lightspeed.particle.gizmos.layer import ParticleGizmosLayer as _ParticleGiz
 from lightspeed.trex.contexts.setup import Contexts as _TrexContexts
 from lightspeed.trex.hotkeys import TrexHotkeyEvent as _TrexHotkeyEvent
 from lightspeed.trex.hotkeys import get_global_hotkey_manager as _get_global_hotkey_manager
+from lightspeed.trex.scatter.core.constants import GIZMO_SCENE_FACTORY_ID as _SCATTER_GIZMO_SCENE_FACTORY_ID
 from lightspeed.trex.scatter.core.constants import SCENE_FACTORY_ID as _SCATTER_BRUSH_SCENE_FACTORY_ID
 from lightspeed.trex.scatter.core.constants import TOOLBAR_PRIORITY as _SCATTER_BRUSH_TOOLBAR_PRIORITY
 from lightspeed.trex.viewports.manipulators import camera_default_factory as _manipulator_camera_default
@@ -48,6 +49,7 @@ from .tools.layer import ViewportToolsLayer
 from .tools.scatter_brush import create_button_instance as _create_scatter_toolbar_button_group
 from .tools.scatter_brush import delete_button_instance as _delete_scatter_toolbar_button_group
 from .tools.scatter_brush import scatter_brush_factory as _scatter_brush_factory
+from .tools.scatter_gizmo import scatter_gizmo_factory as _scatter_gizmo_factory
 from .tools.teleport import create_button_instance as _create_teleporter_toolbar_button_group
 from .tools.teleport import delete_button_instance as _delete_teleporter_toolbar_button_group
 from .tools.teleport import teleporter_factory as _teleporter_factory
@@ -145,6 +147,7 @@ class TrexViewportSharedExtension(omni.ext.IExt):
         self.__registered.append(RegisterScene(_prim_transform_manipulator, "omni.kit.lss.viewport.manipulator.prim"))
         self.__registered.append(RegisterScene(_teleporter_factory, "omni.kit.lss.viewport.tools.teleport"))
         self.__registered.append(RegisterScene(_scatter_brush_factory, _SCATTER_BRUSH_SCENE_FACTORY_ID))
+        self.__registered.append(RegisterScene(_scatter_gizmo_factory, _SCATTER_GIZMO_SCENE_FACTORY_ID))
 
         # self.__registered.append(
         #     RegisterScene(_grid_default_factory, "omni.kit.viewport.scene.SimpleGrid")

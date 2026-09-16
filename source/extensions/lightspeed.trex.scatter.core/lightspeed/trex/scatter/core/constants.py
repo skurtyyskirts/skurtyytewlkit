@@ -23,6 +23,7 @@ __all__ = [
     "DEFAULT_PRESET_NAME",
     "EXTENSION_NAME",
     "FORCE_CPU_PICKER_SETTING",
+    "GIZMO_SCENE_FACTORY_ID",
     "IS_REMIX_SCATTER_ATTR",
     "MAX_PICK_DISTANCE_SETTING",
     "PLACEMENT_PREFIX",
@@ -33,6 +34,7 @@ __all__ = [
     "SCATTER_KEY_ATTR",
     "SCATTER_ORIGIN_ATTR",
     "SCATTER_TRANSFORM_KEY_ATTR",
+    "SCATTER_YAW_ATTR",
     "SCENE_FACTORY_ID",
     "TOOLBAR_PRIORITY",
 ]
@@ -50,6 +52,9 @@ SCATTER_ORIGIN_ATTR = "remixScatterOrigin"
 SCATTER_KEY_ATTR = "remixScatterKey"
 # Checksum of the transform the brush authored, so a transform the user changed by hand can be left alone.
 SCATTER_TRANSFORM_KEY_ATTR = "remixScatterTransformKey"
+# Degrees about the stage up axis the move gizmo has turned this placement by, added to the yaw it samples. Kept
+# because a recomposition reproduces the position and the surface it settled on, but not a turn the user dragged.
+SCATTER_YAW_ATTR = "remixScatterYaw"
 
 # Prim naming: <prototype>/scatter_<preset slug>/s_<uuid>
 CONTAINER_PREFIX = "scatter_"
@@ -57,6 +62,7 @@ PLACEMENT_PREFIX = "s_"
 
 # Viewport integration constants shared with lightspeed.trex.viewports.shared.widget
 SCENE_FACTORY_ID = "omni.kit.lss.viewport.tools.scatter_brush"
+GIZMO_SCENE_FACTORY_ID = "omni.kit.lss.viewport.tools.scatter_gizmo"
 TOOLBAR_PRIORITY = 13
 
 # Carb settings

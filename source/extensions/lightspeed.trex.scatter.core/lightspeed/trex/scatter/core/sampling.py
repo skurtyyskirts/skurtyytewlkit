@@ -35,6 +35,7 @@ __all__ = [
     "stamp_rng",
     "tangent_basis",
     "to_parent_space_origin",
+    "twist_degrees",
     "up_axis_vector",
 ]
 
@@ -424,6 +425,7 @@ def compose_parent_space_transform(
     stage_up: UpAxis,
     asset_up: UpAxis,
     asset_scale_factor: float | None = 1.0,
+    yaw_offset: float = 0.0,
 ) -> tuple[Gf.Vec3d, Gf.Vec3f, Gf.Vec3f]:
     """Compute the translate / rotateXYZ / scale ops of one placement in the space of its parent instance.
 
@@ -449,6 +451,8 @@ def compose_parent_space_transform(
         asset_scale_factor: Multiplier turning a sampled scale value into what is authored: 1.0 leaves the sample a
             plain multiplier, the reciprocal of the asset's height in stage units turns a sampled target height into
             one. None means the asset could not be measured, so the placement keeps its own size.
+        yaw_offset: Degrees about the stage up axis to add to the sampled yaw, so a placement the move gizmo turned
+            keeps that turn when it is composed again.
 
     Returns:
         (translate, rotate_xyz_degrees, scale) such that authoring them with xformOpOrder
@@ -475,7 +479,7 @@ def compose_parent_space_transform(
     conform = Gf.Matrix4d(1.0)
     if settings.conform_to_surface:
         conform = Gf.Matrix4d().SetRotate(Gf.Rotation(up, normal))
-    yaw = rotate_z
+    yaw = rotate_z + yaw_offset
     if settings.align_to_stroke and origin.heading is not None:
         yaw += _heading_yaw_degrees(origin.heading, effective_up, conform)
 
@@ -488,6 +492,33 @@ def compose_parent_space_transform(
         * conform
     )
     return position, rotation_to_xyz_degrees(rotation), Gf.Vec3f(scale[0], scale[1], scale[2])
+
+
+def twist_degrees(rotation: Gf.Rotation, axis: Gf.Vec3d) -> float:
+    """Return how far a rotation turns about an axis, ignoring the part of it that tips the axis over.
+
+    This is the swing-twist decomposition: the quaternion's vector part is projected onto the axis, and the twist is
+    the rotation that projection describes. The move gizmo uses it to record the turn it applied about the stage up
+    axis, which is the only part of a drag a later recomposition can reproduce through the yaw it samples.
+
+    Args:
+        rotation: Rotation to decompose.
+        axis: Axis to measure the turn about; need not be normalized.
+
+    Returns:
+        The angle in degrees, in [-180, 180]. Zero when the axis has no length.
+    """
+    length = axis.GetLength()
+    if length < _EPSILON:
+        return 0.0
+    unit_axis = axis / length
+    quaternion = rotation.GetQuaternion()
+    projection = unit_axis * Gf.Dot(quaternion.GetImaginary(), unit_axis)
+    twist = Gf.Quatd(quaternion.GetReal(), projection)
+    if twist.GetLength() < _EPSILON:
+        # The rotation is a half turn about an axis perpendicular to this one, which carries no twist about it.
+        return 0.0
+    return Gf.Rotation(twist.GetNormalized()).GetAngle() * (1.0 if Gf.Dot(projection, unit_axis) >= 0.0 else -1.0)
 
 
 class PaddingIndex:

@@ -23,6 +23,9 @@ __all__ = [
     "ReapplyScope",
     "ScopeEntry",
     "changed_reappliable_fields",
+    "is_hand_edited",
+    "read_placement_origin",
+    "read_placement_yaw",
     "reapply_transforms",
     "resolve_scope",
 ]
@@ -51,6 +54,7 @@ from .constants import (
     SCATTER_KEY_ATTR,
     SCATTER_ORIGIN_ATTR,
     SCATTER_TRANSFORM_KEY_ATTR,
+    SCATTER_YAW_ATTR,
 )
 from .placement import PlacementTransform, asset_scale_factor, author_placement_transforms, transform_key
 from .sampling import (
@@ -256,14 +260,14 @@ def reapply_transforms(
             if current is None:
                 outcome.foreign_layer += 1
                 continue
-            if _is_hand_edited(spec, current):
+            if is_hand_edited(spec, current):
                 outcome.hand_edited += 1
                 continue
             asset = resolver.resolve(spec)
             if asset is None:
                 outcome.unresolved += 1
                 continue
-            origin = _read_origin(spec)
+            origin = read_placement_origin(spec)
             if origin is None:
                 origin = _recover_origin(cache, target, current, settings)
                 if origin is None:
@@ -278,6 +282,7 @@ def reapply_transforms(
                 up_axis,
                 asset.up_axis,
                 asset_scale_factor(asset, settings, meters_per_unit),
+                read_placement_yaw(spec),
             )
             before.append(current)
             after.append(
@@ -559,7 +564,7 @@ def _read_transform(spec: Sdf.PrimSpec, path: Sdf.Path) -> PlacementTransform | 
     )
 
 
-def _is_hand_edited(spec: Sdf.PrimSpec, current: PlacementTransform) -> bool:
+def is_hand_edited(spec: Sdf.PrimSpec, current: PlacementTransform) -> bool:
     """Whether a placement's transform is no longer the one the brush gave it.
 
     A placement with no recorded checksum was painted before the brush recorded one, so nothing can be concluded and
@@ -572,12 +577,20 @@ def _is_hand_edited(spec: Sdf.PrimSpec, current: PlacementTransform) -> bool:
     return int(recorded.default) != transform_key(current.translate, current.rotate_xyz, current.scale)
 
 
-def _read_origin(spec: Sdf.PrimSpec) -> ParentSpaceOrigin | None:
+def read_placement_origin(spec: Sdf.PrimSpec) -> ParentSpaceOrigin | None:
     """Return the surface a placement recorded when it was painted, or None when it recorded none."""
     attribute = spec.attributes.get(SCATTER_ORIGIN_ATTR)
     if attribute is None or attribute.default is None:
         return None
     return ParentSpaceOrigin.from_values(list(attribute.default))
+
+
+def read_placement_yaw(spec: Sdf.PrimSpec) -> float:
+    """Return the degrees the move gizmo has turned a placement by about the stage up axis; 0 when it never was."""
+    attribute = spec.attributes.get(SCATTER_YAW_ATTR)
+    if attribute is None or attribute.default is None:
+        return 0.0
+    return float(attribute.default)
 
 
 def _read_key(spec: Sdf.PrimSpec, path: Sdf.Path) -> int:

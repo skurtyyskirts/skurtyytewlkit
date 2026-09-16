@@ -30,6 +30,8 @@ presets. It has no UI.
 - Re-apply placement, scale and seed settings to scatter that already exists (`reapply.py`): resolve the selection
   into the placements an edit may write to, recompose them under the new settings, and commit one
   `ScatterReapplyCommand` per edit
+- Move that same selection by a world-space delta and settle it back onto the surface (`move.py`), which is what the
+  viewport's scatter move gizmo drags
 
 ## Non-Responsibilities
 
@@ -100,6 +102,22 @@ authors the recomposed transforms straight into the edit layer with notices defe
 `LIVE_EDIT_SOFT_LIMIT` placements it stops following every step of a drag and updates when the edit ends instead; like
 the prim budget this changes how an edit is paced, never whether it is allowed.
 
+### Moving a patch
+
+`move_scope` transforms the transform a placement already carries rather than recomposing it, and **never reads the
+brush settings**. Recomposing would make a drag apply whatever size and rotation ranges are in the Scatter window at
+the time, so moving a patch could silently resize it; a move moves.
+
+Each placement's recorded surface is carried through the drag, projected back onto the target's capture mesh, and the
+rotation that takes the old normal to the new one is applied along with the drag's own. That is what makes a patch
+slide along the ground and tilt onto a slope instead of floating. How far a placement looks for the surface is the
+size of the mesh it belongs to, so lifting a patch settles it back down and sliding it past the edge stops it at the
+edge, while geometry it was not painted on is never searched.
+
+A recomposition later reproduces the position and, through conform-to-surface, the settling; it cannot reproduce the
+turn, so placements accumulate `remixScatterYaw`, which `compose_parent_space_transform` adds to the yaw it samples.
+With `conform_to_surface` off the settling is not reproduced either, because there is no conform term to carry it.
+
 A placement whose transform no longer matches its checksum was moved by hand and is left alone. One with no recorded
 origin was painted before the brush recorded surfaces: it is projected back onto its capture mesh, which also removes
 whatever vertical offset it was painted with, and reported, because its original random draws cannot be recovered and
@@ -116,6 +134,8 @@ its rotation and scale are drawn afresh.
 - `parent_uniform_scale`, `stage_meters_per_unit`, `read_asset_meters_per_unit`, `read_asset_natural_extent` —
   the unit and size facts that make a placement's scale mean a world size
 - `ScatterStrokeCommand`, `ScatterFloodCommand`, `ScatterReapplyCommand` — undoable mutations
+- `scope_pivot`, `move_scope`, `MoveOutcome` — where a move gizmo sits on a patch, what a drag of it does, and what
+  it left behind
 - `ReapplyScope`, `resolve_scope`, `reapply_transforms`, `ReapplyDriver`, `ReapplyOutcome` — what a settings change
   may write to, the recomposed transforms, the live edit that authors them, and what it left alone
 - `ParentSpaceOrigin`, `to_parent_space_origin`, `placement_rng`, `transform_key` — the surface, the randomness and
@@ -158,6 +178,9 @@ its rotation and scale are drawn afresh.
   stroke segment at the new sample instead of stamping the whole jump
 - Texture assignment happens when a placement is authored, so it does not reach placements that were already painted;
   erase and repaint them, or assign the textures through the Texture Replacements surface, which lists scatter shaders
+- A move never re-derives a patch: it will not resize, re-seed or re-rotate it from the current settings, and a patch
+  dragged with `conform_to_surface` off keeps the settling of the drag itself but will lose it if the patch is later
+  recomposed, because nothing reproduces it
 - Only placement, scale and seed settings re-apply to placements that already exist. The brush and density settings
   (radius, density, strength, spacing, padding) decide where stamps land, which depends on the mouse path a stroke
   followed; that path is not recorded, so changing them affects the next stroke only

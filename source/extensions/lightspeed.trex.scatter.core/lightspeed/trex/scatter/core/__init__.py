@@ -29,6 +29,7 @@ __all__ = [
     "HdRemixSurfacePicker",
     "MeshGeometry",
     "MeshSurfaceCache",
+    "MoveOutcome",
     "PaddingIndex",
     "ParentSpaceOrigin",
     "PlacementRecord",
@@ -92,10 +93,12 @@ __all__ = [
     "get_scatter_brush_controller",
     "has_scatter_ancestor",
     "instance_count",
+    "is_hand_edited",
     "is_scatter_prim",
     "list_ingested_models",
     "load_assets_from_carb",
     "make_relative_asset_path",
+    "move_scope",
     "new_placement_name",
     "normalize_asset_path",
     "parent_uniform_scale",
@@ -107,6 +110,8 @@ __all__ = [
     "read_asset_natural_extent",
     "read_asset_up_axis",
     "read_authored_asset_up_axis",
+    "read_placement_origin",
+    "read_placement_yaw",
     "reapply_transforms",
     "remove_placements",
     "resolve_asset_texture_set",
@@ -119,6 +124,7 @@ __all__ = [
     "sample_rotation_degrees",
     "sample_scale",
     "save_assets_to_carb",
+    "scope_pivot",
     "selected_prototypes",
     "snapshot_prims",
     "stage_meters_per_unit",
@@ -128,6 +134,7 @@ __all__ = [
     "to_parent_space_origin",
     "transform_key",
     "triangulate_faces",
+    "twist_degrees",
     "up_axis_vector",
     "validated_anchor_prototype",
 ]
@@ -196,6 +203,7 @@ from .placement import (
     snapshot_prims,
     transform_key,
 )
+from .move import MoveOutcome, move_scope, scope_pivot
 from .presets import PresetStore, get_default_presets_directory
 from .reapply import (
     ReapplyDriver,
@@ -203,7 +211,10 @@ from .reapply import (
     ReapplyScope,
     ScopeEntry,
     changed_reappliable_fields,
+    is_hand_edited,
     reapply_transforms,
+    read_placement_origin,
+    read_placement_yaw,
     resolve_scope,
 )
 from .sampling import (
@@ -224,6 +235,7 @@ from .sampling import (
     stamp_rng,
     tangent_basis,
     to_parent_space_origin,
+    twist_degrees,
     up_axis_vector,
 )
 from .settings import (

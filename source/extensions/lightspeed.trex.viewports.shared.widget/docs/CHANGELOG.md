@@ -5,6 +5,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Added the Scatter Brush viewport tool (toolbar toggle, Ctrl+B, B+wheel sizing, paint/erase strokes with a surface cursor) and a mouse-wheel interceptor hook on the viewport event delegate.
 - Added a live counter on the scatter brush cursor that reports the prims a paint stroke is adding to the rendered stage, showing the authored and multiplied totals separately on a replicated prototype and turning amber at the brush prim budget and red at five times it. It only reports; a stroke is never interrupted.
+- Added the scatter move gizmo: selecting painted scatter puts the standard transform gizmo on the middle of that patch, and dragging its arrows or rings moves or turns the whole patch as one undo step. It follows the viewport's own move and rotate operation, so the same keys switch it, and it hides itself while the brush is painting or erasing rather than competing for the drag.
 
 ## [1.8.5]
 ### Fixed

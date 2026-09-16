@@ -26,6 +26,7 @@ icon = "data/icon.png"
 "lightspeed.trex.contexts" = {}
 "lightspeed.trex.hotkeys" = {}
 "lightspeed.trex.scatter.core" = {}
+"omni.kit.manipulator.transform" = {}
 "lightspeed.trex.viewports.manipulators" = {}
 "lightspeed.trex.viewports.properties_pane.widget" = {}
 "lightspeed.light.gizmos" = {}

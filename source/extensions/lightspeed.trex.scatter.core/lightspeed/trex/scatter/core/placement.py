@@ -59,6 +59,7 @@ from .constants import (
     SCATTER_KEY_ATTR,
     SCATTER_ORIGIN_ATTR,
     SCATTER_TRANSFORM_KEY_ATTR,
+    SCATTER_YAW_ATTR,
 )
 from .geometry import MeshSurfaceCache, SurfaceSample, area_weighted_triangle_samples
 from .sampling import (
@@ -169,6 +170,22 @@ class PlacementTransform:
     translate: tuple[float, float, float]
     rotate_xyz: tuple[float, float, float]
     scale: tuple[float, float, float]
+    origin: tuple[float, ...] = ()
+    """Surface to record alongside the ops, or empty to leave the recorded one alone.
+
+    A move changes where a placement sits, so the surface it would be composed from has to move with it; carrying it
+    here is what lets one command undo the ops and the surface together.
+    """
+
+    yaw: float | None = None
+    """Degrees about the stage up axis to record, or None to leave the recorded turn alone."""
+
+    brush_owned: bool = True
+    """Whether writing this marks the placement as the brush's again.
+
+    False leaves the recorded checksum stale, which is how a placement the user moved by hand travels with a patch
+    that is dragged and still keeps a later settings change from snapping it back into the brush's arrangement.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize into a JSON-friendly dictionary (vectors become lists)."""
@@ -177,16 +194,23 @@ class PlacementTransform:
             "translate": list(self.translate),
             "rotate_xyz": list(self.rotate_xyz),
             "scale": list(self.scale),
+            "origin": list(self.origin),
+            "yaw": self.yaw,
+            "brush_owned": self.brush_owned,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PlacementTransform:
         """Build a transform from a dictionary produced by :meth:`to_dict`."""
+        yaw = data.get("yaw")
         return cls(
             prim_path=str(data["prim_path"]),
             translate=_as_float_triple(data["translate"]),
             rotate_xyz=_as_float_triple(data["rotate_xyz"]),
             scale=_as_float_triple(data["scale"]),
+            origin=tuple(float(value) for value in data.get("origin", ())),
+            yaw=None if yaw is None else float(yaw),
+            brush_owned=bool(data.get("brush_owned", True)),
         )
 
 
@@ -510,7 +534,23 @@ def author_placement_transforms(layer: Sdf.Layer, transforms: Sequence[Placement
             spec = layer.GetPrimAtPath(Sdf.Path(transform.prim_path))
             if spec is None:
                 continue
-            _set_transform_ops(spec, transform.translate, transform.rotate_xyz, transform.scale)
+            _set_transform_ops(
+                spec,
+                transform.translate,
+                transform.rotate_xyz,
+                transform.scale,
+                brush_owned=transform.brush_owned,
+            )
+            if transform.origin:
+                _set_attribute(
+                    spec,
+                    SCATTER_ORIGIN_ATTR,
+                    Sdf.ValueTypeNames.DoubleArray,
+                    Vt.DoubleArray(list(transform.origin)),
+                    custom=True,
+                )
+            if transform.yaw is not None:
+                _set_attribute(spec, SCATTER_YAW_ATTR, Sdf.ValueTypeNames.Double, float(transform.yaw), custom=True)
             written.append(transform.prim_path)
     return written
 
@@ -520,11 +560,18 @@ def _set_transform_ops(
     translate: Sequence[float],
     rotate_xyz: Sequence[float],
     scale: Sequence[float],
+    brush_owned: bool = True,
 ) -> None:
-    """Author the three transform ops on a placement spec together with the checksum that stamps them as the brush's."""
+    """Author the three transform ops on a placement spec, stamping them as the brush's unless told otherwise.
+
+    Leaving the checksum stale is what keeps a placement the user moved by hand recognizable as theirs even after a
+    move has carried it along with the rest of its patch.
+    """
     _set_attribute(spec, "xformOp:translate", Sdf.ValueTypeNames.Double3, Gf.Vec3d(*translate))
     _set_attribute(spec, "xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3, Gf.Vec3f(*rotate_xyz))
     _set_attribute(spec, "xformOp:scale", Sdf.ValueTypeNames.Float3, Gf.Vec3f(*scale))
+    if not brush_owned:
+        return
     _set_attribute(
         spec,
         SCATTER_TRANSFORM_KEY_ATTR,

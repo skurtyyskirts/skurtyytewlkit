@@ -269,6 +269,32 @@ Two kinds of placement are deliberately left alone, and the readout says how man
 Placements authored in a layer other than your current edit target are also skipped, the same way erasing skips them;
 set that layer as the edit target to change them.
 
+### Moving a Painted Patch
+
+Selecting painted scatter also puts the usual transform gizmo — the red, green and blue arrows, and the rotate rings
+— on the middle of that patch. Drag the arrows to slide the whole patch, or the rings to turn it. Both are a single
+undo step, however far you drag.
+
+The patch **stays on the surface**. Slide it across uneven ground and every placement re-settles onto whatever is
+beneath it, tilting to match the slope, so grass never ends up floating above a hill or buried in it. Drag it
+upwards and it simply settles back down; drag it past the edge of the mesh and it stops at the edge. It only ever
+looks for the mesh it was painted on, so a patch can never jump onto some other piece of geometry.
+
+The same rules decide what moves as everywhere else: select placements or a `scatter_<preset>` container to move
+exactly those, or select a mesh or instance to move what the current preset painted on it. Nothing outside the
+selection moves.
+
+```{note}
+The gizmo follows the viewport's own Move and Rotate tools, so the keys and toolbar buttons you already use to switch
+between them switch this too. It is hidden while Paint or Erase is armed, because otherwise it would swallow the
+brush stroke — turn painting off to move a patch. There is no scale handle: **SCALE ▸ Size** resizes a selected patch
+live, in stage units, which is more precise than dragging a corner.
+```
+
+A move never re-derives the patch. It moves what is there, so dragging can never resize or re-randomize it even if
+you have changed the brush settings since painting — and a placement you nudged by hand travels along with the rest
+and stays yours, so a later settings change still leaves it alone.
+
 ### Keeping a scattered scene fast in game
 
 A placement is authored under a captured mesh's prototype, so it is drawn once for **every instance of that

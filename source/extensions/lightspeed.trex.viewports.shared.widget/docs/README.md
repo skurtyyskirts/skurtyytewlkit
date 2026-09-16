@@ -42,3 +42,22 @@ camera-mutating action is canceled and a warning explains that the capture game 
 - `events.ViewportEventDelegate` routes wheel, key, and drop events of a scene view;
   `events.register_mouse_wheel_interceptor` lets a tool consume wheel events before flight-speed and zoom
   handling.
+
+## Scatter move gizmo
+
+`tools/scatter_gizmo.py` puts the standard `omni.kit.manipulator.transform` gizmo — the translate arrows and rotate
+rings — on the middle of the painted scatter the user has selected, and turns a drag of it into one undoable move of
+that whole patch through `lightspeed.trex.scatter.core.move_scope`.
+
+It resolves its own scope with `resolve_scope`, the same rules the Scatter window's live editing uses, so it works
+whether or not that window is open. The gizmo is model-driven rather than selection-driven, which is why it needs
+nothing from `filter_transformable_prims`: that filter only passes paths with an `inst_` or `light_` segment, and
+scatter placements are authored and worked with on the prototype side.
+
+The gizmo hides itself while the brush is in paint or erase mode, because a handle sitting on the patch would take
+the drag the brush is waiting for. It follows `/app/transform/operation`, so the viewport toolbar and the keys that
+switch the prim gizmo between move and rotate switch this one too, and it offers no scale: resizing a patch is what
+the Size range in the Scatter window does.
+
+Every step of a drag is measured from the state captured when the gesture began, rather than from the step before
+it, so a long drag cannot accumulate the error of every frame along the way.

@@ -20,6 +20,7 @@ from .unit.test_assets import TestAssets
 from .unit.test_commands import TestScatterFloodCommand, TestScatterStrokeCommand
 from .unit.test_controller import TestScatterBrushController, TestScatterBrushControllerSingleton
 from .unit.test_geometry import TestGeometryFunctions, TestMeshGeometry, TestMeshSurfaceCache
+from .unit.test_move import TestMoveAndReapplyTogether, TestMoveHelpers, TestMoveScope, TestScopePivot
 from .unit.test_materials import TestBuildMaterialsPayload, TestResolveAssetTextureSet
 from .unit.test_picking import (
     TestCameraRayFromNdc,
@@ -52,6 +53,9 @@ __all__ = (
     "TestHdRemixSurfacePicker",
     "TestMeshGeometry",
     "TestMeshSurfaceCache",
+    "TestMoveAndReapplyTogether",
+    "TestMoveHelpers",
+    "TestMoveScope",
     "TestPaddingIndex",
     "TestPlacementFunctions",
     "TestPlacementRecord",
@@ -68,6 +72,7 @@ __all__ = (
     "TestScatterCommandsOnProjectExample",
     "TestScatterFloodCommand",
     "TestScatterStrokeCommand",
+    "TestScopePivot",
     "TestStrokeSession",
     "TestTargets",
 )
