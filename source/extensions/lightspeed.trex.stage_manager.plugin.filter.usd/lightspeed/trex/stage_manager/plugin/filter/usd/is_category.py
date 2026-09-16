@@ -15,9 +15,11 @@
 * limitations under the License.
 """
 
+import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, ClassVar
 
-from lightspeed.common.constants import REMIX_CATEGORIES_DISPLAY_NAMES as _REMIX_CATEGORIES_DISPLAY_NAMES
+from lightspeed.trex.schemas.categories import ASSIGNABLE_REMIX_CATEGORIES as _ASSIGNABLE_REMIX_CATEGORIES
 from omni import ui
 from omni.flux.stage_manager.factory import StageManagerItem as _StageManagerItem
 from omni.flux.stage_manager.plugin.filter.usd.base import StageManagerUSDFilterPlugin as _StageManagerUSDFilterPlugin
@@ -26,6 +28,12 @@ from pydantic import Field, PrivateAttr
 if TYPE_CHECKING:
     from omni.flux.stage_manager.factory.plugins.tree_plugin import StageManagerTreeItem as _StageManagerTreeItem
     from omni.flux.stage_manager.factory.plugins.tree_plugin import StageManagerTreeModel as _StageManagerTreeModel
+
+__all__ = ["IsCategoryFilterPlugin"]
+
+_ASSIGNABLE_REMIX_CATEGORIES_DISPLAY_NAMES = {
+    details["attr"]: name for name, details in _ASSIGNABLE_REMIX_CATEGORIES.items()
+}
 
 
 class IsCategoryFilterPlugin(_StageManagerUSDFilterPlugin):
@@ -46,7 +54,9 @@ class IsCategoryFilterPlugin(_StageManagerUSDFilterPlugin):
         default="All Categories", description="Whether to keep all categories or filter by category type."
     )
 
-    _CATEGORY_DISPLAY_LABELS: dict = PrivateAttr(default={"All": "All Categories", **_REMIX_CATEGORIES_DISPLAY_NAMES})
+    _CATEGORY_DISPLAY_LABELS: dict = PrivateAttr(
+        default={"All": "All Categories", **_ASSIGNABLE_REMIX_CATEGORIES_DISPLAY_NAMES}
+    )
     _cat_type_combobox: ui.ComboBox | None = PrivateAttr(default=None)
     _current_attr: str | None = PrivateAttr(default=None)
 
@@ -61,7 +71,7 @@ class IsCategoryFilterPlugin(_StageManagerUSDFilterPlugin):
     def filter_predicate(self, item: _StageManagerItem) -> bool:
         """Return whether an item matches the selected Remix Category filter.
 
-        All Categories matches every item; an unresolved category selection matches none.
+        All Categories passes through items; an unresolved category selection matches none.
 
         Args:
             item: Stage Manager item to evaluate.
@@ -75,6 +85,43 @@ class IsCategoryFilterPlugin(_StageManagerUSDFilterPlugin):
             return False
         attribute = item.data.GetAttribute(self._current_attr)
         return bool(attribute.IsValid() and attribute.Get())
+
+    def build_filter_predicate(
+        self, cancel_event: threading.Event | None = None
+    ) -> Callable[[_StageManagerItem], bool]:
+        """Build a selected-category predicate or prepare neutral category memberships.
+
+        Args:
+            cancel_event: Optional context-refresh cancellation signal.
+
+        Returns:
+            Predicate that matches the selected category or prepares neutral category group memberships.
+        """
+        del cancel_event
+        if self.category_type != "All Categories":
+            return self.filter_predicate
+
+        def predicate(item: _StageManagerItem) -> bool:
+            """Prepare memberships for one valid, categorized item."""
+            prim = item.data
+            if not prim or not prim.IsValid():
+                return False
+            item.mark_display_name_candidate()
+
+            category_names = []
+            for attribute in prim.GetAttributes():
+                if not attribute.IsValid():
+                    continue
+                attribute_name = attribute.GetName()
+                if attribute_name in _ASSIGNABLE_REMIX_CATEGORIES_DISPLAY_NAMES and attribute.Get():
+                    category_names.append(attribute_name)
+            if not category_names:
+                return False
+
+            item.prepare_group_memberships(category_names)
+            return True
+
+        return predicate
 
     def build_ui(self):
         with ui.HStack(spacing=ui.Pixel(8), tooltip=self.tooltip):

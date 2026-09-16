@@ -153,9 +153,6 @@
             "name": "RemixAllMeshesInteractionPlugin",
             "filters": [
                 {
-                    "name": "IsCaptureFilterPlugin"
-                },
-                {
                     "name": "SearchFilterPlugin"
                 },
                 {
@@ -433,9 +430,6 @@
             },
             "filters": [
                 {
-                    "name": "IsCaptureFilterPlugin"
-                },
-                {
                     "name": "SearchFilterPlugin"
                 },
                 {
@@ -537,7 +531,7 @@
         },
         {
             "name": "RemixAllSkeletonsInteractionPlugin",
-            "include_invalid_parents": false,
+            "allow_context_ancestors": false,
             "filtering_rules": {
                 "force_refresh_rules": [
                     {
@@ -708,12 +702,6 @@
                 ]
             },
             "filters": [
-                {
-                    "name": "IsCategoryFilterPlugin"
-                },
-                {
-                    "name": "IsCaptureFilterPlugin"
-                },
                 {
                     "name": "SearchFilterPlugin"
                 },

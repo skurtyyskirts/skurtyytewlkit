@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - REMIX-4970: Validator and pipeline DDS conversions now call the NVTT C binding directly through `omni.flux.nvtt.core.encode_dds`, with typed validator format, gamma, and mip-filter settings.
 - REMIX-2968: Added a non-blocking `check-tests-written` merge request job that warns when an extension's Python source changed without any change to its tests, posting a self-resolving merge request note and honoring a `no-tests-needed` opt-out label
 - Added a viewport asset scattering brush: a Scatter window docked next to the Editor and a viewport toolbar tool (Ctrl+B) that paints, erases and floods ingested assets onto captured meshes with Paint-Tool-style density, falloff, spacing, padding, strength, random rotation and scale, per-asset weights, presets and per-stroke undo; painted assets are given their ingested texture set (albedo, normal, roughness, height) automatically, using the same detection as Assign Texture Sets
+- REMIX-5930: Added an "Open Project with Capture..." recent-project action that selects and saves the active capture before opening StageCraft.
+- REMIX-5976: Added an in-process typed texture and mesh asset-processing graph with ingestion parity, durable queue restart, publication and metadata Apply, and context isolation.
 
 ### Changed
 
@@ -74,6 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update Remix target dependencies: hdremix and omni_core_materials to `ext-88b4c47-main`
 - Reduced default RTX Remix startup time and dependencies by loading StageCraft-only by default, lazy-loading IngestCraft, service, and MCP extensions/UI only when needed, deferring MCP bind until app ready, disabling MDL discovery on boot, and skipping splash during warmup/headless runs
 - Switched the MCP server default transport from the protocol's legacy SSE transport to Streamable HTTP, moving the endpoint from `http://127.0.0.1:8000/sse` to `http://127.0.0.1:8000/mcp`, and added a `/exts/lightspeed.trex.mcp.core/transport` setting so clients that cannot yet speak Streamable HTTP can opt back into the deprecated `sse` transport
+- Update Remix target dependencies: hdremix and omni_core_materials to `ext-619c639-main`
+- Added a fail-closed Packman review workflow with exact Git/forge scope, immutable checkouts, bounded caller context
+  and synthesis, provider canaries, deadlines, parallel native review, independent verification, lossless host merging,
+  production-primary grouping, and delta-owned findings. Schema-3 Policy-6 reviews score each current base-to-head
+  snapshot from a deterministic complexity pool and one host-mapped claim-class penalty per finding, support
+  display-only comparison and fast exact-snapshot feedback adjudication, retain schema-1/2 posting and follow-up
+  compatibility, and report unavailable measured coverage as a nonfatal gap while leaving enforcement to test or CI
+  coverage reports.
+- Strengthened Remix Review testing rules for unit/UI boundaries, real E2E data, meaningful assertions, and test consolidation while preserving service/API coverage.
+- REMIX-5733: Reduced Stage Manager refresh stalls by culling and preparing interaction items once, reusing published
+  tree data, cooperatively pacing worker work, and safely falling back when custom Prim-name fonts are unavailable.
+- REMIX-5566: Sourced Remix category metadata from the authoritative HdRemix USD schema, displayed `remix_category:decal_Static` as Decal, kept non-Decal categories visible when Decal is absent, disabled assignment when schema data is unavailable without blocking Toolkit, made deprecated decal migration composition-safe on undo, and updated Stage Manager category filtering controls.
+- REMIX-6016: Improved Project Wizard capture discovery and capture activation.
 
 ### Removed
 
@@ -133,6 +148,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - REMIX-5700: Fixed directory file pickers so a highlighted folder can be selected without navigating into it first.
 - REMIX-5919: Fixed captures taken before the Remix config was moved into the `remix` USD namespace rendering with default `rtx.sceneScale` and `rtx.zUp`, which made RTX particles the wrong size and orientation; their config is now republished under the namespaced attribute when the capture loads.
 - Fixed on-demand IngestCraft loading so the ingest tab enables its validator plugin providers before parsing ingestion schemas.
+- REMIX-4575: Fixed Stage Manager action icons collapsing multiselection on selected rows while preserving normal selection when an action is clicked on an unselected row.
+- REMIX-6053: Surfaced RTX Remix renderer startup failures with actionable graphics guidance and retried supported viewport initialization once before requiring restart.
+- REMIX-4777: Decoupled Stage Manager action tests from the Remix viewport renderer, restored context-bound frame requests, and added real delete/restore click plus app-level viewport Delete-key coverage.
+- REMIX-4314: Enabled continuous viewport camera drags with native cursor capture while restoring the prior cursor mode when each drag ends.
+- Fixed Remix Review failing on a failed required CI check and made `remix-review-post-threads` post inline diff threads with Jira-style `BLOCKER`/`P0`/`P1`/`P2` priorities.
 
 ## [1.5.2-0]
 

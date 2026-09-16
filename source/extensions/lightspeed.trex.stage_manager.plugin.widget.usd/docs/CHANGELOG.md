@@ -1,6 +1,18 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [3.1.5]
+### Changed
+- Sourced hidden-category state labels from the authoritative USD schema.
+
+## [3.1.4]
+### Fixed
+- Routed Stage Manager focus actions through a context-bound viewport event without loading the Remix viewport renderer.
+
+## [3.1.3]
+### Changed
+- Migrated actionable Stage Manager row icons to shared gesture ownership and selection validation, preserving multiselection on selected rows, selecting unselected rows before release, and restricting nickname toggles to left-button releases.
+
 ## [3.1.2]
 ### Fixed
 - Kept skeleton remap summaries and viewport focus actions working with Stage Manager proxy rows.

@@ -11,12 +11,14 @@ camera-mutating action is canceled and a warning explains that the capture game 
 ## Responsibilities
 
 - Build and manage shared RTX Remix viewport instances.
+- Consume context-bound frame requests and route them to the matching viewport instance.
 - Host the viewport/Properties pane splitter and keep the Properties pane at least 240 pixels wide.
 - Coordinate viewport layers, tools, statistics, activation, and renderer startup behavior.
 - Host the viewport toolbar tools: Teleport and the Scatter Brush (toolbar toggle, `Ctrl+B`, `B`+wheel radius
   sizing, paint/erase strokes with a surface-following cursor).
 - Let viewport tools claim the mouse wheel before the camera zooms through the mouse-wheel interceptor hook on
   `ViewportEventDelegate`.
+- Retry supported viewport initialization once and report terminal startup failures through an Exit-only dialog.
 - Protect capture game-camera source data while still allowing mutating camera workflows through perspective copies.
 
 ## Non-Responsibilities
@@ -29,6 +31,7 @@ camera-mutating action is canceled and a warning explains that the capture game 
 ## Architecture
 
 - `SetupUI` builds the viewport, Properties pane, and splitter and coordinates their lifecycle.
+- `TrexViewportSharedExtension` routes frame requests by USD context before delegating camera-safe framing to `SetupUI`.
 - `ViewportLayers` owns the registered viewport-layer instances and their ordering.
 - The `scene`, `stats`, and `tools` packages provide the viewport overlays and interactions hosted by `SetupUI`.
 - `ViewportSceneLayer` owns the single `sc.SceneView` and only instantiates the scene factories listed in

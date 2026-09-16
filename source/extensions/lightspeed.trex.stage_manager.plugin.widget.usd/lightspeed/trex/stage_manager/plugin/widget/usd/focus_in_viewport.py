@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING
 
 import carb
 from lightspeed.common import constants
-from lightspeed.trex.viewports.shared.widget import get_active_viewport as _get_active_viewport
-from omni import ui, usd
+from lightspeed.events_manager import get_instance as _get_event_manager_instance
+from omni import usd
 from omni.flux.stage_manager.factory.plugins import StageManagerMenuMixin as _StageManagerMenuMixin
 from omni.flux.stage_manager.plugin.widget.usd.base import (
     StageManagerStateWidgetPlugin as _StageManagerStateWidgetPlugin,
@@ -35,9 +35,18 @@ if TYPE_CHECKING:
     from omni.flux.stage_manager.factory.plugins.tree_plugin import StageManagerTreeModel as _StageManagerTreeModel
 
 
+def _frame_paths_in_viewport(paths: list[str], context_name: str) -> None:
+    """Request framing in the viewport that owns the USD context."""
+    _get_event_manager_instance().call_global_custom_event(
+        constants.GlobalEventNames.VIEWPORT_FRAME_PRIMS_REQUEST.value,
+        paths,
+        context_name,
+    )
+
+
 class FocusInViewportActionWidgetPlugin(_StageManagerStateWidgetPlugin, _StageManagerMenuMixin):
     def build_icon_ui(self, model: "_StageManagerTreeModel", item: "_StageManagerTreeItem", level: int, expanded: bool):
-        # Build the icon
+        """Build the viewport-focus action image for the row."""
         enabled = item.data and UsdGeom.Imageable(item.data)
 
         if enabled:
@@ -47,10 +56,9 @@ class FocusInViewportActionWidgetPlugin(_StageManagerStateWidgetPlugin, _StageMa
             icon = "FrameDisabled"
             tooltip = constants.FOCUS_IN_VIEWPORT_TOOLTIP_DISABLED
 
-        ui.Image(
-            "",
-            width=self._icon_size,
-            height=self._icon_size,
+        self.make_action_image(
+            model=model,
+            item=item,
             name=icon,
             tooltip=tooltip,
             enabled=enabled,
@@ -64,7 +72,7 @@ class FocusInViewportActionWidgetPlugin(_StageManagerStateWidgetPlugin, _StageMa
         if button != 0 or not enabled:
             return
 
-        _get_active_viewport().frame_viewport_selection(self._get_action_paths(model, item))
+        _frame_paths_in_viewport(self._get_action_paths(model, item), self._context_name)
 
     @classmethod
     def _get_menu_items(cls):
@@ -92,11 +100,12 @@ class FocusInViewportActionWidgetPlugin(_StageManagerStateWidgetPlugin, _StageMa
 
     @classmethod
     def _on_frame_on_the_viewport(cls, payload: dict):
-        context = usd.get_context(payload.get("context_name", ""))
+        context_name = payload.get("context_name", "")
+        context = usd.get_context(context_name)
         if not context:
-            carb.log_error(f"Context not found: {payload.get('context_name', '')}")
+            carb.log_error(f"Context not found: {context_name}")
             return
-        _get_active_viewport().frame_viewport_selection(context.get_selection().get_selected_prim_paths())
+        _frame_paths_in_viewport(context.get_selection().get_selected_prim_paths(), context_name)
 
     @classmethod
     def _on_frame_on_the_viewport_enabled_fn(cls, payload: dict):

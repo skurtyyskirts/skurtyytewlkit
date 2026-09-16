@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added the scatter brush toolbar icon and docked the Scatter window next to the Editor in the StageCraft layout (hidden in the other layouts)
 - Added a `cube_textured` ingested asset and its texture set to the example project so the scatter brush's texture assignment can be tested end to end
 
+## [1.30.4]
+### Changed
+- Limited the Stage Manager Categories tab top bar to Search and Additional Filters.
+- Moved Asset State from the Stage Manager filter bar to the Additional Filters menu.
+
+## [1.30.3]
+### Changed
+- Renamed the bundled Stage Manager ancestor policy to `allow_context_ancestors` while preserving the Skeleton
+  interaction's explicit sparse-tree veto.
+
 ## [1.30.2]
 ### Added
 - Added ComfyUI protocol, disconnected-state, and retarget icons and reorganized the TextureCraft layout used by AI Tools around Setup, Workflow, Job Queue, a full-height Job Details column, and Stage Manager submission.

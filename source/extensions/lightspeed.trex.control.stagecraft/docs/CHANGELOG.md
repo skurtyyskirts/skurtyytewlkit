@@ -5,6 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Loaded the Scatter window (lightspeed.trex.scatter.widget) in StageCraft.
 
+## [1.8.7]
+### Added
+- Added shipped-schema regression coverage for Stage Manager context refresh rules and the Skeleton ancestor policy.
+
+## [1.8.6]
+### Added
+- Added app-level coverage for deleting a selected replacement prim with the focused Remix viewport's Delete key.
+
+## [1.8.5]
+### Added
+- Route recent-project capture-selection requests through the existing Project Wizard before opening StageCraft.
+
+### Changed
+- Resolve project-open, new-project, and shutdown decisions as linear async flows instead of callback chains.
+
+## [1.8.4]
+### Added
+- Added Stage Manager E2E coverage for action-button selection behavior on selected and unselected rows.
+
 ## [1.8.3]
 ### Added
 - Added an isolated E2E check for the normal StageCraft-to-Home startup chain.

@@ -15,7 +15,8 @@
 * limitations under the License.
 """
 
+from .unit.categories import TestCategories
 from .unit.schema_loading import TestSchemaLoading
 from .unit.test_plugin import TestPlugin
 
-__all__ = ["TestPlugin", "TestSchemaLoading"]
+__all__ = ["TestCategories", "TestPlugin", "TestSchemaLoading"]

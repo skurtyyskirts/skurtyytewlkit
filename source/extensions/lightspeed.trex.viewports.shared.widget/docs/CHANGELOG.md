@@ -5,6 +5,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Added the Scatter Brush viewport tool (toolbar toggle, Ctrl+B, B+wheel sizing, paint/erase strokes with a surface cursor) and a mouse-wheel interceptor hook on the viewport event delegate.
 
+## [1.8.5]
+### Fixed
+- Routed Stage Manager frame requests to the viewport matching the requested USD context.
+
+## [1.8.4]
+### Fixed
+- Retried supported viewport initialization once and surfaced terminal renderer or viewport startup failures.
+
 ## [1.8.3]
 ### Added
 - Routed unmodified main and numpad Delete key releases from the focused viewport to the selected-asset deletion workflow.
