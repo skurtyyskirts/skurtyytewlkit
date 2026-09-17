@@ -15,7 +15,7 @@
 * limitations under the License.
 """
 
-__all__ = ["TestScatterGizmoTool"]
+__all__ = ["TestScatterGizmoGestures", "TestScatterGizmoTool"]
 
 import contextlib
 import pathlib
@@ -43,6 +43,12 @@ from lightspeed.trex.scatter.core import controller as controller_module
 from lightspeed.trex.scatter.core.constants import CONTAINER_PREFIX
 from lightspeed.trex.viewports.shared.widget.tools import scatter_gizmo as scatter_gizmo_module
 from lightspeed.trex.viewports.shared.widget.tools.scatter_gizmo import ScatterGizmoTool, scatter_gizmo_factory
+from omni.kit.manipulator.transform import (
+    RotateDragGesturePayload,
+    TransformDragGesturePayload,
+    TranslateDragGesturePayload,
+)
+from omni.ui import scene as sc
 from pxr import Gf, Sdf, Usd, UsdGeom, Vt
 
 _CONTEXT_NAME = "scatter_gizmo_unit_test"
@@ -328,3 +334,118 @@ class TestScatterGizmoTool(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertIsInstance(tool, ScatterGizmoTool)
         tool.destroy()
+
+
+class TestScatterGizmoGestures(omni.kit.test.AsyncTestCase):
+    """Covers what each gizmo gesture does with the payload a dispatch hands it.
+
+    A manipulator hands every gesture registered on it whatever payload the dispatch carries, so a gesture sees
+    both the drag of its own handle and dispatches that carry none of the drag's fields. Reading a field off the
+    latter raised in the middle of the user's drag, so both kinds are covered here.
+    """
+
+    def _gesture(self, gesture_type, payload):
+        """Build one of the gizmo's gestures holding the payload a dispatch would hand it."""
+        tool = mock.MagicMock(name="tool")
+        stub = type("_StubbedPayload", (gesture_type,), {"gesture_payload": property(lambda _self: payload)})
+        return stub(tool), tool
+
+    def _translate_drag(self, moved):
+        """The payload the translate arrows send while they are dragged."""
+        payload = mock.MagicMock(spec=TranslateDragGesturePayload)
+        payload.moved = moved
+        return payload
+
+    def _rotate_drag(self, axis, angle):
+        """The payload the rotate rings send while they are dragged."""
+        payload = mock.MagicMock(spec=RotateDragGesturePayload)
+        payload.axis = axis
+        payload.angle = angle
+        return payload
+
+    def _foreign_payloads(self):
+        """The payloads that reach the gestures from anything but a drag of their own handle."""
+        return [
+            mock.MagicMock(spec=sc.AbstractGesture.GesturePayload),
+            mock.MagicMock(spec=TransformDragGesturePayload),
+        ]
+
+    async def test_dragging_the_translate_arrows_moves_the_patch(self):
+        # Arrange
+        gesture, tool = self._gesture(scatter_gizmo_module._TranslateGesture, self._translate_drag([7.0, 0.0, 3.0]))
+
+        # Act
+        gesture.on_began()
+        gesture.on_changed()
+        gesture.on_ended()
+
+        # Assert
+        tool.begin_drag.assert_called_once()
+        tool.end_drag.assert_called_once()
+        self.assertEqual(tool.update_drag.call_args.args[0].ExtractTranslation(), Gf.Vec3d(7.0, 0.0, 3.0))
+
+    async def test_dragging_the_rotate_rings_turns_the_patch(self):
+        # Arrange
+        gesture, tool = self._gesture(scatter_gizmo_module._RotateGesture, self._rotate_drag([0.0, 0.0, 1.0], 90.0))
+
+        # Act
+        gesture.on_began()
+        gesture.on_changed()
+        gesture.on_ended()
+
+        # Assert
+        tool.begin_drag.assert_called_once()
+        tool.end_drag.assert_called_once()
+        turned = tool.update_drag.call_args.args[0].TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+        self.assertTrue((turned - Gf.Vec3d(0.0, 1.0, 0.0)).GetLength() < 1e-6, f"{turned} is not a quarter turn")
+
+    async def test_a_ring_that_is_dragged_edge_on_turns_nothing(self):
+        # Arrange - a ring seen edge on hands the gesture an axis of no length
+        gesture, tool = self._gesture(scatter_gizmo_module._RotateGesture, self._rotate_drag([0.0, 0.0, 0.0], 90.0))
+
+        # Act
+        gesture.on_changed()
+
+        # Assert
+        tool.update_drag.assert_not_called()
+
+    async def test_a_dispatch_that_is_not_a_translate_drag_is_left_alone(self):
+        # Act - these carry none of the fields a move is measured with
+        for payload in self._foreign_payloads():
+            gesture, tool = self._gesture(scatter_gizmo_module._TranslateGesture, payload)
+            gesture.on_began()
+            gesture.on_changed()
+            gesture.on_ended()
+            gesture.on_canceled()
+
+            # Assert
+            tool.begin_drag.assert_not_called()
+            tool.update_drag.assert_not_called()
+            tool.end_drag.assert_not_called()
+            tool.cancel_drag.assert_not_called()
+
+    async def test_a_dispatch_that_is_not_a_rotate_drag_is_left_alone(self):
+        # Act - reading an axis off one of these is what raised in the middle of the user's drag
+        for payload in self._foreign_payloads():
+            gesture, tool = self._gesture(scatter_gizmo_module._RotateGesture, payload)
+            gesture.on_began()
+            gesture.on_changed()
+            gesture.on_ended()
+            gesture.on_canceled()
+
+            # Assert
+            tool.begin_drag.assert_not_called()
+            tool.update_drag.assert_not_called()
+            tool.end_drag.assert_not_called()
+            tool.cancel_drag.assert_not_called()
+
+    async def test_cancelling_a_drag_of_a_handle_puts_the_patch_back(self):
+        # Arrange
+        gesture, tool = self._gesture(scatter_gizmo_module._RotateGesture, self._rotate_drag([0.0, 0.0, 1.0], 20.0))
+
+        # Act
+        gesture.on_began()
+        gesture.on_canceled()
+
+        # Assert
+        tool.cancel_drag.assert_called_once()

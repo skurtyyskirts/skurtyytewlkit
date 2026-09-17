@@ -22,7 +22,7 @@ __all__ = ["ScatterPane"]
 import dataclasses
 import functools
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import Enum
 
 import omni.usd
@@ -36,9 +36,11 @@ from lightspeed.trex.scatter.core import (
     ScaleMode,
     ScatterBrushSettings,
     ScatterMode,
+    ScopeDragSession,
     TargetMode,
     get_scatter_brush_controller,
     instance_count,
+    turn_matrix,
     validated_anchor_prototype,
 )
 from lightspeed.trex.utils.widget import TrexMessageDialog as _TrexMessageDialog
@@ -63,6 +65,13 @@ _LIVE_EDIT_TOOLTIP = (
     "- Select a mesh or an instance to edit what the current preset painted on it\n"
     "- Brush and density settings always apply to the next stroke only, never to what is already painted"
 )
+_TURN_TOOLTIP = (
+    "Degrees the selected scatter has been turned by since it was selected, about the stage axes.\n\n"
+    "- The viewport's rotate rings write these, and typing here turns the selection the same way\n"
+    "- Every placement turns where it stands; the patch is not carried around a pivot\n"
+    "- A new selection has not been turned yet, so these read zero again"
+)
+_TURN_LIMIT = 360.0
 _STATUS_STYLE = "PropertiesPaneSectionTreeItem"
 _STATUS_ERROR_STYLE = "PropertiesPaneSectionTreeItemError"
 # Floods above the default cap can take a while to author and render, so they ask for confirmation first.
@@ -115,6 +124,14 @@ class ScatterPane(_WorkspaceWidget):
         self._controller = get_scatter_brush_controller()
         self._surface_cache = MeshSurfaceCache(self._get_stage)
         self._reapply_driver = ReapplyDriver(self._controller, context_name, self._surface_cache)
+        # The turn fields drive the same move the viewport gizmo does, through a session of their own so that a
+        # drag of a field is one undo step the way a drag of a ring is.
+        self._turn_session = ScopeDragSession(context_name, self._surface_cache)
+        self._turn_at_edit_start: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._turn_fields: list = []
+        # Held as well as the fields: a drag field hands back a bare C++ model once the Python one it was
+        # built with has been collected, which loses both this model's behaviour and its own cleanup.
+        self._turn_models: list = []
         self._syncing = False
         self._in_field_edit = False
         self._instance_warning_key: tuple[TargetMode, str] | None = None
@@ -146,6 +163,7 @@ class ScatterPane(_WorkspaceWidget):
         self._presets_widget: PresetsWidget | None = None
 
         self.__create_ui()
+        self.__refresh_turn_fields()
 
         self._paint_sub = self._paint_model.subscribe_value_changed_fn(
             functools.partial(self._on_mode_toggled, ScatterMode.PAINT)
@@ -158,6 +176,7 @@ class ScatterPane(_WorkspaceWidget):
         self._assets_changed_sub = self._controller.subscribe_assets_changed(self._on_assets_changed)
         self._status_message_sub = self._controller.subscribe_status_message(self._on_status_message)
         self._scope_changed_sub = self._reapply_driver.subscribe_scope_changed(self._on_scope_changed)
+        self._selection_turn_sub = self._controller.subscribe_selection_turn_changed(self._on_selection_turn_changed)
 
     def __create_ui(self):
         settings = self._controller.settings
@@ -263,6 +282,12 @@ class ScatterPane(_WorkspaceWidget):
         with frame:
             with ui.VStack(height=0, spacing=self._SPACING_XS):
                 self.__build_row("Edit Selection Live", _LIVE_EDIT_TOOLTIP, self.__build_live_edit_control)
+                for axis, identifier in enumerate(("scatter_turn_x", "scatter_turn_y", "scatter_turn_z")):
+                    self.__build_row(
+                        f"Turn {'XYZ'[axis]}",
+                        _TURN_TOOLTIP,
+                        functools.partial(self.__build_turn_field, axis, identifier),
+                    )
                 self.__build_float_row(
                     "Vertical Offset",
                     "vertical_offset",
@@ -546,6 +571,98 @@ class ScatterPane(_WorkspaceWidget):
         self.__bind(field_name, model, lambda m: m.as_float, lambda m, value: m.set_value(float(value)), end_edit=True)
         return field
 
+    def __build_turn_field(self, axis: int, identifier: str) -> _FloatBoundedDrag:
+        """Build one of the three fields showing what the selection has been turned by.
+
+        Bound to the turn rather than to a brush setting: a brush setting decides what the next stroke paints, while
+        a turn is an edit to scatter that is already painted, which is why it is not routed through ``__bind``.
+
+        Args:
+            axis: 0, 1 or 2 for X, Y or Z.
+            identifier: Widget identifier used by the tests.
+        """
+        model = _DragValueModel(0.0)
+        field = _FloatBoundedDrag(
+            model=model,
+            min=-_TURN_LIMIT,
+            max=_TURN_LIMIT,
+            step=1.0,
+            hard_min_value=-_TURN_LIMIT,
+            hard_max_value=_TURN_LIMIT,
+            identifier=identifier,
+            tooltip=_TURN_TOOLTIP,
+            enable_batch_edit=False,
+        )
+        self._drag_fields.append(field)
+        self._turn_fields.append(field)
+        self._turn_models.append(model)
+        on_edit = functools.partial(self._on_turn_edited, axis)
+        self._field_subs.append(model.subscribe_value_changed_fn(on_edit))
+        self._field_subs.append(model.subscribe_end_edit_fn(on_edit))
+        self._field_subs.append(model.subscribe_end_edit_fn(self._on_turn_edit_finished))
+        return field
+
+    def _on_turn_edited(self, _axis: int, _model: ui.AbstractValueModel):
+        """Turn the selection to the angles the three fields now hold.
+
+        The move is measured from the turn the selection stood at when this edit opened, so dragging a field is one
+        continuous turn rather than a turn per step, exactly as dragging a ring is.
+
+        Args:
+            _axis: Axis of the field that changed; the turn is read from all three together.
+            _model: Value model that changed; likewise.
+        """
+        if self._syncing:
+            return
+        scope = self._reapply_driver.scope
+        if scope.is_empty:
+            return
+        requested = self.__read_turn_fields()
+        if requested == self._controller.selection_turn(scope):
+            return
+        if not self._turn_session.active:
+            self._turn_at_edit_start = self._controller.selection_turn(scope)
+            if not self._turn_session.begin(scope, self._controller.settings.conform_to_surface):
+                return
+        delta = turn_matrix(self._turn_at_edit_start).GetInverse() * turn_matrix(requested)
+        self._turn_session.update(delta)
+        self._controller.set_selection_turn(scope, requested)
+
+    def _on_turn_edit_finished(self, _model: ui.AbstractValueModel):
+        """Commit the turn the fields dialled in as one undo step."""
+        if self._syncing:
+            return
+        self._turn_session.commit()
+
+    def _on_selection_turn_changed(self, scope: ReapplyScope, turn: tuple):
+        """Show the turn the viewport gizmo has just given the patch this pane is scoped to."""
+        if scope != self._reapply_driver.scope:
+            return
+        self.__write_turn_fields(turn)
+
+    def __read_turn_fields(self) -> tuple[float, float, float]:
+        """Return the X, Y, Z degrees the three turn fields hold."""
+        return tuple(float(model.as_float) for model in self._turn_models)
+
+    def __write_turn_fields(self, turn: Sequence[float]) -> None:
+        """Push a turn into the three fields without treating it as an edit of theirs."""
+        if len(self._turn_models) != 3:
+            return
+        was_syncing, self._syncing = self._syncing, True
+        try:
+            for model, value in zip(self._turn_models, turn):
+                if abs(model.as_float - float(value)) > 1e-9:
+                    model.set_value(float(value))
+        finally:
+            self._syncing = was_syncing
+
+    def __refresh_turn_fields(self) -> None:
+        """Show the turn of whatever is selected now, and grey the fields out when nothing is."""
+        scope = self._reapply_driver.scope
+        self.__write_turn_fields(self._controller.selection_turn(scope))
+        for field in self._turn_fields:
+            field.enabled = not scope.is_empty
+
     def __build_int_field(self, field_name: str, identifier: str, step: int, tooltip: str) -> _IntBoundedDrag:
         low, high = field_bounds(ScatterBrushSettings, field_name)
         model = _DragValueModel(int(getattr(self._controller.settings, field_name)))
@@ -676,6 +793,7 @@ class ScatterPane(_WorkspaceWidget):
             _scope: The new scope; the readout is built from the driver, which also knows the last outcome.
         """
         self.__refresh_live_edit_label()
+        self.__refresh_turn_fields()
 
     def _on_mode_changed(self, mode: ScatterMode):
         """Reflect a controller mode change on the header buttons while the pane is visible.
@@ -743,14 +861,19 @@ class ScatterPane(_WorkspaceWidget):
         if visible:
             self.__push_settings(self._controller.settings, force_instance_warning=True)
             self.__push_mode(self._controller.mode)
+            self.__refresh_turn_fields()
 
     def destroy(self):
         """Commit any open live edit, then release the subscriptions, the surface cache and the child widgets."""
+        if self._turn_session is not None:
+            self._turn_session.commit()
+            self._turn_session = None
         self._settings_changed_sub = None
         self._mode_changed_sub = None
         self._assets_changed_sub = None
         self._status_message_sub = None
         self._scope_changed_sub = None
+        self._selection_turn_sub = None
         self._paint_sub = None
         self._erase_sub = None
         self._field_subs.clear()
@@ -758,6 +881,8 @@ class ScatterPane(_WorkspaceWidget):
         for field in self._drag_fields:
             field.destroy()
         self._drag_fields.clear()
+        self._turn_fields.clear()
+        self._turn_models.clear()
         for frame in self._section_frames:
             frame.destroy()
         self._section_frames.clear()

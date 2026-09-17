@@ -35,6 +35,8 @@ __all__ = [
     "stamp_rng",
     "tangent_basis",
     "to_parent_space_origin",
+    "turn_matrix",
+    "turn_to_degrees",
     "twist_degrees",
     "up_axis_vector",
 ]
@@ -426,6 +428,7 @@ def compose_parent_space_transform(
     asset_up: UpAxis,
     asset_scale_factor: float | None = 1.0,
     yaw_offset: float = 0.0,
+    turn: Gf.Matrix4d | None = None,
 ) -> tuple[Gf.Vec3d, Gf.Vec3f, Gf.Vec3f]:
     """Compute the translate / rotateXYZ / scale ops of one placement in the space of its parent instance.
 
@@ -453,6 +456,10 @@ def compose_parent_space_transform(
             one. None means the asset could not be measured, so the placement keeps its own size.
         yaw_offset: Degrees about the stage up axis to add to the sampled yaw, so a placement the move gizmo turned
             keeps that turn when it is composed again.
+        turn: Whole turn the gizmo or the Scatter window's turn fields gave the placement, in parent space, applied
+            last so that it aims the placement the composed one ends up at. None leaves it unturned. A yaw arrives
+            through ``yaw_offset`` instead and keeps its old place in the chain, so scatter painted before turns
+            were recorded composes to exactly what it did then.
 
     Returns:
         (translate, rotate_xyz_degrees, scale) such that authoring them with xformOpOrder
@@ -491,7 +498,30 @@ def compose_parent_space_transform(
         * Gf.Matrix4d().SetRotate(Gf.Rotation(up, yaw))
         * conform
     )
+    if turn is not None:
+        # Last, and after conform: the gizmo turns a placement that is already standing on its surface, so a turn
+        # kept here has to be applied to the same thing the gizmo applied it to.
+        rotation = rotation * turn
     return position, rotation_to_xyz_degrees(rotation), Gf.Vec3f(scale[0], scale[1], scale[2])
+
+
+def turn_matrix(degrees: Sequence[float]) -> Gf.Matrix4d:
+    """Return the rotation an X, Y, Z turn in degrees stands for, composed in that order.
+
+    The same order ``rotation_to_xyz_degrees`` reads back, so a turn written to the Scatter window's fields and one
+    read out of a gizmo drag mean the same thing.
+    """
+    return (
+        Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), float(degrees[0])))
+        * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.YAxis(), float(degrees[1])))
+        * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.ZAxis(), float(degrees[2])))
+    )
+
+
+def turn_to_degrees(turn: Gf.Matrix4d) -> tuple[float, float, float]:
+    """Return the X, Y, Z degrees a rotation stands for, as ``turn_matrix`` would rebuild it."""
+    degrees = rotation_to_xyz_degrees(turn)
+    return (float(degrees[0]), float(degrees[1]), float(degrees[2]))
 
 
 def twist_degrees(rotation: Gf.Rotation, axis: Gf.Vec3d) -> float:

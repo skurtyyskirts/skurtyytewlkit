@@ -51,6 +51,7 @@ from .materials import asset_source_hash, build_materials_payload, resolve_asset
 from .picking import create_surface_picker
 from .placement import existing_placement_points, generate_flood
 from .presets import PresetStore, get_default_presets_directory
+from .reapply import ReapplyScope
 from .sampling import PaddingIndex, stage_meters_per_unit, stage_up_axis, stamp_rng
 from .settings import (
     RANGE_PAIRS,
@@ -139,11 +140,18 @@ class ScatterBrushController:
         self._up_axis_warned: set[str] = set()
         self._picker_factory: Callable[[object, MeshSurfaceCache], SurfacePicker] | None = None
 
+        # The turn the viewport gizmo and the Scatter window's turn fields have between them put on one patch,
+        # kept with the scope it was put on: a different selection has not been turned, so it reads as none. Held
+        # here because the gizmo and the window resolve their own scope and neither owns the other.
+        self._selection_turn: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._selection_turn_scope: ReapplyScope = ReapplyScope()
+
         self.__on_mode_changed = Event(copy=True)
         self.__on_settings_changed = Event(copy=True)
         self.__on_assets_changed = Event(copy=True)
         self.__on_stroke_committed = Event(copy=True)
         self.__on_status_message = Event(copy=True)
+        self.__on_selection_turn_changed = Event(copy=True)
 
     @property
     def settings(self) -> ScatterBrushSettings:
@@ -527,6 +535,35 @@ class ScatterBrushController:
         """Subscribe to mode changes; the subscription ends when the returned object is released."""
         return EventSubscription(self.__on_mode_changed, fn)
 
+    def selection_turn(self, scope: ReapplyScope) -> tuple[float, float, float]:
+        """Return the X, Y, Z degrees a scope has been turned by so far, or no turn when it is a different scope.
+
+        Args:
+            scope: Placements the caller is about to turn, or is showing the turn of.
+
+        Returns:
+            The turn in degrees, which is ``(0, 0, 0)`` for a scope nothing has turned yet.
+        """
+        return self._selection_turn if scope == self._selection_turn_scope else (0.0, 0.0, 0.0)
+
+    def set_selection_turn(self, scope: ReapplyScope, turn: Sequence[float]) -> None:
+        """Record what a scope has been turned by and tell everyone showing it.
+
+        Args:
+            scope: Placements that were turned.
+            turn: X, Y, Z degrees the scope now stands turned by, measured from where it was when it was selected.
+        """
+        value = (float(turn[0]), float(turn[1]), float(turn[2]))
+        if scope == self._selection_turn_scope and value == self._selection_turn:
+            return
+        self._selection_turn_scope = scope
+        self._selection_turn = value
+        self.__on_selection_turn_changed(scope, value)
+
+    def subscribe_selection_turn_changed(self, fn: Callable[[ReapplyScope, tuple], None]) -> EventSubscription:
+        """Subscribe to the turn a patch has been given; the subscription ends when the returned object is released."""
+        return EventSubscription(self.__on_selection_turn_changed, fn)
+
     def subscribe_settings_changed(self, fn: Callable[[ScatterBrushSettings], None]) -> EventSubscription:
         """Subscribe to settings replacements; the subscription ends when the returned object is released."""
         return EventSubscription(self.__on_settings_changed, fn)
@@ -562,6 +599,7 @@ class ScatterBrushController:
         self.__on_assets_changed = Event(copy=True)
         self.__on_stroke_committed = Event(copy=True)
         self.__on_status_message = Event(copy=True)
+        self.__on_selection_turn_changed = Event(copy=True)
         self._picker_factory = None
 
     def _set_settings(self, settings: ScatterBrushSettings) -> None:

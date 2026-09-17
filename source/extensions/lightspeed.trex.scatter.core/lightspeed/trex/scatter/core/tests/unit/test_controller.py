@@ -39,6 +39,7 @@ from lightspeed.trex.scatter.core.settings import (
     TargetMode,
     UpAxis,
 )
+from lightspeed.trex.scatter.core.reapply import ReapplyScope, ScopeEntry
 from lightspeed.trex.scatter.core.targets import ScatterTarget
 
 _ROCK = "C:/project/assets/ingested/rock.usd"
@@ -1423,3 +1424,88 @@ class TestScatterBrushControllerSingleton(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertIsNone(controller_module._CONTROLLER_INSTANCE)
+
+
+class TestControllerSelectionTurn(omni.kit.test.AsyncTestCase):
+    """The turn a patch has been given is shared state: the viewport gizmo writes it and the Scatter window shows it.
+
+    It is kept with the scope it was given to, because a different selection has not been turned by anything and has
+    to read as untouched rather than inheriting the last patch's angles.
+    """
+
+    async def setUp(self):
+        self._previous = controller_module._CONTROLLER_INSTANCE
+        controller_module._CONTROLLER_INSTANCE = None
+        self._stack = contextlib.ExitStack()
+        self._stack.enter_context(mock.patch.object(ScatterBrushSettings, "save_to_carb"))
+        self._stack.enter_context(
+            mock.patch.object(ScatterBrushSettings, "load_from_carb", return_value=ScatterBrushSettings())
+        )
+        self._stack.enter_context(mock.patch.object(controller_module, "save_assets_to_carb"))
+        self._stack.enter_context(mock.patch.object(controller_module, "load_assets_from_carb", return_value=[]))
+        self.controller = controller_module.get_scatter_brush_controller()
+
+    async def tearDown(self):
+        self.controller.destroy()
+        controller_module._CONTROLLER_INSTANCE = self._previous
+        self._stack.close()
+
+    def _scope(self, name: str) -> ReapplyScope:
+        """A scope over one named container, standing in for one selection."""
+        return ReapplyScope(
+            entries=(
+                ScopeEntry(
+                    prototype_root=Sdf.Path("/RootNode/meshes/mesh_0123456789ABCDEF"),
+                    container_names=(name,),
+                    placement_paths=(Sdf.Path(f"/RootNode/meshes/mesh_0123456789ABCDEF/{name}/s_000000000001"),),
+                ),
+            )
+        )
+
+    async def test_a_scope_nothing_has_turned_reads_as_untouched(self):
+        # Assert
+        self.assertEqual(self.controller.selection_turn(self._scope("grass")), (0.0, 0.0, 0.0))
+
+    async def test_a_turn_is_reported_back_for_the_scope_it_was_given_to(self):
+        # Arrange
+        scope = self._scope("grass")
+
+        # Act
+        self.controller.set_selection_turn(scope, (10.0, 20.0, 30.0))
+
+        # Assert
+        self.assertEqual(self.controller.selection_turn(scope), (10.0, 20.0, 30.0))
+
+    async def test_selecting_something_else_reads_as_untouched_again(self):
+        # Arrange
+        self.controller.set_selection_turn(self._scope("grass"), (10.0, 20.0, 30.0))
+
+        # Assert
+        self.assertEqual(self.controller.selection_turn(self._scope("glass")), (0.0, 0.0, 0.0))
+
+    async def test_subscribers_are_told_which_scope_was_turned_and_by_how_much(self):
+        # Arrange
+        seen = []
+        subscription = self.controller.subscribe_selection_turn_changed(lambda scope, turn: seen.append((scope, turn)))
+        scope = self._scope("grass")
+
+        # Act
+        self.controller.set_selection_turn(scope, (0.0, 0.0, 45.0))
+
+        # Assert
+        self.assertEqual(seen, [(scope, (0.0, 0.0, 45.0))])
+        del subscription
+
+    async def test_setting_the_same_turn_again_tells_nobody(self):
+        # Arrange
+        scope = self._scope("grass")
+        self.controller.set_selection_turn(scope, (0.0, 0.0, 45.0))
+        seen = []
+        subscription = self.controller.subscribe_selection_turn_changed(lambda *args: seen.append(args))
+
+        # Act
+        self.controller.set_selection_turn(scope, (0.0, 0.0, 45.0))
+
+        # Assert
+        self.assertEqual(seen, [])
+        del subscription

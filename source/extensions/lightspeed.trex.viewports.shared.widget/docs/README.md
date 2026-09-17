@@ -61,3 +61,13 @@ the Size range in the Scatter window does.
 
 Every step of a drag is measured from the state captured when the gesture began, rather than from the step before
 it, so a long drag cannot accumulate the error of every frame along the way.
+
+The brush's Conform to Surface setting is passed into every move, because it decides whether a slide may turn the
+patch onto the ground it lands on.
+
+The rotate rings aim the patch rather than carrying it around: the gesture sends its rotation on its own, with no
+pivot, and `move_scope` turns every placement where it stands. The handle still sits on the middle of the patch,
+because that is what the rings are drawn around, but nothing about that point moves a placement. Sandwiching the
+rotation between translations to and from the handle — a rigid-body turn — swung the far side of a patch up into the
+air on any ring but the one about the surface normal, and re-planting it afterwards dropped it elsewhere on the
+mesh.

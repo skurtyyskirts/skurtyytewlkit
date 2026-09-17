@@ -23,33 +23,35 @@ from typing import TYPE_CHECKING, Any
 
 import carb
 import carb.settings
-import omni.kit.commands
 import omni.usd
 from lightspeed.trex.scatter.core import (
     MeshSurfaceCache,
     ReapplyScope,
     ScatterMode,
-    author_placement_transforms,
+    ScopeDragSession,
     get_scatter_brush_controller,
-    move_scope,
     resolve_scope,
     scope_pivot,
+    turn_matrix,
+    turn_to_degrees,
 )
-from omni.flux.utils.common.interactive_usd_notices import begin_interaction, end_interaction
 from omni.kit.manipulator.transform import (
     Axis,
     Operation,
     RotateChangedGesture,
+    RotateDragGesturePayload,
     SimpleTransformModel,
+    TransformDragGesturePayload,
     TransformManipulator,
     TranslateChangedGesture,
+    TranslateDragGesturePayload,
 )
-from pxr import Gf, Sdf, Usd
+from pxr import Gf, Usd
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from lightspeed.trex.scatter.core import MoveOutcome, PlacementTransform
+    from lightspeed.trex.scatter.core import MoveOutcome
     from omni.kit.widget.viewport.api import ViewportAPI
 
 _LOG_PREFIX = "[lightspeed.trex.viewports.shared.widget]"
@@ -102,10 +104,10 @@ class ScatterGizmoTool:
         self._controller = get_scatter_brush_controller()
         self._cache: MeshSurfaceCache | None = MeshSurfaceCache(self._stage)
 
-        self._layer: Sdf.Layer | None = None
-        self._interaction_token = None
-        self._start: list[PlacementTransform] = []
-        self._moved: list[PlacementTransform] = []
+        self._session = ScopeDragSession(self._usd_context_name, self._cache)
+        # The turn the patch already stood at when this drag opened, so consecutive drags add up rather than each
+        # one starting the patch over at no turn.
+        self._turn_at_start = Gf.Matrix4d(1.0)
         self._pivot = Gf.Vec3d(0.0, 0.0, 0.0)
 
         self._model = SimpleTransformModel()
@@ -190,55 +192,35 @@ class ScatterGizmoTool:
 
     def begin_drag(self) -> None:
         """Take the patch as it stands, so every step of the drag is measured from there rather than from the last."""
-        stage = self._stage()
-        if stage is None or self._scope.is_empty:
-            return
-        self._layer = stage.GetEditTarget().GetLayer()
-        self._start, _after, _outcome = move_scope(
-            stage, self._layer, self._scope, Gf.Matrix4d(1.0), self._cache
-        )
-        self._moved = []
-        self._interaction_token = begin_interaction(stage)
+        if self._session.begin(self._scope, self._conform):
+            self._turn_at_start = turn_matrix(self._controller.selection_turn(self._scope))
 
     def update_drag(self, delta: Gf.Matrix4d) -> None:
-        """Move the patch to where a drag of ``delta`` from the start of the gesture would put it.
-
-        The patch is rewound to its starting state first, so ``delta`` is always measured against the same thing and
-        a long drag cannot accumulate the error of every frame before it.
-        """
-        stage = self._stage()
-        if stage is None or self._interaction_token is None:
-            return
-        author_placement_transforms(self._layer, self._start)
-        _before, after, outcome = move_scope(stage, self._layer, self._scope, delta, self._cache)
-        author_placement_transforms(self._layer, after)
-        self._moved = after
-        self._report(outcome)
+        """Move the patch to where a drag of ``delta`` from the start of the gesture would put it."""
+        self._report(self._session.update(delta))
+        self._publish_turn(delta)
 
     def end_drag(self) -> None:
         """Commit the drag as one undoable move and put the gizmo back on the patch where it now sits."""
-        token, self._interaction_token = self._interaction_token, None
-        if token is not None:
-            end_interaction(token)
-        if self._moved:
-            omni.kit.commands.execute(
-                "ScatterReapplyCommand",
-                context_name=self._usd_context_name,
-                layer_identifier=self._layer.identifier,
-                before=[transform.to_dict() for transform in self._start],
-                after=[transform.to_dict() for transform in self._moved],
-                already_applied=True,
-            )
-        self._start = []
-        self._moved = []
+        self._session.commit()
         self.refresh()
 
     def cancel_drag(self) -> None:
         """Put the patch back as it was and close the drag without committing anything."""
-        if self._interaction_token is not None and self._start:
-            author_placement_transforms(self._layer, self._start)
-        self._moved = []
-        self.end_drag()
+        self._session.cancel()
+        self._controller.set_selection_turn(self._scope, turn_to_degrees(self._turn_at_start))
+        self.refresh()
+
+    def _publish_turn(self, delta: Gf.Matrix4d) -> None:
+        """Tell the Scatter window's turn fields where this drag has aimed the patch.
+
+        Only the rotation of the drag is reported, so sliding a patch leaves the turn it already stands at alone.
+        """
+        rotation = delta.ExtractRotation()
+        if abs(rotation.GetAngle()) < 1e-9:
+            return
+        total = self._turn_at_start * Gf.Matrix4d().SetRotate(rotation)
+        self._controller.set_selection_turn(self._scope, turn_to_degrees(total))
 
     def destroy(self):
         """Close any drag and drop every subscription and scene item."""
@@ -253,6 +235,11 @@ class ScatterGizmoTool:
             self._manipulator.enabled = False
         self._manipulator = None
         self._model = None
+
+    @property
+    def _conform(self) -> bool:
+        """Whether the brush is set to conform to the surface, which decides if a slide may re-aim the patch."""
+        return self._controller.settings.conform_to_surface
 
     def _stage(self) -> Usd.Stage | None:
         """Return the stage of the gizmo's USD context, or None when there is none."""
@@ -273,59 +260,72 @@ class ScatterGizmoTool:
             carb.log_info(f"{_LOG_PREFIX} Scatter move: {notes}")
 
 
-class _TranslateGesture(TranslateChangedGesture):
-    """Turns a drag of the translate arrows into a move of the whole patch."""
+class _PatchGesture:
+    """What the gizmo's two gestures have in common: one drag of one handle.
+
+    A manipulator hands every gesture registered on it whatever payload the dispatch carries, and only the drag of
+    the handle a gesture stands for carries the fields saying how far it was dragged. The toolbar's own gesture and
+    the scene's dispatches carry a plain payload instead, which would otherwise be read for a distance it does not
+    hold, or start a drag the user never made. Each handler therefore acts only on its own kind of drag.
+    """
+
+    _PAYLOAD_TYPE: type = TransformDragGesturePayload
 
     def __init__(self, tool: ScatterGizmoTool):
         super().__init__()
         self._tool = tool
 
+    def _drag_payload(self) -> Any | None:
+        """Return the payload of this gesture's own drag, or None when the dispatch is something else."""
+        payload = self.gesture_payload
+        return payload if isinstance(payload, self._PAYLOAD_TYPE) else None
+
     def on_began(self):
-        """Start the move."""
-        self._tool.begin_drag()
+        """Start the drag."""
+        if self._drag_payload() is not None:
+            self._tool.begin_drag()
+
+    def on_ended(self):
+        """Commit the drag."""
+        if self._drag_payload() is not None:
+            self._tool.end_drag()
+
+    def on_canceled(self):
+        """Put the patch back."""
+        if self._drag_payload() is not None:
+            self._tool.cancel_drag()
+
+
+class _TranslateGesture(_PatchGesture, TranslateChangedGesture):
+    """Turns a drag of the translate arrows into a move of the whole patch."""
+
+    _PAYLOAD_TYPE = TranslateDragGesturePayload
 
     def on_changed(self):
         """Move the patch to the total distance dragged so far."""
-        moved = self.gesture_payload.moved
+        payload = self._drag_payload()
+        if payload is None:
+            return
+        moved = payload.moved
         self._tool.update_drag(Gf.Matrix4d().SetTranslate(Gf.Vec3d(moved[0], moved[1], moved[2])))
 
-    def on_ended(self):
-        """Commit the move."""
-        self._tool.end_drag()
 
-    def on_canceled(self):
-        """Put the patch back."""
-        self._tool.cancel_drag()
+class _RotateGesture(_PatchGesture, RotateChangedGesture):
+    """Turns a drag of the rotate rings into a turn of every placement of the patch where it stands."""
 
-
-class _RotateGesture(RotateChangedGesture):
-    """Turns a drag of the rotate rings into a turn of the whole patch about the gizmo pivot."""
-
-    def __init__(self, tool: ScatterGizmoTool):
-        super().__init__()
-        self._tool = tool
-
-    def on_began(self):
-        """Start the turn."""
-        self._tool.begin_drag()
+    _PAYLOAD_TYPE = RotateDragGesturePayload
 
     def on_changed(self):
-        """Turn the patch by the total angle dragged so far, about the axis the ring stands for."""
-        payload = self.gesture_payload
+        """Aim the patch by the total angle dragged so far, about the axis the ring stands for.
+
+        The rotation is sent on its own, with no pivot: ``move_scope`` turns each placement where it stands, so
+        sandwiching it between translations to and from the handle would only claim a movement it does not make.
+        The handle itself still sits on the middle of the patch, which is what the rings are drawn around.
+        """
+        payload = self._drag_payload()
+        if payload is None:
+            return
         axis = Gf.Vec3d(payload.axis[0], payload.axis[1], payload.axis[2])
         if axis.GetLength() < 1e-9:
             return
-        pivot = self._tool.pivot
-        self._tool.update_drag(
-            Gf.Matrix4d().SetTranslate(-pivot)
-            * Gf.Matrix4d().SetRotate(Gf.Rotation(axis, payload.angle))
-            * Gf.Matrix4d().SetTranslate(pivot)
-        )
-
-    def on_ended(self):
-        """Commit the turn."""
-        self._tool.end_drag()
-
-    def on_canceled(self):
-        """Put the patch back."""
-        self._tool.cancel_drag()
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(axis, payload.angle)))

@@ -52,6 +52,7 @@ __all__ = [
     "ScatterStrokeKind",
     "ScatterTarget",
     "ScatterTextureSet",
+    "ScopeDragSession",
     "ScopeEntry",
     "StrokeSession",
     "SurfaceHit",
@@ -74,6 +75,7 @@ __all__ = [
     "camera_ray_from_ndc",
     "canonical_instance",
     "changed_reappliable_fields",
+    "changed_recompose_assets",
     "choose_asset",
     "closest_point_on_triangles",
     "closest_points",
@@ -111,6 +113,7 @@ __all__ = [
     "read_asset_up_axis",
     "read_authored_asset_up_axis",
     "read_placement_origin",
+    "read_placement_turn",
     "read_placement_yaw",
     "reapply_transforms",
     "remove_placements",
@@ -134,6 +137,8 @@ __all__ = [
     "to_parent_space_origin",
     "transform_key",
     "triangulate_faces",
+    "turn_matrix",
+    "turn_to_degrees",
     "twist_degrees",
     "up_axis_vector",
     "validated_anchor_prototype",
@@ -203,7 +208,7 @@ from .placement import (
     snapshot_prims,
     transform_key,
 )
-from .move import MoveOutcome, move_scope, scope_pivot
+from .move import MoveOutcome, ScopeDragSession, move_scope, scope_pivot
 from .presets import PresetStore, get_default_presets_directory
 from .reapply import (
     ReapplyDriver,
@@ -211,9 +216,11 @@ from .reapply import (
     ReapplyScope,
     ScopeEntry,
     changed_reappliable_fields,
+    changed_recompose_assets,
     is_hand_edited,
     reapply_transforms,
     read_placement_origin,
+    read_placement_turn,
     read_placement_yaw,
     resolve_scope,
 )
@@ -235,6 +242,8 @@ from .sampling import (
     stamp_rng,
     tangent_basis,
     to_parent_space_origin,
+    turn_matrix,
+    turn_to_degrees,
     twist_degrees,
     up_axis_vector,
 )

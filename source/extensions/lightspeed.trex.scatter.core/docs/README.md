@@ -27,9 +27,9 @@ presets. It has no UI.
   (`ScatterStrokeCommand`, `ScatterFloodCommand`)
 - Run the stroke state machine (`StrokeSession`) and expose the shared brush state and events through
   `ScatterBrushController`
-- Re-apply placement, scale and seed settings to scatter that already exists (`reapply.py`): resolve the selection
-  into the placements an edit may write to, recompose them under the new settings, and commit one
-  `ScatterReapplyCommand` per edit
+- Re-apply placement, scale and seed settings, and the palette's up axis and measurements, to scatter that already
+  exists (`reapply.py`): resolve the selection into the placements an edit may write to, recompose them under the new
+  settings, and commit one `ScatterReapplyCommand` per edit
 - Move that same selection by a world-space delta and settle it back onto the surface (`move.py`), which is what the
   viewport's scatter move gizmo drags
 
@@ -108,15 +108,43 @@ the prim budget this changes how an edit is paced, never whether it is allowed.
 brush settings**. Recomposing would make a drag apply whatever size and rotation ranges are in the Scatter window at
 the time, so moving a patch could silently resize it; a move moves.
 
-Each placement's recorded surface is carried through the drag, projected back onto the target's capture mesh, and the
-rotation that takes the old normal to the new one is applied along with the drag's own. That is what makes a patch
-slide along the ground and tilt onto a slope instead of floating. How far a placement looks for the surface is the
-size of the mesh it belongs to, so lifting a patch settles it back down and sliding it past the edge stops it at the
-edge, while geometry it was not painted on is never searched.
+The gizmo's arrows and its rings are separate gestures, so a drag is either a slide or a turn, and a move treats the
+two differently.
+
+A slide carries each placement's recorded surface through the drag and projects it back onto the target's capture
+mesh, so a patch slides along the ground instead of floating, and applies the rotation that takes the old normal to
+the new one, which is what tilts it onto a slope. That rotation is applied only when `conform_to_surface` is on, so a
+patch the brush was told to stand straight up is not tipped over by the ground it is slid across. How far a placement
+looks for the surface is the size of the mesh it belongs to, so lifting a patch settles it back down and sliding it
+past the edge stops it at the edge, while geometry it was not painted on is never searched.
+
+A turn aims each placement where it stands. Its position and the surface it recorded are left exactly as they are and
+only its rotation changes, which is why the rings behave like a trackball on the patch rather than a carousel. The
+rotation is applied about the recorded surface point, so a blade pivots where it meets the ground. Carrying the
+placements around the gizmo instead — the obvious reading of a rigid-body turn — swings the far side of a patch up
+into the air on any ring but the one about the surface normal, and re-planting them afterwards then drops them
+somewhere else on the mesh, so a turn became a move nobody asked for.
+
+The rings send a world rotation, and everything a placement holds is in the space of the instance that parents it, so
+`move_scope` carries the rotation into that space before applying it. A capture's instances stand at whatever angle the
+game left them at; applied as if an instance stood square to the stage, a ring aims the patch about some other axis
+than the one being dragged, which on a tilted instance leaves the ring about the stage up axis doing nothing at all
+while the other two tip the patch flat.
 
 A recomposition later reproduces the position and, through conform-to-surface, the settling; it cannot reproduce the
-turn, so placements accumulate `remixScatterYaw`, which `compose_parent_space_transform` adds to the yaw it samples.
-With `conform_to_surface` off the settling is not reproduced either, because there is no conform term to carry it.
+turn, so placements record it. `remixScatterTurn` holds the whole turn as X, Y, Z degrees in parent space and
+`compose_parent_space_transform` applies it last, after conform, which is what the gizmo applied it to. The older
+`remixScatterYaw` keeps its own meaning and its own place in the composition — added to the yaw that is sampled,
+before conform — so scatter painted before turns were recorded composes to exactly what it always did; a move no
+longer adds to it. With `conform_to_surface` off the settling is not reproduced either, because there is no conform
+term to carry it.
+
+`ScopeDragSession` holds the lifecycle of one drag: it takes the patch as it stands, measures every update from there
+rather than from the last one, and commits the whole drag as a single `ScatterReapplyCommand`. The viewport gizmo and
+the Scatter window's Turn fields are two ways of doing the same thing and share it. The turn a patch has been given
+since it was selected lives on the controller (`selection_turn`, `set_selection_turn`,
+`subscribe_selection_turn_changed`), kept with the scope it was given to so that a different selection reads as
+untouched; that is what lets the gizmo and the window show and drive the same turn while each resolves its own scope.
 
 A placement whose transform no longer matches its checksum was moved by hand and is left alone. One with no recorded
 origin was painted before the brush recorded surfaces: it is projected back onto its capture mesh, which also removes
@@ -167,7 +195,9 @@ its rotation and scale are drawn afresh.
   says so in the palette tooltip
 - The palette's up axis is read from the asset once, when it is added, and can be overridden by hand; it is never
   re-derived afterwards. A wrong value scatters the asset on its side and skews Absolute Size, so a disagreement
-  with the file is reported at the start of a stroke
+  with the file is reported at the start of a stroke. Correcting it, or an asset's measurements landing, re-applies
+  to the selected placements live, the way a brush setting does; adding, removing, re-weighting or re-texturing a
+  palette entry does not, because none of those change a placement that is already painted
 - `prim_budget` only classifies a stroke for reporting. Nothing in this extension caps, trims or stops a paint
   stroke: `flood_max_instances` bounds a flood, but a stroke's length is bounded only by `padding`, which stops
   governing it at all when set to 0
@@ -178,9 +208,14 @@ its rotation and scale are drawn afresh.
   stroke segment at the new sample instead of stamping the whole jump
 - Texture assignment happens when a placement is authored, so it does not reach placements that were already painted;
   erase and repaint them, or assign the textures through the Texture Replacements surface, which lists scatter shaders
-- A move never re-derives a patch: it will not resize, re-seed or re-rotate it from the current settings, and a patch
-  dragged with `conform_to_surface` off keeps the settling of the drag itself but will lose it if the patch is later
-  recomposed, because nothing reproduces it
+- A move never re-derives a patch: it will not resize, re-seed or re-rotate it from the current settings. The one
+  setting it reads is `conform_to_surface`, which decides only whether a slide may turn a placement onto the surface
+  it lands on
+- A turn never moves a placement, so the rotate rings cannot be used to swing a patch around its middle; painting it
+  where it belongs, or sliding it with the arrows, is what places a patch
+- A turn the gizmo applies survives further moves but not a recomposition: only the yaw about the stage up axis is
+  recorded, so a settings change puts a tilt back onto the surface. The palette's up axis, not the gizmo, is where an
+  asset that is permanently mis-oriented is corrected
 - Only placement, scale and seed settings re-apply to placements that already exist. The brush and density settings
   (radius, density, strength, spacing, padding) decide where stamps land, which depends on the mouse path a stroke
   followed; that path is not recorded, so changing them affects the next stroke only

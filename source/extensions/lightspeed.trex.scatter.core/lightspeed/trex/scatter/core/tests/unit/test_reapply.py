@@ -33,6 +33,7 @@ from lightspeed.trex.scatter.core.reapply import (
     ReapplyScope,
     ScopeEntry,
     changed_reappliable_fields,
+    changed_recompose_assets,
     reapply_transforms,
     resolve_scope,
 )
@@ -441,6 +442,68 @@ class TestReapplyHelpers(omni.kit.test.AsyncTestCase):
 
         # Act
         changed = changed_reappliable_fields(previous, previous.model_copy(update={"radius": 123.0}))
+
+        # Assert
+        self.assertEqual(changed, set())
+
+    async def test_changed_recompose_assets_reports_an_up_axis_change(self):
+        # Arrange
+        entry = _asset()
+
+        # Act
+        changed = changed_recompose_assets([entry], [entry.model_copy(update={"up_axis": UpAxis.Y})])
+
+        # Assert
+        self.assertEqual(changed, {_ASSET_PATH})
+
+    async def test_changed_recompose_assets_reports_a_measurement_landing(self):
+        # Arrange
+        entry = _asset().model_copy(update={"natural_extent": (0.0, 0.0, 0.0)})
+
+        # Act
+        changed = changed_recompose_assets([entry], [entry.model_copy(update={"natural_extent": (1.0, 1.0, 2.0)})])
+
+        # Assert
+        self.assertEqual(changed, {_ASSET_PATH})
+
+    async def test_changed_recompose_assets_ignores_a_texture_change(self):
+        # Arrange
+        entry = _asset()
+
+        # Act
+        changed = changed_recompose_assets(
+            [entry], [entry.model_copy(update={"texture_source": "C:/assets/blade_albedo.png"})]
+        )
+
+        # Assert
+        self.assertEqual(changed, set())
+
+    async def test_changed_recompose_assets_ignores_a_weight_change(self):
+        # Arrange
+        entry = _asset()
+
+        # Act
+        changed = changed_recompose_assets([entry], [entry.model_copy(update={"weight": 9.0})])
+
+        # Assert
+        self.assertEqual(changed, set())
+
+    async def test_changed_recompose_assets_ignores_an_asset_being_added_to_the_palette(self):
+        # Arrange - a placement references its own file, so a palette gaining an entry cannot alter one
+        entry = _asset()
+
+        # Act
+        changed = changed_recompose_assets([entry], [entry, entry.model_copy(update={"path": "C:/assets/rock.usda"})])
+
+        # Assert
+        self.assertEqual(changed, set())
+
+    async def test_changed_recompose_assets_ignores_an_asset_being_removed_from_the_palette(self):
+        # Arrange
+        entry = _asset()
+
+        # Act
+        changed = changed_recompose_assets([entry], [])
 
         # Assert
         self.assertEqual(changed, set())

@@ -20,7 +20,7 @@ from .e2e.test_widget import TestSharedViewportWidget
 from .unit.test_delegate import TestMouseWheelInterceptors, TestViewportEventDelegate
 from .unit.test_layers import TestViewportLayersFactorySkip
 from .unit.test_scatter_brush import TestBrushCursorMatrix, TestScatterBrushButtonGroup, TestScatterBrushTool
-from .unit.test_scatter_gizmo import TestScatterGizmoTool
+from .unit.test_scatter_gizmo import TestScatterGizmoGestures, TestScatterGizmoTool
 from .unit.test_setup_ui import TestSetupUI, TestSetupUIGameCameraBoundary
 from .unit.test_stats import TestViewportStatisticFading
 
@@ -30,6 +30,7 @@ __all__ = [
     "TestScatterBrushButtonGroup",
     "TestScatterBrushTool",
     "TestScatterBrushViewportE2E",
+    "TestScatterGizmoGestures",
     "TestScatterGizmoTool",
     "TestSetupUI",
     "TestSetupUIGameCameraBoundary",

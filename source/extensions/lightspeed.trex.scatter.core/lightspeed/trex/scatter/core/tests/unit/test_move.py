@@ -16,14 +16,21 @@
 """
 
 import omni.kit.test
-from lightspeed.trex.scatter.core.constants import SCATTER_ORIGIN_ATTR, SCATTER_TRANSFORM_KEY_ATTR, SCATTER_YAW_ATTR
+from lightspeed.trex.scatter.core.constants import (
+    SCATTER_ORIGIN_ATTR,
+    SCATTER_TRANSFORM_KEY_ATTR,
+    SCATTER_TURN_ATTR,
+    SCATTER_YAW_ATTR,
+)
 from lightspeed.trex.scatter.core.move import MoveOutcome, move_scope, scope_pivot
+from lightspeed.trex.scatter.core.sampling import turn_matrix, turn_to_degrees
 from lightspeed.trex.scatter.core.placement import author_placement_transforms
 from lightspeed.trex.scatter.core.reapply import reapply_transforms
 from lightspeed.trex.scatter.core.sampling import twist_degrees
-from pxr import Gf, Sdf
+from lightspeed.trex.scatter.core.targets import build_prototype_target
+from pxr import Gf, Sdf, UsdGeom
 
-from .test_reapply import _ScatterStageTestCase, _asset, _scope_of, _settings
+from .test_reapply import _INSTANCE_ROOT, _PROTOTYPE_ROOT, _ScatterStageTestCase, _asset, _scope_of, _settings
 
 _PARENT_OFFSET_X = 100.0
 
@@ -40,6 +47,23 @@ def _yaw(degrees: float, pivot: Gf.Vec3d) -> Gf.Matrix4d:
     return to_origin * spin * Gf.Matrix4d().SetTranslate(pivot)
 
 
+def _tilt(degrees: float, pivot: Gf.Vec3d) -> Gf.Matrix4d:
+    """A drag that tips the patch over about the world X axis through a pivot."""
+    to_origin = Gf.Matrix4d().SetTranslate(-pivot)
+    tip = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), degrees))
+    return to_origin * tip * Gf.Matrix4d().SetTranslate(pivot)
+
+
+def _up_of(rotate_xyz) -> Gf.Vec3d:
+    """The direction a placement's own up axis points once the rotateXYZ it authors is applied."""
+    rotation = (
+        Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), rotate_xyz[0]))
+        * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.YAxis(), rotate_xyz[1]))
+        * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.ZAxis(), rotate_xyz[2]))
+    )
+    return rotation.TransformDir(Gf.Vec3d.ZAxis()).GetNormalized()
+
+
 class _MoveTestCase(_ScatterStageTestCase):
     """The two-patch scatter stage, with helpers for reading and driving a gizmo drag."""
 
@@ -52,11 +76,21 @@ class _MoveTestCase(_ScatterStageTestCase):
         attribute = self.layer.GetPrimAtPath(Sdf.Path(path)).attributes.get(name)
         return None if attribute is None else attribute.default
 
-    def drag(self, delta: Gf.Matrix4d, paths: list[str]) -> MoveOutcome:
+    def drag(self, delta: Gf.Matrix4d, paths: list[str], conform: bool = True) -> MoveOutcome:
         """Move the placements by a delta and author the result, as a gizmo drag does."""
-        _before, after, outcome = move_scope(self.stage, self.layer, _scope_of(paths), delta, self.cache)
+        _before, after, outcome = move_scope(
+            self.stage, self.layer, _scope_of(paths), delta, self.cache, conform=conform
+        )
         author_placement_transforms(self.layer, after)
         return outcome
+
+    def record_surface_normal(self, path: str, normal: Gf.Vec3d) -> None:
+        """Rewrite the normal of the surface a placement recorded, leaving its point and its heading alone."""
+        spec = self.layer.GetPrimAtPath(Sdf.Path(path))
+        unit = normal.GetNormalized()
+        values = list(spec.attributes[SCATTER_ORIGIN_ATTR].default)
+        values[3:6] = [unit[0], unit[1], unit[2]]
+        spec.attributes[SCATTER_ORIGIN_ATTR].default = values
 
 
 class TestScopePivot(_MoveTestCase):
@@ -126,7 +160,7 @@ class TestMoveScope(_MoveTestCase):
         # Assert
         self.assertEqual([self.authored(path)[2] for path in self.grass], before)
 
-    async def test_turning_the_patch_orbits_its_placements_about_the_pivot(self):
+    async def test_turning_the_patch_leaves_every_placement_where_it_stands(self):
         # Arrange
         pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
         before = self.positions(self.grass)
@@ -134,12 +168,8 @@ class TestMoveScope(_MoveTestCase):
         # Act
         self.drag(_yaw(90.0, pivot), self.grass)
 
-        # Assert - a rigid turn keeps every distance to the pivot, in the parent space the ops are authored in
-        local_pivot = Gf.Vec3d(pivot[0] - _PARENT_OFFSET_X, pivot[1], pivot[2])
-        radius = [Gf.Vec3d(*p) - local_pivot for p in before]
-        turned = [Gf.Vec3d(*p) - local_pivot for p in self.positions(self.grass)]
-        for old, new in zip(radius, turned):
-            self.assertAlmostEqual(old.GetLength(), new.GetLength(), places=4)
+        # Assert - a turn aims the patch where it is; it does not carry it around the gizmo
+        self.assertEqual(self.positions(self.grass), before)
 
     async def test_turning_the_patch_records_the_turn_so_a_later_settings_change_keeps_it(self):
         # Arrange
@@ -148,9 +178,9 @@ class TestMoveScope(_MoveTestCase):
         # Act
         self.drag(_yaw(90.0, pivot), self.grass)
 
-        # Assert
-        recorded = [self.attribute(path, SCATTER_YAW_ATTR) for path in self.grass]
-        self.assertTrue(all(abs(value - 90.0) < 1e-4 for value in recorded))
+        # Assert - recorded as a whole turn, so a tilt survives the recompose as well as a yaw does
+        recorded = [self.attribute(path, SCATTER_TURN_ATTR) for path in self.grass]
+        self.assertTrue(all(abs(value[2] - 90.0) < 1e-4 for value in recorded), recorded)
 
     async def test_a_settings_change_after_a_turn_leaves_the_patch_turned(self):
         # Arrange
@@ -163,6 +193,63 @@ class TestMoveScope(_MoveTestCase):
 
         # Assert
         self.assertEqual([self.authored(path)[1] for path in self.grass], turned)
+
+    async def test_tipping_the_patch_leaves_its_placements_tipped(self):
+        # Arrange
+        pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
+
+        # Act
+        self.drag(_tilt(90.0, pivot), self.grass)
+
+        # Assert - a quarter turn about X lays every placement's up axis flat instead of standing it back up
+        ups = [_up_of(self.authored(path)[1]) for path in self.grass]
+        self.assertTrue(all(abs(up[2]) < 1e-4 for up in ups), [tuple(up) for up in ups])
+
+    async def test_tipping_the_patch_leaves_every_placement_on_the_ground_where_it_stands(self):
+        # Arrange
+        pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
+        before = self.positions(self.grass)
+
+        # Act
+        self.drag(_tilt(90.0, pivot), self.grass)
+
+        # Assert - orbiting the gizmo would swing the far side of the patch up into the air and drop it elsewhere
+        self.assertEqual(self.positions(self.grass), before)
+
+    async def test_turning_the_patch_leaves_the_surface_each_placement_recorded_alone(self):
+        # Arrange
+        pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
+        before = [tuple(self.attribute(path, SCATTER_ORIGIN_ATTR))[:6] for path in self.grass]
+
+        # Act
+        self.drag(_tilt(45.0, pivot), self.grass)
+
+        # Assert - nothing was projected, so the ground each placement stands on is the one it already recorded
+        self.assertEqual([tuple(self.attribute(path, SCATTER_ORIGIN_ATTR))[:6] for path in self.grass], before)
+
+    async def test_sliding_a_patch_with_conform_off_leaves_its_placements_pointing_where_they_were(self):
+        # Arrange - it recorded a sloped surface, so conforming it to the flat quad would turn it
+        sloped = self.grass[0]
+        self.record_surface_normal(sloped, Gf.Vec3d(0.0, 0.6, 0.8))
+        before = self.authored(sloped)[1]
+
+        # Act
+        self.drag(_translate(30.0, 0.0, 0.0), [sloped], conform=False)
+
+        # Assert
+        self.assertEqual(self.authored(sloped)[1], before)
+
+    async def test_sliding_a_patch_with_conform_on_turns_its_placements_onto_the_surface_they_land_on(self):
+        # Arrange
+        sloped = self.grass[0]
+        self.record_surface_normal(sloped, Gf.Vec3d(0.0, 0.6, 0.8))
+        before = self.authored(sloped)[1]
+
+        # Act
+        self.drag(_translate(30.0, 0.0, 0.0), [sloped], conform=True)
+
+        # Assert
+        self.assertNotEqual(self.authored(sloped)[1], before)
 
     async def test_dragging_moves_the_recorded_surface_with_the_placement(self):
         # Arrange
@@ -364,3 +451,127 @@ class TestMoveAndReapplyTogether(_MoveTestCase):
 
         # Assert
         self.assertEqual(self.positions(self.grass), dragged)
+
+
+class TestTurningUnderARotatedInstance(_MoveTestCase):
+    """A turn must aim every placement about the axis of the ring the user grabbed.
+
+    A capture's instances stand at whatever angle the game left them at, while a placement's transform and the
+    surface it recorded are held in that instance's space. The rings send a world rotation, so it has to be carried
+    into that space before it is applied. Applied as if the instance stood square to the stage, it aims the patch
+    about some other axis: the ring the user drags tips the grass over, or does nothing at all.
+    """
+
+    async def setUp(self):
+        await super().setUp()
+        # The one thing the shared stage does not have: an instance that does not stand square to the stage.
+        UsdGeom.Xform(self.stage.GetPrimAtPath(Sdf.Path(_INSTANCE_ROOT))).AddRotateXYZOp().Set(Gf.Vec3f(90.0, 0.0, 0.0))
+        self.parent_world = build_prototype_target(self.stage, Sdf.Path(_PROTOTYPE_ROOT)).parent_world
+
+    def world_up(self, path: str) -> Gf.Vec3d:
+        """The direction a placement's own up axis points in the stage, once the instance has had its say."""
+        return self.parent_world.TransformDir(_up_of(self.authored(path)[1])).GetNormalized()
+
+    def world_position(self, path: str) -> Gf.Vec3d:
+        """Where a placement stands in the stage."""
+        return self.parent_world.Transform(Gf.Vec3d(*self.authored(path)[0]))
+
+    async def test_a_ring_aims_every_placement_about_the_world_axis_it_stands_for(self):
+        # Arrange
+        path = self.grass[0]
+        spin = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.ZAxis(), 45.0))
+        expected = spin.TransformDir(self.world_up(path)).GetNormalized()
+
+        # Act
+        self.drag(_yaw(45.0, Gf.Vec3d(0.0, 0.0, 0.0)), self.grass)
+
+        # Assert
+        self.assertLess((self.world_up(path) - expected).GetLength(), 1e-6, f"{self.world_up(path)} != {expected}")
+
+    async def test_a_turn_still_leaves_every_placement_standing_where_it_was(self):
+        # Arrange
+        before = [self.world_position(path) for path in self.grass]
+
+        # Act
+        self.drag(_yaw(45.0, Gf.Vec3d(0.0, 0.0, 0.0)), self.grass)
+
+        # Assert
+        for was, now in zip(before, [self.world_position(path) for path in self.grass]):
+            self.assertLess((now - was).GetLength(), 1e-6, f"{now} != {was}")
+
+
+class TestTurnHelpers(omni.kit.test.AsyncTestCase):
+    """The turn a gizmo drag reports and the turn typed into the Scatter window have to mean the same thing."""
+
+    async def test_a_turn_read_back_from_its_matrix_is_the_turn_that_built_it(self):
+        # Arrange
+        turn = (12.0, -34.0, 56.0)
+
+        # Act
+        read_back = turn_to_degrees(turn_matrix(turn))
+
+        # Assert
+        for was, now in zip(turn, read_back):
+            self.assertAlmostEqual(was, now, places=6)
+
+    async def test_no_turn_is_the_identity(self):
+        # Act
+        matrix = turn_matrix((0.0, 0.0, 0.0))
+
+        # Assert
+        self.assertEqual(turn_to_degrees(matrix), (0.0, 0.0, 0.0))
+
+    async def test_turning_by_a_turn_and_its_inverse_leaves_nothing_behind(self):
+        # Arrange
+        turn = turn_matrix((20.0, 40.0, 60.0))
+
+        # Act
+        degrees = turn_to_degrees(turn * turn.GetInverse())
+
+        # Assert
+        for value in degrees:
+            self.assertAlmostEqual(value, 0.0, places=6)
+
+
+class TestATurnThatSurvivesASettingsChange(_MoveTestCase):
+    """A turn is recorded whole, so the aim the user gave a patch is still there after it is recomposed.
+
+    Only the yaw used to be recorded, so a patch tipped over by the rings stood straight back up the next time any
+    setting recomposed it, and the tilt the user had dialled in was gone.
+    """
+
+    async def test_a_tilt_is_still_there_after_a_settings_change(self):
+        # Arrange
+        pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
+        self.drag(_tilt(90.0, pivot), self.grass)
+        tipped = [_up_of(self.authored(path)[1]) for path in self.grass]
+
+        # Act
+        self.reapply(_settings(), self.grass)
+
+        # Assert
+        for was, now in zip(tipped, [_up_of(self.authored(path)[1]) for path in self.grass]):
+            self.assertLess((now - was).GetLength(), 1e-4, f"{now} != {was}")
+
+    async def test_a_placement_that_records_no_turn_is_composed_exactly_as_it_always_was(self):
+        # Arrange - nothing has turned this patch, so it records no turn, as everything painted before them does
+        before = [self.authored(path) for path in self.grass]
+        self.assertTrue(all(self.attribute(path, SCATTER_TURN_ATTR) is None for path in self.grass))
+
+        # Act
+        self.reapply(_settings(), self.grass)
+
+        # Assert
+        self.assertEqual([self.authored(path) for path in self.grass], before)
+
+    async def test_two_turns_in_a_row_add_up_rather_than_replacing_one_another(self):
+        # Arrange
+        pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
+
+        # Act
+        self.drag(_yaw(30.0, pivot), self.grass)
+        self.drag(_yaw(20.0, pivot), self.grass)
+
+        # Assert
+        recorded = [self.attribute(path, SCATTER_TURN_ATTR) for path in self.grass]
+        self.assertTrue(all(abs(value[2] - 50.0) < 1e-4 for value in recorded), recorded)

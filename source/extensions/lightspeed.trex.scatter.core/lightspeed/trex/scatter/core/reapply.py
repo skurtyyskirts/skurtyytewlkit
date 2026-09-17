@@ -23,8 +23,10 @@ __all__ = [
     "ReapplyScope",
     "ScopeEntry",
     "changed_reappliable_fields",
+    "changed_recompose_assets",
     "is_hand_edited",
     "read_placement_origin",
+    "read_placement_turn",
     "read_placement_yaw",
     "reapply_transforms",
     "resolve_scope",
@@ -54,10 +56,12 @@ from .constants import (
     SCATTER_KEY_ATTR,
     SCATTER_ORIGIN_ATTR,
     SCATTER_TRANSFORM_KEY_ATTR,
+    SCATTER_TURN_ATTR,
     SCATTER_YAW_ATTR,
 )
 from .placement import PlacementTransform, asset_scale_factor, author_placement_transforms, transform_key
 from .sampling import (
+    turn_matrix,
     ParentSpaceOrigin,
     compose_parent_space_transform,
     placement_rng,
@@ -176,6 +180,35 @@ def changed_reappliable_fields(previous: ScatterBrushSettings, current: ScatterB
     return {name for name in REAPPLIABLE_FIELDS if getattr(previous, name) != getattr(current, name)}
 
 
+def changed_recompose_assets(previous: Sequence[ScatterAssetEntry], current: Sequence[ScatterAssetEntry]) -> set[str]:
+    """Return the paths of palette entries whose change a placement that is already painted would follow.
+
+    Only the up axis and the measurements count. Those decide the correction a placement is turned by and the factor
+    Absolute Size divides its height by, so changing one has to reach a patch that is already painted, the same way
+    moving a slider does. The rest of an entry decides what the *next* stroke does: the weight and the enabled flag
+    pick which asset is stamped, and textures are assigned when a placement is authored, so including them would
+    rewrite a patch for nothing.
+
+    An entry appearing or disappearing is not a change either. A placement references its own file, so a palette
+    gaining an entry cannot alter one, and a palette losing an entry leaves its placements with the transforms they
+    already have rather than rewriting them from an entry that is gone.
+
+    Args:
+        previous: Palette before the change.
+        current: Palette after it.
+
+    Returns:
+        The paths that changed; empty when a recompose would produce the transforms it already produced.
+    """
+    was = _recompose_values(previous)
+    return {path for path, values in _recompose_values(current).items() if path in was and was[path] != values}
+
+
+def _recompose_values(assets: Sequence[ScatterAssetEntry]) -> dict[str, tuple]:
+    """Return, per palette entry path, only the values a recompose reads from that entry."""
+    return {entry.path: (entry.up_axis, entry.meters_per_unit, tuple(entry.natural_extent)) for entry in assets}
+
+
 def resolve_scope(
     stage: Usd.Stage | None, usd_context: omni.usd.UsdContext, settings: ScatterBrushSettings
 ) -> ReapplyScope:
@@ -283,6 +316,7 @@ def reapply_transforms(
                 asset.up_axis,
                 asset_scale_factor(asset, settings, meters_per_unit),
                 read_placement_yaw(spec),
+                read_placement_turn(spec),
             )
             before.append(current)
             after.append(
@@ -319,6 +353,7 @@ class ReapplyDriver:
         self._usd_context_name = usd_context_name
         self._cache = cache
         self._known_settings = controller.settings
+        self._known_assets = controller.assets
         self._scope = ReapplyScope()
         self._outcome = ReapplyOutcome()
         self._layer: Sdf.Layer | None = None
@@ -329,6 +364,7 @@ class ReapplyDriver:
 
         self.__on_scope_changed = Event(copy=True)
         self._settings_sub = controller.subscribe_settings_changed(self._on_settings_changed)
+        self._assets_sub = controller.subscribe_assets_changed(self._on_assets_changed)
         self._stage_event_sub = (
             omni.usd.get_context(usd_context_name)
             .get_stage_event_stream()
@@ -398,6 +434,7 @@ class ReapplyDriver:
         """Commit any open edit and drop every subscription so the driver can be released."""
         self.edit_finished()
         self._settings_sub = None
+        self._assets_sub = None
         self._stage_event_sub = None
         self.__on_scope_changed = Event(copy=True)
 
@@ -408,6 +445,24 @@ class ReapplyDriver:
             self.edit_finished()
             return
         if not changed_reappliable_fields(previous, settings):
+            return
+        if self._interaction_token is None and not self._begin():
+            return
+        if self._scope.placement_count <= LIVE_EDIT_SOFT_LIMIT:
+            self._apply()
+
+    def _on_assets_changed(self, assets: Sequence[ScatterAssetEntry]) -> None:
+        """Re-apply a palette change to the scope, the way a settings change is applied.
+
+        Setting an asset's up axis is the fix for one scattered on its side, and it is a palette field rather than a
+        brush setting, so without this the patch the user is looking at would keep its old orientation until they
+        happened to nudge a slider.
+        """
+        previous, self._known_assets = self._known_assets, list(assets)
+        if not self._controller.settings.edit_selection_live:
+            self.edit_finished()
+            return
+        if not changed_recompose_assets(previous, self._known_assets):
             return
         if self._interaction_token is None and not self._begin():
             return
@@ -583,6 +638,22 @@ def read_placement_origin(spec: Sdf.PrimSpec) -> ParentSpaceOrigin | None:
     if attribute is None or attribute.default is None:
         return None
     return ParentSpaceOrigin.from_values(list(attribute.default))
+
+
+def read_placement_turn(spec: Sdf.PrimSpec) -> Gf.Matrix4d | None:
+    """Return the whole turn a placement records, or None when nothing has turned it.
+
+    Args:
+        spec: Placement prim spec.
+
+    Returns:
+        The turn as a rotation in parent space, or None for a placement that records none, which is every placement
+        painted before turns were recorded.
+    """
+    attribute = spec.attributes.get(SCATTER_TURN_ATTR)
+    if attribute is None or attribute.default is None or len(attribute.default) < 3:
+        return None
+    return turn_matrix(tuple(float(value) for value in attribute.default[:3]))
 
 
 def read_placement_yaw(spec: Sdf.PrimSpec) -> float:

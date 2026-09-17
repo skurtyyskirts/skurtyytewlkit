@@ -91,3 +91,12 @@ hand, placements painted before the brush recorded surfaces, and placements auth
 The narrowest selection wins. Selecting painted placements or a scatter container edits exactly those; selecting a
 mesh or an instance edits what the current preset painted on it, which is how two patches painted with two presets on
 one mesh stay independent. With nothing selected, a settings change only affects the next stroke.
+
+**Turn X**, **Turn Y** and **Turn Z**, below it, show the degrees that selection has been turned by since it was
+selected. The viewport's rotate rings write them as they are dragged, and typing or dragging them turns the selection
+the same way; either is one undo step. They are greyed out while nothing scattered is selected and read zero again for
+a new selection, because a turn is measured from where the patch stood when it was picked rather than from any angle
+the placements happen to carry - each already has its own random yaw.
+
+They are not brush settings, which is why they are not bound to one: the Rotation ranges further down the section
+decide what the next stroke paints, while a turn edits scatter that is already painted.

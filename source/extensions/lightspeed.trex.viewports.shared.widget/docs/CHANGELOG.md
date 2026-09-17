@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added the Scatter Brush viewport tool (toolbar toggle, Ctrl+B, B+wheel sizing, paint/erase strokes with a surface cursor) and a mouse-wheel interceptor hook on the viewport event delegate.
 - Added a live counter on the scatter brush cursor that reports the prims a paint stroke is adding to the rendered stage, showing the authored and multiplied totals separately on a replicated prototype and turning amber at the brush prim budget and red at five times it. It only reports; a stroke is never interrupted.
 - Added the scatter move gizmo: selecting painted scatter puts the standard transform gizmo on the middle of that patch, and dragging its arrows or rings moves or turns the whole patch as one undo step. It follows the viewport's own move and rotate operation, so the same keys switch it, and it hides itself while the brush is painting or erasing rather than competing for the drag.
+- The move gizmo now passes the brush's Conform to Surface setting into the move, and its rotate rings send their rotation with no pivot, so dragging them aims the patch where it stands instead of swinging it around the handle and re-planting it somewhere else.
+- The move gizmo now answers only to drags of its own arrows and rings. A manipulator hands every gesture registered on it whatever payload the dispatch carries, and only the drag of a handle carries the distance or angle it was dragged by, so the rings were reading an angle off dispatches that hold none: every frame of a ring drag raised and the patch stayed where it was.
+- The move gizmo now reports the turn it has given a patch, so the Scatter window's Turn fields follow the rings as they are dragged, and it takes its drag lifecycle from the scatter core rather than keeping its own, so a turn dialled into those fields and a drag of a ring commit the same way
 
 ## [1.8.5]
 ### Fixed

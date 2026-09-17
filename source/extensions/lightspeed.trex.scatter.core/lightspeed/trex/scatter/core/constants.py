@@ -55,6 +55,10 @@ SCATTER_TRANSFORM_KEY_ATTR = "remixScatterTransformKey"
 # Degrees about the stage up axis the move gizmo has turned this placement by, added to the yaw it samples. Kept
 # because a recomposition reproduces the position and the surface it settled on, but not a turn the user dragged.
 SCATTER_YAW_ATTR = "remixScatterYaw"
+# The whole turn the move gizmo and the Scatter window's turn fields have given a placement, as X, Y, Z degrees
+# in the space of the instance that parents it. Recorded beside the yaw rather than replacing it so that scatter
+# painted before this existed recomposes to exactly what it does today.
+SCATTER_TURN_ATTR = "remixScatterTurn"
 
 # Prim naming: <prototype>/scatter_<preset slug>/s_<uuid>
 CONTAINER_PREFIX = "scatter_"

@@ -18,9 +18,21 @@
 from .e2e.test_commands_project import TestScatterCommandsOnProjectExample
 from .unit.test_assets import TestAssets
 from .unit.test_commands import TestScatterFloodCommand, TestScatterStrokeCommand
-from .unit.test_controller import TestScatterBrushController, TestScatterBrushControllerSingleton
+from .unit.test_controller import (
+    TestControllerSelectionTurn,
+    TestScatterBrushController,
+    TestScatterBrushControllerSingleton,
+)
 from .unit.test_geometry import TestGeometryFunctions, TestMeshGeometry, TestMeshSurfaceCache
-from .unit.test_move import TestMoveAndReapplyTogether, TestMoveHelpers, TestMoveScope, TestScopePivot
+from .unit.test_move import (
+    TestATurnThatSurvivesASettingsChange,
+    TestMoveAndReapplyTogether,
+    TestMoveHelpers,
+    TestMoveScope,
+    TestScopePivot,
+    TestTurningUnderARotatedInstance,
+    TestTurnHelpers,
+)
 from .unit.test_materials import TestBuildMaterialsPayload, TestResolveAssetTextureSet
 from .unit.test_picking import (
     TestCameraRayFromNdc,
@@ -42,10 +54,12 @@ from .unit.test_stroke import TestStrokeSession
 from .unit.test_targets import TestTargets
 
 __all__ = (
+    "TestATurnThatSurvivesASettingsChange",
     "TestAssets",
     "TestAssetsCarbPersistence",
     "TestBuildMaterialsPayload",
     "TestCameraRayFromNdc",
+    "TestControllerSelectionTurn",
     "TestCpuRaySurfacePicker",
     "TestCreateSurfacePicker",
     "TestGeometryFunctions",
@@ -75,4 +89,6 @@ __all__ = (
     "TestScopePivot",
     "TestStrokeSession",
     "TestTargets",
+    "TestTurnHelpers",
+    "TestTurningUnderARotatedInstance",
 )

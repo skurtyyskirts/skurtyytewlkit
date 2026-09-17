@@ -59,6 +59,7 @@ from .constants import (
     SCATTER_KEY_ATTR,
     SCATTER_ORIGIN_ATTR,
     SCATTER_TRANSFORM_KEY_ATTR,
+    SCATTER_TURN_ATTR,
     SCATTER_YAW_ATTR,
 )
 from .geometry import MeshSurfaceCache, SurfaceSample, area_weighted_triangle_samples
@@ -180,6 +181,13 @@ class PlacementTransform:
     yaw: float | None = None
     """Degrees about the stage up axis to record, or None to leave the recorded turn alone."""
 
+    turn: tuple[float, float, float] | None = None
+    """Whole turn to record as X, Y, Z degrees in parent space, or None to leave the recorded one alone.
+
+    The yaw above only ever held a turn about the up axis, so a placement tipped over by the rings stood back up the
+    next time a settings change recomposed it. This carries the tilt as well, so an aim survives a recompose.
+    """
+
     brush_owned: bool = True
     """Whether writing this marks the placement as the brush's again.
 
@@ -196,6 +204,7 @@ class PlacementTransform:
             "scale": list(self.scale),
             "origin": list(self.origin),
             "yaw": self.yaw,
+            "turn": None if self.turn is None else list(self.turn),
             "brush_owned": self.brush_owned,
         }
 
@@ -203,6 +212,7 @@ class PlacementTransform:
     def from_dict(cls, data: Mapping[str, Any]) -> PlacementTransform:
         """Build a transform from a dictionary produced by :meth:`to_dict`."""
         yaw = data.get("yaw")
+        turn = data.get("turn")
         return cls(
             prim_path=str(data["prim_path"]),
             translate=_as_float_triple(data["translate"]),
@@ -210,6 +220,7 @@ class PlacementTransform:
             scale=_as_float_triple(data["scale"]),
             origin=tuple(float(value) for value in data.get("origin", ())),
             yaw=None if yaw is None else float(yaw),
+            turn=None if turn is None else _as_float_triple(turn),
             brush_owned=bool(data.get("brush_owned", True)),
         )
 
@@ -551,6 +562,14 @@ def author_placement_transforms(layer: Sdf.Layer, transforms: Sequence[Placement
                 )
             if transform.yaw is not None:
                 _set_attribute(spec, SCATTER_YAW_ATTR, Sdf.ValueTypeNames.Double, float(transform.yaw), custom=True)
+            if transform.turn is not None:
+                _set_attribute(
+                    spec,
+                    SCATTER_TURN_ATTR,
+                    Sdf.ValueTypeNames.DoubleArray,
+                    Vt.DoubleArray([float(value) for value in transform.turn]),
+                    custom=True,
+                )
             written.append(transform.prim_path)
     return written
 

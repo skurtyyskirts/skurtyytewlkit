@@ -58,6 +58,9 @@ _EXPECTED_CONTROLS = (
     ("FloatBoundedDrag", "scatter_strength"),
     ("FloatBoundedDrag", "scatter_spacing"),
     ("FloatBoundedDrag", "scatter_padding"),
+    ("FloatBoundedDrag", "scatter_turn_x"),
+    ("FloatBoundedDrag", "scatter_turn_y"),
+    ("FloatBoundedDrag", "scatter_turn_z"),
     ("FloatBoundedDrag", "scatter_vertical_offset"),
     ("CheckBox", "scatter_conform"),
     ("CheckBox", "scatter_align_stroke"),
@@ -687,3 +690,54 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(model.as_float, 50.0)
+
+
+class TestScatterPaneTurnFields(TestScatterPane):
+    """The turn fields show what the viewport gizmo has done to the selection, and drive the same move themselves.
+
+    They are not bound to a brush setting: a brush setting decides what the next stroke paints, while a turn is an
+    edit to scatter that is already painted.
+    """
+
+    def _turn(self) -> tuple:
+        """Return the X, Y, Z degrees the three fields are showing."""
+        return tuple(model.as_float for model in self.pane._turn_models)  # noqa: PLW0212
+
+    async def test_the_fields_start_at_no_turn(self):
+        # Assert
+        self.assertEqual(self._turn(), (0.0, 0.0, 0.0))
+
+    async def test_a_turn_the_gizmo_reports_is_shown_on_the_fields(self):
+        # Arrange
+        scope = self.pane._reapply_driver.scope  # noqa: PLW0212
+
+        # Act
+        self.controller.set_selection_turn(scope, (10.0, 20.0, 30.0))
+
+        # Assert
+        self.assertEqual(self._turn(), (10.0, 20.0, 30.0))
+
+    async def test_a_turn_given_to_something_else_is_not_shown(self):
+        # Arrange
+        other = _setup_ui_module.ReapplyScope()
+        other_scope = other if other != self.pane._reapply_driver.scope else None  # noqa: PLW0212
+
+        # Act
+        if other_scope is not None:
+            self.controller.set_selection_turn(other_scope, (10.0, 20.0, 30.0))
+
+        # Assert
+        self.assertEqual(self._turn(), (0.0, 0.0, 0.0))
+
+    async def test_the_fields_are_disabled_while_nothing_scattered_is_selected(self):
+        # Assert - the pane's scope is empty in the test stage, so there is nothing a turn could be applied to
+        self.assertTrue(self.pane._reapply_driver.scope.is_empty)  # noqa: PLW0212
+        for field in self.pane._turn_fields:  # noqa: PLW0212
+            self.assertFalse(field.enabled)
+
+    async def test_typing_a_turn_with_nothing_selected_writes_nothing(self):
+        # Act
+        self.pane._turn_models[2].set_value(45.0)  # noqa: PLW0212
+
+        # Assert - no scope means no session was ever opened
+        self.assertFalse(self.pane._turn_session.active)  # noqa: PLW0212
