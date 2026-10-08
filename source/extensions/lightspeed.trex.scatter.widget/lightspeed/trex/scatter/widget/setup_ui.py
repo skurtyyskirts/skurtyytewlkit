@@ -31,13 +31,13 @@ from lightspeed.trex.scatter.core import (
     EraseScope,
     Falloff,
     MeshSurfaceCache,
-    ReapplyDriver,
     ReapplyScope,
     ScaleMode,
     ScatterBrushSettings,
     ScatterMode,
     ScopeDragSession,
     TargetMode,
+    get_reapply_driver,
     get_scatter_brush_controller,
     instance_count,
     turn_matrix,
@@ -60,7 +60,10 @@ from .value_model import field_bounds
 
 _ANCHOR_NONE_TEXT = "<none>"
 _LIVE_EDIT_TOOLTIP = (
-    "Apply placement, scale and seed changes to the scatter that is selected, as well as to the next stroke.\n\n"
+    "Apply placement, scale and seed changes to painted scatter, as well as to the next stroke.\n\n"
+    "- Right after a stroke, changes apply to that stroke: tune it by eye, and one undo removes it with everything "
+    "changed on it while the settings stay as you left them\n"
+    "- Selecting anything ends that, and changes then apply to the selection, each as an undo step of its own\n"
     "- Select painted placements or a scatter container to edit exactly those\n"
     "- Select a mesh or an instance to edit what the current preset painted on it\n"
     "- Brush and density settings always apply to the next stroke only, never to what is already painted"
@@ -69,7 +72,15 @@ _TURN_TOOLTIP = (
     "Degrees the selected scatter has been turned by since it was selected, about the stage axes.\n\n"
     "- The viewport's rotate rings write these, and typing here turns the selection the same way\n"
     "- Every placement turns where it stands; the patch is not carried around a pivot\n"
-    "- A new selection has not been turned yet, so these read zero again"
+    "- A new selection has not been turned yet, so these read zero again\n"
+    "- A turn stays with the scatter it was given to; use Base Rotation to change every stroke painted from now on"
+)
+_BASE_ROTATION_TOOLTIP = (
+    "Degrees every placement is turned about its own root before its random rotation, about the stage {axis} axis."
+    "\n\n"
+    "- The fix for an asset that comes out lying down or leaning: it applies to every stroke painted from now on\n"
+    "- Right after a stroke, the viewport's rotate rings set these and the stroke follows live\n"
+    "- Saved with the preset"
 )
 _TURN_LIMIT = 360.0
 _STATUS_STYLE = "PropertiesPaneSectionTreeItem"
@@ -123,7 +134,8 @@ class ScatterPane(_WorkspaceWidget):
         self._context_name = context_name
         self._controller = get_scatter_brush_controller()
         self._surface_cache = MeshSurfaceCache(self._get_stage)
-        self._reapply_driver = ReapplyDriver(self._controller, context_name, self._surface_cache)
+        # Shared with the viewport gizmo, so a change is applied once whichever of them made it.
+        self._reapply_driver = get_reapply_driver(context_name)
         # The turn fields drive the same move the viewport gizmo does, through a session of their own so that a
         # drag of a field is one undo step the way a drag of a ring is.
         self._turn_session = ScopeDragSession(context_name, self._surface_cache)
@@ -250,7 +262,8 @@ class ScatterPane(_WorkspaceWidget):
             "- Radius is in stage units\n"
             "- Density is the number of candidates per stamp and Strength the share of them that is kept\n"
             "- Spacing is the distance between stamps along a stroke\n"
-            "- Padding keeps placements apart from each other",
+            "- Padding keeps placements apart from each other\n"
+            "- Max Surface Angle skips surfaces steeper than that, such as the wall beside a floor",
         )
         with frame:
             with ui.VStack(height=0, spacing=self._SPACING_XS):
@@ -270,6 +283,16 @@ class ScatterPane(_WorkspaceWidget):
                 self.__build_float_row(
                     "Padding", "padding", "scatter_padding", 0.5, "Minimum distance between two placements."
                 )
+                self.__build_float_row(
+                    "Max Surface Angle",
+                    "max_surface_angle",
+                    "scatter_max_surface_angle",
+                    1.0,
+                    "Steepest surface, in degrees from the stage up axis, the brush still paints on.\n\n"
+                    "A stamp snaps each candidate onto the closest surface, so near a wall or a ledge some land on "
+                    "the side of it and stand sideways. Lower this (45 suits grass) to skip them; 180 keeps every "
+                    "candidate, which painting on a wall or a ceiling needs.",
+                )
 
     def __build_placement_section(self, settings: ScatterBrushSettings):
         frame = self.__build_section(
@@ -277,6 +300,7 @@ class ScatterPane(_WorkspaceWidget):
             "How each placement sits on the surface.\n\n"
             "- Conform aligns the asset up axis with the surface normal\n"
             "- Align to stroke turns the asset along the stroke direction\n"
+            "- Base Rotation stands up or leans every placement the same way, before its random rotation\n"
             "- Rotation ranges are in degrees; the advanced ranges tilt the asset around X and Y",
         )
         with frame:
@@ -307,6 +331,14 @@ class ScatterPane(_WorkspaceWidget):
                     "scatter_align_stroke",
                     "Turn the asset to face the stroke direction.",
                 )
+                for axis in ("x", "y", "z"):
+                    self.__build_float_row(
+                        f"Base Rotation {axis.upper()}",
+                        f"base_rotation_{axis}",
+                        f"scatter_base_rotation_{axis}",
+                        1.0,
+                        _BASE_ROTATION_TOOLTIP.format(axis=axis.upper()),
+                    )
                 self.__build_float_row(
                     "Rotation Z Min", "rotation_z_min", "scatter_rot_z_min", 1.0, "Lowest random yaw in degrees."
                 )
@@ -657,11 +689,15 @@ class ScatterPane(_WorkspaceWidget):
             self._syncing = was_syncing
 
     def __refresh_turn_fields(self) -> None:
-        """Show the turn of whatever is selected now, and grey the fields out when nothing is."""
+        """Show the turn of whatever is selected now, and grey the fields out when nothing is.
+
+        They are greyed out on the stroke just painted as well: a turn stays with the scatter it is given to, and the
+        stroke just painted is tuned through the brush settings, Base Rotation included, so later strokes follow.
+        """
         scope = self._reapply_driver.scope
         self.__write_turn_fields(self._controller.selection_turn(scope))
         for field in self._turn_fields:
-            field.enabled = not scope.is_empty
+            field.enabled = not scope.is_empty and not self._reapply_driver.previewing
 
     def __build_int_field(self, field_name: str, identifier: str, step: int, tooltip: str) -> _IntBoundedDrag:
         low, high = field_bounds(ScatterBrushSettings, field_name)
@@ -892,7 +928,8 @@ class ScatterPane(_WorkspaceWidget):
         self._asset_list_widget = None
         self._presets_widget = None
         if self._reapply_driver is not None:
-            self._reapply_driver.destroy()
+            # Shared with the viewport gizmo, so it outlives the pane; only the edit this pane opened is closed.
+            self._reapply_driver.edit_finished()
             self._reapply_driver = None
         if self._surface_cache is not None:
             self._surface_cache.destroy()

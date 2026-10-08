@@ -720,6 +720,31 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
         self.assertIsNone(self._tool._session)
         self.assertTrue(all(prim.GetPath().name.startswith("s_") for prim in placements))
 
+    async def test_drag_ended_makes_the_painted_stroke_the_preview(self):
+        # Arrange
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert - live edits now go to exactly what this stroke painted
+        preview = self._controller.preview_scope(_CONTEXT_NAME)
+        self.assertIsNotNone(preview)
+        self.assertEqual(preview.placement_count, len(self._placements()))
+
+    async def test_drag_ended_erase_does_not_start_a_preview(self):
+        # Arrange
+        self._begin_stroke()
+        self._tool._on_drag_ended(self._tool._drag)
+        self._keys_down = {carb.input.KeyboardInput.LEFT_SHIFT}
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert - the erase is now on top of the undo stack, so the stroke before it is no longer the preview
+        self.assertIsNone(self._controller.preview_scope(_CONTEXT_NAME))
+
     async def test_drag_ended_without_session_does_nothing(self):
         # Arrange
         self._hover()

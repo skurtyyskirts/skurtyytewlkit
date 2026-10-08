@@ -20,7 +20,9 @@ from .unit.test_assets import TestAssets
 from .unit.test_commands import TestScatterFloodCommand, TestScatterStrokeCommand
 from .unit.test_controller import (
     TestControllerSelectionTurn,
+    TestReapplyDriverRegistry,
     TestScatterBrushController,
+    TestScatterBrushControllerPreview,
     TestScatterBrushControllerSingleton,
 )
 from .unit.test_geometry import TestGeometryFunctions, TestMeshGeometry, TestMeshSurfaceCache
@@ -29,6 +31,8 @@ from .unit.test_move import (
     TestMoveAndReapplyTogether,
     TestMoveHelpers,
     TestMoveScope,
+    TestPreparedMove,
+    TestScopeDragSession,
     TestScopePivot,
     TestTurningUnderARotatedInstance,
     TestTurnHelpers,
@@ -40,9 +44,16 @@ from .unit.test_picking import (
     TestCreateSurfacePicker,
     TestHdRemixSurfacePicker,
 )
-from .unit.test_placement import TestPlacementFunctions, TestPlacementRecord
+from .unit.test_placement import TestPlacementFunctions, TestPlacementPool, TestPlacementRecord
 from .unit.test_presets import TestGetDefaultPresetsDirectory, TestPresetStore
-from .unit.test_reapply import TestReapplyHelpers, TestReapplyTransforms, TestResolveScope
+from .unit.test_reapply import (
+    TestPreparedReapply,
+    TestReapplyDriver,
+    TestReapplyHelpers,
+    TestReapplyTransforms,
+    TestReplayedDraws,
+    TestResolveScope,
+)
 from .unit.test_sampling import TestPaddingIndex, TestSamplingFunctions
 from .unit.test_settings import (
     TestAssetsCarbPersistence,
@@ -72,20 +83,28 @@ __all__ = (
     "TestMoveScope",
     "TestPaddingIndex",
     "TestPlacementFunctions",
+    "TestPlacementPool",
     "TestPlacementRecord",
+    "TestPreparedMove",
+    "TestPreparedReapply",
     "TestPresetStore",
     "TestPrimBudgetStatus",
+    "TestReapplyDriver",
+    "TestReapplyDriverRegistry",
     "TestReapplyHelpers",
     "TestReapplyTransforms",
+    "TestReplayedDraws",
     "TestResolveAssetTextureSet",
     "TestResolveScope",
     "TestSamplingFunctions",
     "TestScatterAssetEntry",
     "TestScatterBrushController",
+    "TestScatterBrushControllerPreview",
     "TestScatterBrushControllerSingleton",
     "TestScatterCommandsOnProjectExample",
     "TestScatterFloodCommand",
     "TestScatterStrokeCommand",
+    "TestScopeDragSession",
     "TestScopePivot",
     "TestStrokeSession",
     "TestTargets",

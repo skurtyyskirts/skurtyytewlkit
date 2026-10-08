@@ -15,7 +15,7 @@
 * limitations under the License.
 """
 
-__all__ = ["TestScatterBrushController", "TestScatterBrushControllerSingleton"]
+__all__ = ["TestScatterBrushController", "TestScatterBrushControllerPreview", "TestScatterBrushControllerSingleton"]
 
 import contextlib
 import json
@@ -25,11 +25,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import omni.kit.commands
 import omni.kit.test
+import omni.kit.undo
 from pxr import Gf, Sdf, Usd, UsdGeom
 
+from lightspeed.trex.scatter.core import commands as commands_module
 from lightspeed.trex.scatter.core import constants as constants_module
 from lightspeed.trex.scatter.core import controller as controller_module
+from lightspeed.trex.scatter.core.commands import ScatterStrokeKind
+from lightspeed.trex.scatter.core.placement import PlacementRecord
 from lightspeed.trex.scatter.core.settings import (
     Falloff,
     ScatterAssetEntry,
@@ -39,7 +44,7 @@ from lightspeed.trex.scatter.core.settings import (
     TargetMode,
     UpAxis,
 )
-from lightspeed.trex.scatter.core.reapply import ReapplyScope, ScopeEntry
+from lightspeed.trex.scatter.core.reapply import ReapplyScope, ScopeEntry, scope_of_placements
 from lightspeed.trex.scatter.core.targets import ScatterTarget
 
 _ROCK = "C:/project/assets/ingested/rock.usd"
@@ -1064,7 +1069,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
             "ScatterFloodCommand",
             context_name="scatter_context",
             layer_identifier=stage.GetEditTarget().GetLayer().identifier,
-            records=[{"prim_name": "s_1"}, {"prim_name": "s_2"}],
+            records=records,
             materials={},
         )
         patched["generate_flood"].assert_called_once()
@@ -1084,7 +1089,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         # Arrange
         stage = Usd.Stage.CreateInMemory()
         self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
-        self.controller.update_settings(padding=0.0)
+        self.controller.update_settings(padding=0.5)
         target = _make_target("mesh_A")
         existing = np.array([[1.0, 2.0, 3.0]])
 
@@ -1381,6 +1386,272 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         callback.assert_not_called()
 
 
+class TestScatterBrushControllerPreview(omni.kit.test.AsyncTestCase):
+    """The stroke just painted stays the preview live edits fold into until anything else reaches the undo stack."""
+
+    _CONTEXT = "scatter_context"
+    _CONTAINER = f"{_ANCHOR_PROTOTYPE}/scatter_default"
+
+    async def setUp(self):
+        self._stack = contextlib.ExitStack()
+        # Persistence is stubbed at the controller's own readers rather than by patching carb.settings: these tests
+        # run real commands, and omni.kit.undo caches a carb setting the first time one runs.
+        self._stack.enter_context(mock.patch.object(ScatterBrushSettings, "save_to_carb"))
+        self._stack.enter_context(
+            mock.patch.object(ScatterBrushSettings, "load_from_carb", return_value=ScatterBrushSettings())
+        )
+        self._stack.enter_context(mock.patch.object(controller_module, "save_assets_to_carb"))
+        self._stack.enter_context(mock.patch.object(controller_module, "load_assets_from_carb", return_value=[]))
+        # The extension registers these commands on startup; register them here too so the test is self-contained,
+        # and restore that startup registration in tearDown so later tests in the same process still find them.
+        self._commands_were_registered = omni.kit.commands.get_command_class("ScatterStroke") is not None
+        self._registered = omni.kit.commands.register_all_commands_in_module(commands_module)
+        omni.kit.undo.clear_stack()
+        self.stage = Usd.Stage.CreateInMemory()
+        self.layer = self.stage.GetRootLayer()
+        self.controller = controller_module.ScatterBrushController()
+        self.preview_changed = mock.Mock()
+        self._subscription = self.controller.subscribe_preview_changed(self.preview_changed)
+
+    async def tearDown(self):
+        self._subscription = None
+        self.controller.destroy()
+        omni.kit.undo.clear_stack()
+        omni.kit.commands.unregister_module_commands(self._registered)
+        if self._commands_were_registered:
+            omni.kit.commands.register_all_commands_in_module(commands_module)
+        self.layer = None
+        self.stage = None
+        self._stack.close()
+
+    def _paint(self, count: int = 2) -> list[str]:
+        """Commit a placing stroke the way the brush does at mouse-up; returns the paths it created."""
+        records = [
+            PlacementRecord(
+                container_path=self._CONTAINER,
+                prim_name=f"s_00000000000{index}",
+                asset_rel_path=_ROCK,
+                asset_abs_path=_ROCK,
+                translate=(float(index), 0.0, 0.0),
+                rotate_xyz=(0.0, 0.0, 0.0),
+                scale=(1.0, 1.0, 1.0),
+                brush_id="Default",
+            )
+            for index in range(count)
+        ]
+        omni.kit.commands.execute(
+            "ScatterStrokeCommand",
+            context_name=self._CONTEXT,
+            layer_identifier=self.layer.identifier,
+            kind=ScatterStrokeKind.PLACE.value,
+            records=records,
+            already_applied=True,
+        )
+        return [record.prim_path for record in records]
+
+    def _erase(self) -> None:
+        """Commit an erasing stroke the way the brush does at mouse-up."""
+        omni.kit.commands.execute(
+            "ScatterStrokeCommand",
+            context_name=self._CONTEXT,
+            layer_identifier=self.layer.identifier,
+            kind=ScatterStrokeKind.ERASE.value,
+            prim_paths=[f"{self._CONTAINER}/s_000000000000"],
+            snapshot_layer=Sdf.Layer.CreateAnonymous(),
+            already_applied=True,
+        )
+
+    def _execute_another_command(self) -> None:
+        """Commit an edit that is not a stroke, as a live edit of a selection does."""
+        omni.kit.commands.execute(
+            "ScatterReapplyCommand",
+            context_name=self._CONTEXT,
+            layer_identifier=self.layer.identifier,
+            before=[],
+            after=[],
+        )
+
+    def _begin_preview_of_a_stroke(self) -> list[str]:
+        """Paint a stroke, make it the preview and forget the notification that started it."""
+        paths = self._paint()
+        self.assertTrue(self.controller.begin_preview(self._CONTEXT))
+        self.preview_changed.reset_mock()
+        return paths
+
+    async def test_begin_preview_with_a_placing_stroke_on_top_of_the_undo_stack_returns_true(self):
+        # Arrange
+        self._paint()
+
+        # Act
+        started = self.controller.begin_preview(self._CONTEXT)
+
+        # Assert
+        self.assertTrue(started)
+        self.preview_changed.assert_called_once_with()
+
+    async def test_preview_scope_of_the_previewed_stroke_is_the_placements_it_created(self):
+        # Arrange
+        paths = self._paint()
+        self.controller.begin_preview(self._CONTEXT)
+
+        # Act
+        scope = self.controller.preview_scope(self._CONTEXT)
+
+        # Assert
+        self.assertEqual(scope, scope_of_placements(paths))
+        self.assertEqual(scope.placement_count, 2)
+
+    async def test_begin_preview_with_an_erasing_stroke_on_top_returns_false_and_previews_nothing(self):
+        # Arrange
+        self._erase()
+
+        # Act
+        started = self.controller.begin_preview(self._CONTEXT)
+
+        # Assert
+        self.assertFalse(started)
+        self.assertIsNone(self.controller.preview_scope(self._CONTEXT))
+
+    async def test_begin_preview_with_another_command_on_top_returns_false_and_previews_nothing(self):
+        # Arrange
+        self._paint()
+        self._execute_another_command()
+
+        # Act
+        started = self.controller.begin_preview(self._CONTEXT)
+
+        # Assert
+        self.assertFalse(started)
+        self.assertIsNone(self.controller.preview_scope(self._CONTEXT))
+
+    async def test_begin_preview_with_a_stroke_that_placed_nothing_returns_false(self):
+        # Arrange
+        self._paint(count=0)
+
+        # Act
+        started = self.controller.begin_preview(self._CONTEXT)
+
+        # Assert
+        self.assertFalse(started)
+
+    async def test_begin_preview_with_an_empty_undo_stack_returns_false(self):
+        # Arrange
+        omni.kit.undo.clear_stack()
+
+        # Act
+        started = self.controller.begin_preview(self._CONTEXT)
+
+        # Assert
+        self.assertFalse(started)
+
+    async def test_preview_scope_for_another_usd_context_is_none(self):
+        # Arrange
+        self._begin_preview_of_a_stroke()
+
+        # Act
+        scope = self.controller.preview_scope("another_context")
+
+        # Assert
+        self.assertIsNone(scope)
+
+    async def test_executing_another_command_ends_the_preview_and_tells_subscribers(self):
+        # Arrange
+        self._begin_preview_of_a_stroke()
+
+        # Act
+        self._execute_another_command()
+
+        # Assert
+        self.assertIsNone(self.controller.preview_scope(self._CONTEXT))
+        self.preview_changed.assert_called_once_with()
+
+    async def test_undoing_the_stroke_ends_the_preview_and_tells_subscribers(self):
+        # Arrange
+        self._begin_preview_of_a_stroke()
+
+        # Act
+        omni.kit.undo.undo()
+
+        # Assert
+        self.assertIsNone(self.controller.preview_scope(self._CONTEXT))
+        self.preview_changed.assert_called_once_with()
+
+    async def test_folds_into_preview_of_an_edit_of_the_previewed_stroke_returns_true(self):
+        # Arrange
+        paths = self._begin_preview_of_a_stroke()
+
+        # Act
+        folds = self.controller.folds_into_preview(self._CONTEXT, self.layer.identifier, scope_of_placements(paths))
+
+        # Assert
+        self.assertTrue(folds)
+
+    async def test_folds_into_preview_of_an_edit_in_another_layer_returns_false(self):
+        # Arrange
+        paths = self._begin_preview_of_a_stroke()
+        other_layer = Sdf.Layer.CreateAnonymous("other_edit_target")
+
+        # Act
+        folds = self.controller.folds_into_preview(self._CONTEXT, other_layer.identifier, scope_of_placements(paths))
+
+        # Assert
+        self.assertFalse(folds)
+
+    async def test_folds_into_preview_of_an_edit_of_another_scope_returns_false(self):
+        # Arrange - only part of the stroke, which is a selection rather than the stroke
+        paths = self._begin_preview_of_a_stroke()
+
+        # Act
+        folds = self.controller.folds_into_preview(self._CONTEXT, self.layer.identifier, scope_of_placements(paths[:1]))
+
+        # Assert
+        self.assertFalse(folds)
+
+    async def test_folds_into_preview_of_an_edit_in_another_usd_context_returns_false(self):
+        # Arrange
+        paths = self._begin_preview_of_a_stroke()
+
+        # Act
+        folds = self.controller.folds_into_preview("another_context", self.layer.identifier, scope_of_placements(paths))
+
+        # Assert
+        self.assertFalse(folds)
+
+    async def test_folds_into_preview_after_the_stroke_was_undone_returns_false(self):
+        # Arrange
+        paths = self._begin_preview_of_a_stroke()
+        omni.kit.undo.undo()
+
+        # Act
+        folds = self.controller.folds_into_preview(self._CONTEXT, self.layer.identifier, scope_of_placements(paths))
+
+        # Assert
+        self.assertFalse(folds)
+
+    async def test_end_preview_ends_the_preview_and_tells_subscribers_once(self):
+        # Arrange
+        self._begin_preview_of_a_stroke()
+
+        # Act
+        self.controller.end_preview()
+
+        # Assert
+        self.assertIsNone(self.controller.preview_scope(self._CONTEXT))
+        self.preview_changed.assert_called_once_with()
+
+    async def test_end_preview_when_nothing_is_previewed_tells_nobody(self):
+        # Arrange
+        self._begin_preview_of_a_stroke()
+        self.controller.end_preview()
+        self.preview_changed.reset_mock()
+
+        # Act
+        self.controller.end_preview()
+
+        # Assert
+        self.preview_changed.assert_not_called()
+
+
 class TestScatterBrushControllerSingleton(omni.kit.test.AsyncTestCase):
     async def setUp(self):
         self._stack = contextlib.ExitStack()
@@ -1424,6 +1695,17 @@ class TestScatterBrushControllerSingleton(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertIsNone(controller_module._CONTROLLER_INSTANCE)
+
+    async def test_destroy_scatter_brush_controller_destroys_the_live_edit_drivers_bound_to_it(self):
+        # Arrange
+        controller_module.get_scatter_brush_controller()
+
+        with mock.patch.object(controller_module, "destroy_reapply_drivers") as destroy_reapply_drivers:
+            # Act
+            controller_module.destroy_scatter_brush_controller()
+
+        # Assert
+        destroy_reapply_drivers.assert_called_once_with()
 
 
 class TestControllerSelectionTurn(omni.kit.test.AsyncTestCase):
@@ -1509,3 +1791,105 @@ class TestControllerSelectionTurn(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(seen, [])
         del subscription
+
+
+class TestReapplyDriverRegistry(omni.kit.test.AsyncTestCase):
+    """One driver per USD context, following whichever brush controller is current."""
+
+    _CONTEXT = "scatter_core_driver_registry_test"
+
+    async def setUp(self):
+        self._stack = contextlib.ExitStack()
+        self._stack.enter_context(mock.patch.object(ScatterBrushSettings, "save_to_carb"))
+        self._stack.enter_context(
+            mock.patch.object(ScatterBrushSettings, "load_from_carb", return_value=ScatterBrushSettings())
+        )
+        self._stack.enter_context(mock.patch.object(controller_module, "save_assets_to_carb"))
+        self._stack.enter_context(mock.patch.object(controller_module, "load_assets_from_carb", return_value=[]))
+        usd_context = mock.Mock()
+        usd_context.get_selection.return_value.get_selected_prim_paths.return_value = []
+        usd_context.get_stage.return_value = None
+        self._stack.enter_context(
+            mock.patch.object(controller_module.omni.usd, "get_context", return_value=usd_context)
+        )
+        self._previous_controller = controller_module._CONTROLLER_INSTANCE
+        controller_module._CONTROLLER_INSTANCE = None
+        self._previous_drivers = dict(controller_module._DRIVERS)
+        controller_module._DRIVERS.clear()
+
+    async def tearDown(self):
+        controller_module.destroy_reapply_drivers()
+        if controller_module._CONTROLLER_INSTANCE is not None:
+            controller_module._CONTROLLER_INSTANCE.destroy()
+        controller_module._CONTROLLER_INSTANCE = self._previous_controller
+        controller_module._DRIVERS.update(self._previous_drivers)
+        self._stack.close()
+
+    def replace_controller(self) -> None:
+        """Swap in a new brush controller without telling the drivers, as reloading the extension can."""
+        old = controller_module._CONTROLLER_INSTANCE
+        controller_module._CONTROLLER_INSTANCE = controller_module.ScatterBrushController()
+        if old is not None:
+            old.destroy()
+
+    async def test_get_reapply_driver_twice_for_one_context_returns_the_same_driver(self):
+        # Arrange
+        first = controller_module.get_reapply_driver(self._CONTEXT)
+
+        # Act
+        second = controller_module.get_reapply_driver(self._CONTEXT)
+
+        # Assert
+        self.assertIs(second, first)
+
+    async def test_get_reapply_driver_for_another_context_returns_another_driver(self):
+        # Arrange
+        first = controller_module.get_reapply_driver(self._CONTEXT)
+
+        # Act
+        other = controller_module.get_reapply_driver(f"{self._CONTEXT}_other")
+
+        # Assert
+        self.assertIsNot(other, first)
+
+    async def test_get_reapply_driver_binds_the_driver_to_the_current_brush_controller(self):
+        # Act
+        driver = controller_module.get_reapply_driver(self._CONTEXT)
+
+        # Assert
+        self.assertIs(driver.controller, controller_module.get_scatter_brush_controller())
+
+    async def test_get_reapply_driver_after_destroy_reapply_drivers_creates_a_new_driver(self):
+        # Arrange
+        first = controller_module.get_reapply_driver(self._CONTEXT)
+        controller_module.destroy_reapply_drivers()
+
+        # Act
+        second = controller_module.get_reapply_driver(self._CONTEXT)
+
+        # Assert
+        self.assertIsNot(second, first)
+
+    async def test_get_reapply_driver_after_the_controller_was_replaced_returns_a_driver_of_the_new_controller(self):
+        # Arrange
+        first = controller_module.get_reapply_driver(self._CONTEXT)
+        self.replace_controller()
+
+        # Act
+        second = controller_module.get_reapply_driver(self._CONTEXT)
+
+        # Assert
+        self.assertIsNot(second, first)
+        self.assertIs(second.controller, controller_module.get_scatter_brush_controller())
+
+    async def test_get_reapply_driver_after_the_controller_was_replaced_destroys_the_old_driver(self):
+        # Arrange
+        first = controller_module.get_reapply_driver(self._CONTEXT)
+        self.replace_controller()
+
+        with mock.patch.object(first, "destroy", wraps=first.destroy) as destroy:
+            # Act
+            controller_module.get_reapply_driver(self._CONTEXT)
+
+        # Assert
+        destroy.assert_called_once()

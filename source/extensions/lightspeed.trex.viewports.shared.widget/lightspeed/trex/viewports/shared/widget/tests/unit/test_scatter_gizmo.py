@@ -15,7 +15,7 @@
 * limitations under the License.
 """
 
-__all__ = ["TestScatterGizmoGestures", "TestScatterGizmoTool"]
+__all__ = ["TestScatterGizmoGestures", "TestScatterGizmoOnThePreview", "TestScatterGizmoTool", "TestWrapDegrees"]
 
 import contextlib
 import pathlib
@@ -38,6 +38,7 @@ from lightspeed.trex.scatter.core import (
     author_placements,
     generate_stamp,
     get_scatter_brush_controller,
+    scope_of_placements,
 )
 from lightspeed.trex.scatter.core import controller as controller_module
 from lightspeed.trex.scatter.core.constants import CONTAINER_PREFIX
@@ -96,8 +97,8 @@ def _build_capture_stage(stage: Usd.Stage) -> None:
     instance.GetPrim().GetReferences().AddInternalReference(_PROTOTYPE)
 
 
-class TestScatterGizmoTool(omni.kit.test.AsyncTestCase):
-    """Drives the gizmo's scope, visibility and drag lifecycle with the manipulator itself mocked away."""
+class _ScatterGizmoTestCase(omni.kit.test.AsyncTestCase):
+    """A capture stage holding one painted patch and a gizmo on it, with the manipulator itself mocked away."""
 
     async def setUp(self):
         self._stack = contextlib.ExitStack()
@@ -191,6 +192,10 @@ class TestScatterGizmoTool(omni.kit.test.AsyncTestCase):
             tuple(self._layer.GetPrimAtPath(Sdf.Path(path)).attributes["xformOp:translate"].default)
             for path in self._placements
         ]
+
+
+class TestScatterGizmoTool(_ScatterGizmoTestCase):
+    """Drives the gizmo's scope, visibility and drag lifecycle."""
 
     async def test_selecting_a_scatter_container_shows_the_gizmo_on_it(self):
         # Arrange
@@ -380,7 +385,7 @@ class TestScatterGizmoGestures(omni.kit.test.AsyncTestCase):
         gesture.on_ended()
 
         # Assert
-        tool.begin_drag.assert_called_once()
+        tool.begin_drag.assert_called_once_with(rotating=False)
         tool.end_drag.assert_called_once()
         self.assertEqual(tool.update_drag.call_args.args[0].ExtractTranslation(), Gf.Vec3d(7.0, 0.0, 3.0))
 
@@ -394,7 +399,7 @@ class TestScatterGizmoGestures(omni.kit.test.AsyncTestCase):
         gesture.on_ended()
 
         # Assert
-        tool.begin_drag.assert_called_once()
+        tool.begin_drag.assert_called_once_with(rotating=True)
         tool.end_drag.assert_called_once()
         turned = tool.update_drag.call_args.args[0].TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
         self.assertTrue((turned - Gf.Vec3d(0.0, 1.0, 0.0)).GetLength() < 1e-6, f"{turned} is not a quarter turn")
@@ -449,3 +454,121 @@ class TestScatterGizmoGestures(omni.kit.test.AsyncTestCase):
 
         # Assert
         tool.cancel_drag.assert_called_once()
+
+
+class TestScatterGizmoOnThePreview(_ScatterGizmoTestCase):
+    """On the stroke the brush just painted, the rings set the brush's base rotation and nothing adds an undo step.
+
+    The preview itself is the controller's to decide; it is stood in for here so the stroke does not have to be
+    committed through the command system, which these tests mock away.
+    """
+
+    async def setUp(self):
+        await super().setUp()
+        # The settings the patch was painted with, so a recomposition at an unchanged base rotation reproduces it.
+        self._controller.replace_settings(ScatterBrushSettings(preset_name="Grass", seed=5, randomize_seed=False))
+        preview = scope_of_placements(self._placements)
+        self._stack.enter_context(mock.patch.object(self._controller, "preview_scope", return_value=preview))
+        self._stack.enter_context(mock.patch.object(self._controller, "folds_into_preview", return_value=True))
+        self._tool.refresh()
+
+    def _rotations(self) -> list[tuple]:
+        """Return the authored rotation of every painted placement."""
+        return [
+            tuple(self._layer.GetPrimAtPath(Sdf.Path(path)).attributes["xformOp:rotateXYZ"].default)
+            for path in self._placements
+        ]
+
+    async def test_the_gizmo_sits_on_the_stroke_with_nothing_selected(self):
+        # Assert
+        self.assertTrue(self._tool.previewing)
+        self.assertEqual(self._tool.scope.placement_count, len(self._placements))
+        self.assertTrue(self._manipulator.enabled)
+
+    async def test_dragging_a_ring_sets_the_base_rotation_about_its_axis(self):
+        # Arrange
+        self._tool.begin_drag(rotating=True)
+
+        # Act
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 30.0)))
+
+        # Assert
+        settings = self._controller.settings
+        self.assertAlmostEqual(settings.base_rotation_x, 30.0, places=6)
+        self.assertEqual((settings.base_rotation_y, settings.base_rotation_z), (0.0, 0.0))
+        self._tool.end_drag()
+
+    async def test_dragging_a_ring_restands_every_placement_while_the_drag_is_held(self):
+        # Arrange
+        before = self._rotations()
+        self._tool.begin_drag(rotating=True)
+
+        # Act
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 90.0)))
+
+        # Assert
+        self.assertTrue(all(new != old for new, old in zip(self._rotations(), before)))
+        self._tool.end_drag()
+
+    async def test_each_step_of_a_ring_drag_is_measured_from_the_base_rotation_it_started_at(self):
+        # Arrange
+        self._controller.update_settings(base_rotation_y=10.0)
+        self._tool.begin_drag(rotating=True)
+
+        # Act
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.YAxis(), 5.0)))
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.YAxis(), 20.0)))
+
+        # Assert
+        self.assertAlmostEqual(self._controller.settings.base_rotation_y, 30.0, places=6)
+        self._tool.end_drag()
+
+    async def test_a_ring_drag_on_the_preview_adds_no_undo_step(self):
+        # Arrange
+        self._tool.begin_drag(rotating=True)
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.ZAxis(), 45.0)))
+        self._execute.reset_mock()
+
+        # Act
+        self._tool.end_drag()
+
+        # Assert
+        self._execute.assert_not_called()
+
+    async def test_cancelling_a_ring_drag_puts_the_base_rotation_and_the_stroke_back(self):
+        # Arrange
+        before = self._rotations()
+        self._tool.begin_drag(rotating=True)
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 60.0)))
+
+        # Act
+        self._tool.cancel_drag()
+
+        # Assert
+        self.assertEqual(self._controller.settings.base_rotation_x, 0.0)
+        for new, old in zip(self._rotations(), before):
+            self.assertTrue(all(abs(a - b) < 1e-4 for a, b in zip(new, old)), f"{new} != {old}")
+
+    async def test_sliding_the_preview_moves_it_without_an_undo_step(self):
+        # Arrange
+        before = self._positions()
+        self._tool.begin_drag()
+        self._tool.update_drag(Gf.Matrix4d().SetTranslate(Gf.Vec3d(40.0, 0.0, 0.0)))
+        self._execute.reset_mock()
+
+        # Act
+        self._tool.end_drag()
+
+        # Assert
+        moved = [new[0] - old[0] for new, old in zip(self._positions(), before)]
+        self.assertTrue(all(abs(value - 40.0) < 1e-6 for value in moved))
+        self._execute.assert_not_called()
+
+
+class TestWrapDegrees(omni.kit.test.AsyncTestCase):
+    async def test_wrap_degrees_with_an_angle_past_a_half_turn_brings_it_into_range(self):
+        # Act
+        wrapped = [scatter_gizmo_module._wrap_degrees(value) for value in (190.0, -190.0, 540.0, 179.0)]
+
+        # Assert
+        self.assertEqual(wrapped, [-170.0, 170.0, -180.0, 179.0])

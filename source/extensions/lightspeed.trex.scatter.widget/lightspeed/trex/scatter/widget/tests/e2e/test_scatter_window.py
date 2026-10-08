@@ -35,6 +35,8 @@ from lightspeed.trex.scatter.core import (
     ScatterBrushSettings,
     ScatterMode,
     ScatterTarget,
+    StrokeSession,
+    SurfaceHit,
     UpAxis,
     author_placements,
     destroy_scatter_brush_controller,
@@ -131,6 +133,7 @@ class TestScatterWindowE2E(AsyncTestCase):
             if cancel_button is not None:
                 await cancel_button.click()
         self._controller.delete_preset(_PRESET_NAME)
+        self._controller.end_preview()
         self._controller.set_mode(ScatterMode.OFF)
         ui.Workspace.show_window(_WINDOW_TITLE, False)
         await ui_test.human_delay(2)
@@ -245,6 +248,12 @@ class TestScatterWindowE2E(AsyncTestCase):
         Returns:
             The placement paths of the grass patch and of the glass patch.
         """
+        stage = await self._open_quad_stage()
+        self._controller.replace_settings(ScatterBrushSettings(randomize_seed=False, size_min=10.0, size_max=20.0))
+        return (self._paint_patch(stage, "Grass", 7), self._paint_patch(stage, "Glass", 99))
+
+    async def _open_quad_stage(self):
+        """Open a capture-like stage holding one instance of a flat quad, and return it."""
         usd_context = omni.usd.get_context(_CONTEXT_NAME)
         await usd_context.new_stage_async()
         self._painted_stage = True
@@ -264,8 +273,57 @@ class TestScatterWindowE2E(AsyncTestCase):
         )
         mesh.GetFaceVertexCountsAttr().Set([4])
         mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
-        self._controller.replace_settings(ScatterBrushSettings(randomize_seed=False, size_min=10.0, size_max=20.0))
-        return (self._paint_patch(stage, "Grass", 7), self._paint_patch(stage, "Glass", 99))
+        return stage
+
+    def _paint_stroke(self, stage) -> list[str]:
+        """Paint one stroke with the brush's own stroke session and make it the preview, as the viewport brush does.
+
+        Returns:
+            The placement paths the stroke created.
+        """
+        target = ScatterTarget(
+            prototype_root=Sdf.Path(_PROTOTYPE_ROOT),
+            parent_instance_root=Sdf.Path(_INSTANCE_ROOT),
+            mesh_path=Sdf.Path(_MESH_PATH),
+            parent_world=Gf.Matrix4d(1.0),
+            instance_count=1,
+        )
+        asset = ScatterAssetEntry(path=_SCATTER_ASSET, up_axis=UpAxis.Z, natural_extent=(1.0, 1.0, 2.0))
+        cache = MeshSurfaceCache(lambda: stage)
+        sample = cache.closest_point(_MESH_PATH, Gf.Vec3d(0.0, 0.0, 0.0), 10.0)
+        seed, stroke_index = self._controller.next_stroke()
+        session = StrokeSession(
+            _CONTEXT_NAME, self._controller.settings, [asset], cache, False, UpAxis.Z, seed, stroke_index
+        )
+        layer = stage.GetRootLayer()
+        before = {str(child.path) for child in self._container_children(layer)}
+        session.begin(SurfaceHit(path=Sdf.Path(_MESH_PATH), world_position=Gf.Vec3d(0.0, 0.0, 0.0)), target, sample)
+        session.end()
+        cache.destroy()
+        self.assertTrue(self._controller.begin_preview(_CONTEXT_NAME), "The stroke did not become the preview")
+        created = sorted(str(child.path) for child in self._container_children(layer) if str(child.path) not in before)
+        self.assertTrue(created, "The stroke painted no placement")
+        return created
+
+    def _container_children(self, layer) -> list:
+        """Return the placement specs of the current preset's container on the test prototype."""
+        container = layer.GetPrimAtPath(f"{_PROTOTYPE_ROOT}/{CONTAINER_PREFIX}{self._controller.settings.slug()}")
+        return [] if container is None else list(container.nameChildren)
+
+    def _rotations(self, paths: list[str]) -> list[tuple]:
+        """Return the authored rotation of every placement, as the edit layer holds it."""
+        layer = omni.usd.get_context(_CONTEXT_NAME).get_stage().GetRootLayer()
+        return [tuple(layer.GetPrimAtPath(Sdf.Path(path)).attributes["xformOp:rotateXYZ"].default) for path in paths]
+
+    @staticmethod
+    def _asset_y_axis(rotate_xyz) -> Gf.Vec3d:
+        """Return where an authored rotateXYZ sends the asset's own +Y axis."""
+        rotation = (
+            Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), rotate_xyz[0]))
+            * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.YAxis(), rotate_xyz[1]))
+            * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.ZAxis(), rotate_xyz[2]))
+        )
+        return rotation.TransformDir(Gf.Vec3d.YAxis()).GetNormalized()
 
     def _paint_patch(self, stage, preset_name: str, seed: int) -> list[str]:
         """Author one stamp of a preset onto the quad the way a brush stroke does, and return its placements."""
@@ -385,3 +443,72 @@ class TestScatterWindowE2E(AsyncTestCase):
         # The setting changed for the next stroke only; the selected patch did not move.
         self.assertEqual(self._controller.settings.size_min, 60.0)
         self.assertEqual(self._scales(glass), glass_before)
+
+    async def test_tuning_the_last_stroke_then_undoing_once_removes_it_and_keeps_the_tuned_setting(self):
+        # The user paints a stroke of an asset that comes out lying on its side. Right after the stroke the window
+        # says the stroke itself is what a settings change will update.
+        stage = await self._open_quad_stage()
+        self._controller.replace_settings(ScatterBrushSettings(randomize_seed=False, assign_textures=False))
+        stroke = self._paint_stroke(stage)
+        await ui_test.human_delay(10)
+        scope_label = await self._find_control("Label", "scatter_live_edit_scope")
+        self.assertIn("Last stroke", scope_label.widget.text)
+        rotations_before = self._rotations(stroke)
+
+        # They stand the asset up with Base Rotation X and see the stroke follow.
+        base_x = await self._find_control("FloatBoundedDrag", "scatter_base_rotation_x")
+        await base_x.input("90", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(20)
+        self.assertEqual(self._controller.settings.base_rotation_x, 90.0)
+        self.assertNotEqual(self._rotations(stroke), rotations_before)
+
+        # Happy with it, they undo once: the whole stroke is gone, and the base rotation they tuned is still set.
+        omni.kit.undo.undo()
+        await ui_test.human_delay(10)
+        layer = stage.GetRootLayer()
+        self.assertTrue(all(layer.GetPrimAtPath(Sdf.Path(path)) is None for path in stroke))
+        self.assertEqual(self._controller.settings.base_rotation_x, 90.0)
+        self.assertEqual(base_x.widget.model.get_value_as_float(), 90.0)
+
+        # The next stroke comes out the way they tuned it: the asset's own +Y axis now stands along the stage up axis.
+        next_stroke = self._paint_stroke(stage)
+        for rotate_xyz in self._rotations(next_stroke):
+            self.assertGreater(self._asset_y_axis(rotate_xyz)[2], 0.999)
+
+    async def test_tuning_the_last_stroke_adds_no_undo_step_of_its_own(self):
+        # The user paints a stroke and nudges the base rotation of it twice.
+        stage = await self._open_quad_stage()
+        self._controller.replace_settings(ScatterBrushSettings(randomize_seed=False, assign_textures=False))
+        self._paint_stroke(stage)
+        await ui_test.human_delay(10)
+        depth = len(omni.kit.undo.get_undo_stack())
+        base_z = await self._find_control("FloatBoundedDrag", "scatter_base_rotation_z")
+        await base_z.input("30", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(10)
+        await base_z.input("45", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(10)
+
+        # Both edits belong to the stroke, so the undo history is exactly as deep as it was after painting.
+        self.assertEqual(len(omni.kit.undo.get_undo_stack()), depth)
+
+    async def test_selecting_scatter_after_a_stroke_makes_later_edits_undo_steps_of_their_own(self):
+        # The user paints a stroke, then selects the patch it went into.
+        stage = await self._open_quad_stage()
+        self._controller.replace_settings(ScatterBrushSettings(randomize_seed=False, assign_textures=False))
+        stroke = self._paint_stroke(stage)
+        container = str(Sdf.Path(stroke[0]).GetParentPath())
+        omni.usd.get_context(_CONTEXT_NAME).get_selection().set_selected_prim_paths([container], True)
+        await ui_test.human_delay(20)
+        scope_label = await self._find_control("Label", "scatter_live_edit_scope")
+        self.assertNotIn("Last stroke", scope_label.widget.text)
+        depth = len(omni.kit.undo.get_undo_stack())
+
+        # They resize the selection; that edit is now an undo step, and undoing it leaves the stroke in place.
+        size_min = await self._find_control("FloatBoundedDrag", "scatter_size_min")
+        await size_min.input("40", end_key=KeyboardInput.ENTER)
+        await ui_test.human_delay(20)
+        self.assertEqual(len(omni.kit.undo.get_undo_stack()), depth + 1)
+        omni.kit.undo.undo()
+        await ui_test.human_delay(10)
+        layer = stage.GetRootLayer()
+        self.assertTrue(all(layer.GetPrimAtPath(Sdf.Path(path)) is not None for path in stroke))

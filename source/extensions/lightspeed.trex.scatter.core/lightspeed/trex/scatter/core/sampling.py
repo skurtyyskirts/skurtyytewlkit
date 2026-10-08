@@ -367,7 +367,13 @@ class ParentSpaceOrigin:
 
     def to_values(self) -> tuple[float, ...]:
         """Flatten the origin into the six or nine doubles a placement authors; no heading means six."""
-        values = [*self.position, *self.normal, *(self.heading or ())]
+        # Indexed rather than unpacked: unpacking a Gf vector iterates it in Python, and a drag flattens one origin
+        # per placement at every step.
+        position, normal = self.position, self.normal
+        values = (position[0], position[1], position[2], normal[0], normal[1], normal[2])
+        heading = self.heading
+        if heading is not None:
+            values += (heading[0], heading[1], heading[2])
         return tuple(float(value) for value in values)
 
     @classmethod
@@ -432,9 +438,9 @@ def compose_parent_space_transform(
 ) -> tuple[Gf.Vec3d, Gf.Vec3f, Gf.Vec3f]:
     """Compute the translate / rotateXYZ / scale ops of one placement in the space of its parent instance.
 
-    The rotation applied to the asset is, first to last: the asset up-axis correction, tilt about X, tilt about Y,
-    yaw about the stage up axis (random spin plus stroke heading), then the rotation taking the stage up axis onto
-    the surface normal when conform_to_surface is set.
+    The rotation applied to the asset is, first to last: the asset up-axis correction, the base rotation, tilt about
+    X, tilt about Y, yaw about the stage up axis (random spin plus stroke heading), then the rotation taking the stage
+    up axis onto the surface normal when conform_to_surface is set.
 
     The parent's own scale is divided out of both the authored scale and the vertical offset, so a placement comes
     out the same size wherever it is painted; this makes them world-space quantities like radius, padding and
@@ -491,8 +497,15 @@ def compose_parent_space_transform(
         yaw += _heading_yaw_degrees(origin.heading, effective_up, conform)
 
     # Row-vector products: the first rotation applied to the asset is on the left
+    rotation = Gf.Matrix4d().SetRotate(asset_up_correction(asset_up, stage_up))
+    if settings.base_rotation_x or settings.base_rotation_y or settings.base_rotation_z:
+        # Ahead of the random draws, so it turns the asset in its own frame: every placement is stood up or leaned
+        # the same way whatever yaw it then draws, which a turn applied after the yaw could never do.
+        rotation = rotation * turn_matrix(
+            (settings.base_rotation_x, settings.base_rotation_y, settings.base_rotation_z)
+        )
     rotation = (
-        Gf.Matrix4d().SetRotate(asset_up_correction(asset_up, stage_up))
+        rotation
         * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), rotate_x))
         * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.YAxis(), rotate_y))
         * Gf.Matrix4d().SetRotate(Gf.Rotation(up, yaw))
@@ -574,11 +587,15 @@ class PaddingIndex:
 
     def add_many(self, points: np.ndarray) -> None:
         """Store every row of a (K, 3) array."""
-        array = np.asarray(points, dtype=np.float64)
+        array = np.asarray(points, dtype=np.float64).reshape(-1, 3)
         if array.size == 0:
             return
-        for point in array.reshape(-1, 3):
-            self.add(point)
+        # One vectorised floor for every point instead of one per point: a stroke seeds the index with every
+        # placement already on the prototype, which can be tens of thousands.
+        cells = np.floor(array / self._cell_size).astype(np.int64).tolist()
+        for cell, point in zip(cells, array):
+            self._cells.setdefault((cell[0], cell[1], cell[2]), []).append(point)
+        self._count += len(array)
 
     def is_free(self, point, min_distance: float) -> bool:
         """Whether no stored point lies strictly closer than min_distance to the point."""

@@ -50,10 +50,13 @@ class ScatterStrokeKind(StrEnum):
 class ScatterStrokeCommand(omni.kit.commands.Command):
     """One brush stroke.
 
-    PLACE: the records were already authored live while the mouse moved, so the first ``do()`` is a no-op, ``undo()``
-    removes the created prims and redo re-authors them. ERASE: the prims were already removed live and a snapshot of
-    their specs is given, so the first ``do()`` is a no-op, ``undo()`` restores them from the snapshot and redo removes
-    them again. With ``already_applied=False`` the first ``do()`` performs the edit itself.
+    PLACE: the records were already authored live while the mouse moved, so the first ``do()`` is a no-op. ``undo()``
+    snapshots the created prims as they stand and removes them, and redo restores that snapshot. Snapshotting at undo
+    time rather than replaying the records is what lets a stroke that was tuned while it was the brush preview come
+    back tuned: those edits are folded into the stroke instead of being undo steps of their own. ERASE: the prims were
+    already removed live and a snapshot of their specs is given, so the first ``do()`` is a no-op, ``undo()`` restores
+    them from the snapshot and redo removes them again. With ``already_applied=False`` the first ``do()`` performs the
+    edit itself.
     """
 
     def __init__(
@@ -89,6 +92,23 @@ class ScatterStrokeCommand(omni.kit.commands.Command):
         self._snapshot_layer = snapshot_layer
         self._skip_next_do = already_applied
         self._created_paths = [record.prim_path for record in self._records] if already_applied else []
+        # PLACE only: the stroke as it stood when it was last undone, which a redo restores.
+        self._undone_layer: Sdf.Layer | None = None
+
+    @property
+    def kind(self) -> ScatterStrokeKind:
+        """Whether the stroke placed or erased."""
+        return self._kind
+
+    @property
+    def layer_identifier(self) -> str:
+        """Identifier of the layer the stroke edits."""
+        return self._layer_identifier
+
+    @property
+    def created_paths(self) -> list[str]:
+        """PLACE only: the prim paths the stroke created; empty for an erase or before the first ``do()``."""
+        return list(self._created_paths)
 
     def do(self) -> list[str]:
         """Apply the stroke unless it was already applied live; returns the affected prim paths."""
@@ -99,6 +119,10 @@ class ScatterStrokeCommand(omni.kit.commands.Command):
         if layer is None:
             return []
         if self._kind == ScatterStrokeKind.PLACE:
+            if self._undone_layer is not None:
+                restore_prims(layer, self._undone_layer, self._created_paths)
+                self._undone_layer = None
+                return list(self._created_paths)
             self._created_paths = author_placements(layer, self._records, self._materials)
             return list(self._created_paths)
         if self._snapshot_layer is None:
@@ -112,6 +136,7 @@ class ScatterStrokeCommand(omni.kit.commands.Command):
         if layer is None:
             return
         if self._kind == ScatterStrokeKind.PLACE:
+            self._undone_layer = snapshot_prims(layer, self._created_paths)
             remove_placements(layer, self._created_paths)
             return
         if self._snapshot_layer is None:

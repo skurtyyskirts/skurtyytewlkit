@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The move gizmo now passes the brush's Conform to Surface setting into the move, and its rotate rings send their rotation with no pivot, so dragging them aims the patch where it stands instead of swinging it around the handle and re-planting it somewhere else.
 - The move gizmo now answers only to drags of its own arrows and rings. A manipulator hands every gesture registered on it whatever payload the dispatch carries, and only the drag of a handle carries the distance or angle it was dragged by, so the rings were reading an angle off dispatches that hold none: every frame of a ring drag raised and the patch stayed where it was.
 - The move gizmo now reports the turn it has given a patch, so the Scatter window's Turn fields follow the rings as they are dragged, and it takes its drag lifecycle from the scatter core rather than keeping its own, so a turn dialled into those fields and a drag of a ring commit the same way
+- Committing a paint stroke now makes it the scatter preview. The move gizmo takes its scope from the shared live-edit driver, so it sits on that stroke with nothing selected, and on it the rotate rings set the brush's base rotation, spinning every placement about its own root and carrying into later strokes, while a drag of the preview adds no undo step of its own
 
 ## [1.8.5]
 ### Fixed

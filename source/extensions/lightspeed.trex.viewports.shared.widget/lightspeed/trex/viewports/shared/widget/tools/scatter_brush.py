@@ -598,7 +598,12 @@ class ScatterBrushTool:
         except Exception as exc:  # noqa: BLE001 - runs from gesture and teardown paths that must not propagate.
             carb.log_error(f"{_LOG_PREFIX} Scatter stroke commit failed: {exc}")
             return
-        get_scatter_brush_controller().notify_stroke_committed(count, session.erase)
+        controller = get_scatter_brush_controller()
+        if count and not session.erase:
+            # The stroke just committed is what live edits change until anything else happens, so it can be tuned
+            # by eye and then undone in one step with the settings it was tuned to left in place.
+            controller.begin_preview(self._usd_context_name)
+        controller.notify_stroke_committed(count, session.erase)
         if count and not session.erase:
             self._warn_replicated_prototypes(touched)
 

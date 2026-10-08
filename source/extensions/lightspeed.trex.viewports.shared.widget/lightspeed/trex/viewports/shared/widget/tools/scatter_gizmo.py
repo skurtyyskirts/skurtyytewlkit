@@ -29,8 +29,8 @@ from lightspeed.trex.scatter.core import (
     ReapplyScope,
     ScatterMode,
     ScopeDragSession,
+    get_reapply_driver,
     get_scatter_brush_controller,
-    resolve_scope,
     scope_pivot,
     turn_matrix,
     turn_to_degrees,
@@ -60,6 +60,7 @@ _LOG_PREFIX = "[lightspeed.trex.viewports.shared.widget]"
 _TRANSFORM_OP_SETTING = "/app/transform/operation"
 _OPERATIONS = {"move": Operation.TRANSLATE, "rotate": Operation.ROTATE}
 _MANIPULATOR_SIZE = 1.0
+_BASE_ROTATION_FIELDS = ("base_rotation_x", "base_rotation_y", "base_rotation_z")
 
 
 def scatter_gizmo_factory(desc: dict[str, Any]) -> ScatterGizmoTool:
@@ -74,10 +75,14 @@ def scatter_gizmo_factory(desc: dict[str, Any]) -> ScatterGizmoTool:
 class ScatterGizmoTool:
     """Viewport half of the scatter move gizmo for one viewport.
 
-    Shows the standard transform gizmo at the centre of the painted scatter the user has selected, and turns a drag
-    of it into one undoable move of that whole patch. The scope comes from ``resolve_scope``, the same rules the
-    Scatter window's live editing uses, resolved here rather than read from the window so the gizmo works whether or
-    not that window is open.
+    Shows the standard transform gizmo at the centre of the scatter live editing applies to, and turns a drag of it
+    into one undoable move of that whole patch. The scope is the shared live-edit driver's, so the gizmo sits on the
+    stroke the brush just painted while that stroke is the preview, and on the selected scatter otherwise, whether
+    or not the Scatter window is open.
+
+    On the preview the rings do something else: they set the brush's base rotation, which spins every placement of
+    the stroke about its own root and carries into every stroke painted afterwards. That is what fixes an asset
+    that comes out lying down, which a turn of the patch cannot, because each placement draws its own yaw first.
 
     The gizmo is hidden while the brush is painting or erasing, because a handle sitting on the patch would take the
     drag the brush is waiting for.
@@ -102,7 +107,10 @@ class ScatterGizmoTool:
         self._visible = True
         self._scope = ReapplyScope()
         self._controller = get_scatter_brush_controller()
+        self._driver = get_reapply_driver(self._usd_context_name)
         self._cache: MeshSurfaceCache | None = MeshSurfaceCache(self._stage)
+        # The base rotation a ring drag on the preview started from, or None when no such drag is open.
+        self._base_at_start: tuple[float, float, float] | None = None
 
         self._session = ScopeDragSession(self._usd_context_name, self._cache)
         # The turn the patch already stood at when this drag opened, so consecutive drags add up rather than each
@@ -126,6 +134,9 @@ class ScatterGizmoTool:
             _TRANSFORM_OP_SETTING, lambda *_: self.refresh()
         )
         self._mode_subscription = self._controller.subscribe_mode_changed(lambda *_: self.refresh())
+        # The driver follows the selection and the preview, and says so once it has; following the selection here
+        # as well could read the scope before the driver had updated it.
+        self._scope_subscription = self._driver.subscribe_scope_changed(lambda *_: self.refresh())
         self._stage_event_subscription = (
             omni.usd.get_context(self._usd_context_name)
             .get_stage_event_stream()
@@ -163,15 +174,22 @@ class ScatterGizmoTool:
         """World point the gizmo sits on, which a turn of the patch is measured about."""
         return self._pivot
 
+    @property
+    def previewing(self) -> bool:
+        """Whether the gizmo sits on the stroke the brush just painted rather than on the selection."""
+        return self._driver.previewing
+
     def refresh(self) -> None:
-        """Resolve the selection again and show the gizmo on it when a drag would have somewhere to land."""
+        """Take the live-edit scope again and show the gizmo on it when a drag would have somewhere to land."""
         if self._manipulator is None:
             return
         stage = self._stage()
-        usd_context = omni.usd.get_context(self._usd_context_name)
-        self._scope = (
-            ReapplyScope() if stage is None else resolve_scope(stage, usd_context, self._controller.settings)
-        )
+        if stage is None:
+            self._scope = ReapplyScope()
+        else:
+            # Resolved again rather than read as it stands: the selection can change before the driver has heard.
+            self._driver.refresh_scope()
+            self._scope = self._driver.scope
         operation = _OPERATIONS.get(carb.settings.get_settings().get(_TRANSFORM_OP_SETTING))
         showing = bool(
             self._visible
@@ -190,26 +208,66 @@ class ScatterGizmoTool:
                 self._model.set_floats(self._model.get_item("translate"), [pivot[0], pivot[1], pivot[2]])
         self._manipulator.enabled = showing
 
-    def begin_drag(self) -> None:
-        """Take the patch as it stands, so every step of the drag is measured from there rather than from the last."""
+    def begin_drag(self, rotating: bool = False) -> None:
+        """Take the patch as it stands, so every step of the drag is measured from there rather than from the last.
+
+        Args:
+            rotating: Whether the drag is of a ring. On the preview a ring drag sets the base rotation instead.
+        """
+        if rotating and self.previewing:
+            settings = self._controller.settings
+            self._base_at_start = tuple(float(getattr(settings, name)) for name in _BASE_ROTATION_FIELDS)
+            # One edit for the whole drag, however many settings changes it makes on the way.
+            self._driver.hold()
+            return
         if self._session.begin(self._scope, self._conform):
             self._turn_at_start = turn_matrix(self._controller.selection_turn(self._scope))
 
     def update_drag(self, delta: Gf.Matrix4d) -> None:
         """Move the patch to where a drag of ``delta`` from the start of the gesture would put it."""
+        if self._base_at_start is not None:
+            self._spin_preview(delta)
+            return
         self._report(self._session.update(delta))
         self._publish_turn(delta)
 
     def end_drag(self) -> None:
         """Commit the drag as one undoable move and put the gizmo back on the patch where it now sits."""
+        if self._base_at_start is not None:
+            self._base_at_start = None
+            self._driver.release()
+            self.refresh()
+            return
         self._session.commit()
         self.refresh()
 
     def cancel_drag(self) -> None:
         """Put the patch back as it was and close the drag without committing anything."""
+        if self._base_at_start is not None:
+            start, self._base_at_start = self._base_at_start, None
+            self._controller.update_settings(**dict(zip(_BASE_ROTATION_FIELDS, start)))
+            self._driver.release()
+            self.refresh()
+            return
         self._session.cancel()
         self._controller.set_selection_turn(self._scope, turn_to_degrees(self._turn_at_start))
         self.refresh()
+
+    def _spin_preview(self, delta: Gf.Matrix4d) -> None:
+        """Set the base rotation to where a ring drag of ``delta`` from its start takes it.
+
+        A ring turns about one stage axis, so the drag adds its angle to the base rotation about that axis. The live
+        edit driver applies the change to the preview the way it applies any settings change, and folds it into the
+        stroke.
+        """
+        rotation = delta.ExtractRotation()
+        axis = rotation.GetAxis()
+        index = max(range(3), key=lambda component: abs(axis[component]))
+        # Axis and angle can come back both negated; their product is the same either way.
+        degrees = axis[index] * rotation.GetAngle()
+        target = list(self._base_at_start)
+        target[index] = _wrap_degrees(target[index] + degrees)
+        self._controller.update_settings(**dict(zip(_BASE_ROTATION_FIELDS, target)))
 
     def _publish_turn(self, delta: Gf.Matrix4d) -> None:
         """Tell the Scatter window's turn fields where this drag has aimed the patch.
@@ -227,6 +285,7 @@ class ScatterGizmoTool:
         self.cancel_drag()
         self._operation_subscription = None
         self._mode_subscription = None
+        self._scope_subscription = None
         self._stage_event_subscription = None
         if self._cache is not None:
             self._cache.destroy()
@@ -247,10 +306,8 @@ class ScatterGizmoTool:
         return None if usd_context is None else usd_context.get_stage()
 
     def _on_stage_event(self, event) -> None:
-        """Follow the selection, and close a drag the stage is about to pull the ground out from under."""
-        if event.type == int(omni.usd.StageEventType.SELECTION_CHANGED):
-            self.refresh()
-        elif event.type in (int(omni.usd.StageEventType.CLOSING), int(omni.usd.StageEventType.OPENED)):
+        """Close a drag the stage is about to pull the ground out from under."""
+        if event.type in (int(omni.usd.StageEventType.CLOSING), int(omni.usd.StageEventType.OPENED)):
             self.cancel_drag()
 
     def _report(self, outcome: MoveOutcome) -> None:
@@ -258,6 +315,11 @@ class ScatterGizmoTool:
         notes = outcome.describe()
         if notes:
             carb.log_info(f"{_LOG_PREFIX} Scatter move: {notes}")
+
+
+def _wrap_degrees(degrees: float) -> float:
+    """Return an angle in degrees brought into [-180, 180), the range a base rotation accepts."""
+    return (degrees + 180.0) % 360.0 - 180.0
 
 
 class _PatchGesture:
@@ -270,6 +332,7 @@ class _PatchGesture:
     """
 
     _PAYLOAD_TYPE: type = TransformDragGesturePayload
+    _ROTATES = False
 
     def __init__(self, tool: ScatterGizmoTool):
         super().__init__()
@@ -283,7 +346,7 @@ class _PatchGesture:
     def on_began(self):
         """Start the drag."""
         if self._drag_payload() is not None:
-            self._tool.begin_drag()
+            self._tool.begin_drag(rotating=self._ROTATES)
 
     def on_ended(self):
         """Commit the drag."""
@@ -314,6 +377,7 @@ class _RotateGesture(_PatchGesture, RotateChangedGesture):
     """Turns a drag of the rotate rings into a turn of every placement of the patch where it stands."""
 
     _PAYLOAD_TYPE = RotateDragGesturePayload
+    _ROTATES = True
 
     def on_changed(self):
         """Aim the patch by the total angle dragged so far, about the axis the ring stands for.

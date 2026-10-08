@@ -407,6 +407,122 @@ class TestScatterStrokeCommand(omni.kit.test.AsyncTestCase):
         self.assertIsNone(self._layer.GetPrimAtPath(shader_path))
         self.assertIsNone(self._layer.GetPrimAtPath(self._records[0].prim_path))
 
+    def _edit_translate(self, record: PlacementRecord, translate: Gf.Vec3d) -> None:
+        """Change a placement in the layer without an undo step, as a live edit of the brush preview does."""
+        self._layer.GetPrimAtPath(record.prim_path).attributes["xformOp:translate"].default = translate
+
+    def _translate_of(self, record: PlacementRecord) -> Gf.Vec3d:
+        return self._layer.GetPrimAtPath(record.prim_path).attributes["xformOp:translate"].default
+
+    def _make_command(self, kind: ScatterStrokeKind, already_applied: bool = True) -> ScatterStrokeCommand:
+        return ScatterStrokeCommand(
+            context_name="",
+            layer_identifier=self._layer.identifier,
+            kind=kind.value,
+            records=self._records if kind == ScatterStrokeKind.PLACE else None,
+            prim_paths=[record.prim_path for record in self._records] if kind == ScatterStrokeKind.ERASE else None,
+            already_applied=already_applied,
+        )
+
+    async def test_place_redo_restores_an_edit_made_to_the_stroke_before_it_was_undone(self):
+        # Arrange
+        author_placements(self._layer, self._records)
+        self._execute_place(self._records, already_applied=True)
+        self._edit_translate(self._records[0], Gf.Vec3d(7.0, 8.0, 9.0))
+        omni.kit.undo.undo()
+
+        # Act
+        omni.kit.undo.redo()
+
+        # Assert - restored as it stood when undone, not re-authored from the records it was painted with
+        self.assertEqual(self._translate_of(self._records[0]), Gf.Vec3d(7.0, 8.0, 9.0))
+        self.assertEqual(self._translate_of(self._records[1]), Gf.Vec3d(4.0, 5.0, 6.0))
+
+    async def test_place_second_redo_restores_an_edit_made_after_the_first_redo(self):
+        # Arrange
+        author_placements(self._layer, self._records)
+        self._execute_place(self._records, already_applied=True)
+        omni.kit.undo.undo()
+        omni.kit.undo.redo()
+        self._edit_translate(self._records[1], Gf.Vec3d(-1.0, -2.0, -3.0))
+        omni.kit.undo.undo()
+
+        # Act
+        omni.kit.undo.redo()
+
+        # Assert
+        self.assertEqual(self._translate_of(self._records[1]), Gf.Vec3d(-1.0, -2.0, -3.0))
+
+    async def test_kind_of_a_place_stroke_is_place(self):
+        # Arrange
+        command = self._make_command(ScatterStrokeKind.PLACE)
+
+        # Act
+        kind = command.kind
+
+        # Assert
+        self.assertEqual(kind, ScatterStrokeKind.PLACE)
+
+    async def test_kind_of_an_erase_stroke_is_erase(self):
+        # Arrange
+        command = self._make_command(ScatterStrokeKind.ERASE)
+
+        # Act
+        kind = command.kind
+
+        # Assert
+        self.assertEqual(kind, ScatterStrokeKind.ERASE)
+
+    async def test_layer_identifier_is_the_layer_the_stroke_edits(self):
+        # Arrange
+        command = self._make_command(ScatterStrokeKind.PLACE)
+
+        # Act
+        identifier = command.layer_identifier
+
+        # Assert
+        self.assertEqual(identifier, self._layer.identifier)
+
+    async def test_created_paths_of_an_applied_place_stroke_lists_every_record(self):
+        # Arrange
+        command = self._make_command(ScatterStrokeKind.PLACE)
+
+        # Act
+        created = command.created_paths
+
+        # Assert
+        self.assertEqual(created, [record.prim_path for record in self._records])
+
+    async def test_created_paths_of_a_place_stroke_not_yet_applied_is_empty_until_it_is_done(self):
+        # Arrange
+        command = self._make_command(ScatterStrokeKind.PLACE, already_applied=False)
+
+        # Act
+        created = command.created_paths
+
+        # Assert
+        self.assertEqual(created, [])
+
+    async def test_created_paths_of_an_erase_stroke_is_empty(self):
+        # Arrange
+        command = self._make_command(ScatterStrokeKind.ERASE)
+
+        # Act
+        created = command.created_paths
+
+        # Assert
+        self.assertEqual(created, [])
+
+    async def test_created_paths_returns_a_copy_the_caller_cannot_change_the_stroke_through(self):
+        # Arrange
+        command = self._make_command(ScatterStrokeKind.PLACE)
+
+        # Act
+        command.created_paths.clear()
+
+        # Assert
+        self.assertEqual(command.created_paths, [record.prim_path for record in self._records])
+
 
 class TestScatterFloodCommand(omni.kit.test.AsyncTestCase):
     async def setUp(self):

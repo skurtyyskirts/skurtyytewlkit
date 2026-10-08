@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "PreparedReapply",
     "ReapplyDriver",
     "ReapplyOutcome",
     "ReapplyScope",
@@ -25,13 +26,16 @@ __all__ = [
     "changed_reappliable_fields",
     "changed_recompose_assets",
     "is_hand_edited",
+    "prepare_reapply",
     "read_placement_origin",
     "read_placement_turn",
     "read_placement_yaw",
     "reapply_transforms",
     "resolve_scope",
+    "scope_of_placements",
 ]
 
+import dataclasses
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -61,15 +65,15 @@ from .constants import (
 )
 from .placement import PlacementTransform, asset_scale_factor, author_placement_transforms, transform_key
 from .sampling import (
-    turn_matrix,
     ParentSpaceOrigin,
     compose_parent_space_transform,
     placement_rng,
     stage_meters_per_unit,
     stage_up_axis,
     to_parent_space_origin,
+    turn_matrix,
 )
-from .settings import LIVE_EDIT_SOFT_LIMIT, REAPPLIABLE_FIELDS, ScatterAssetEntry, ScatterBrushSettings
+from .settings import LIVE_EDIT_SOFT_LIMIT, REAPPLIABLE_FIELDS, ScatterAssetEntry, ScatterBrushSettings, UpAxis
 from .targets import build_prototype_target, get_prototype_root, is_scatter_prim, prototype_side_path
 
 if TYPE_CHECKING:
@@ -82,6 +86,9 @@ _LOG_PREFIX = "[lightspeed.trex.scatter.core]"
 # brush radius bounds how far a stamp reaches and the vertical offset is the only thing that lifts a placement off
 # the surface, so twice the larger of the two covers a placement painted with settings close to the current ones.
 _RECOVERY_DISTANCE_FACTOR = 2.0
+# Draws a placement's generator makes at most when it is composed: three rotations, then up to three scales. Two spare
+# so that a composition drawing one more than expected fails loudly in the tests rather than reading past the end.
+_PLACEMENT_DRAWS = 8
 
 
 @dataclass(frozen=True)
@@ -251,37 +258,187 @@ def resolve_scope(
     return _build_scope(by_prototype)
 
 
-def reapply_transforms(
+def scope_of_placements(placement_paths: Sequence[Sdf.Path | str]) -> ReapplyScope:
+    """Return the scope holding exactly the given placements, grouped by the prototype each one is authored under.
+
+    Args:
+        placement_paths: Placement paths; an instance-side path is rewritten to the prototype side it is authored
+            on, and paths outside the capture topology are left out.
+
+    Returns:
+        The scope, empty when no path names a placement under a prototype.
+    """
+    by_prototype: dict[Sdf.Path, set[Sdf.Path]] = {}
+    for placement_path in placement_paths:
+        path = prototype_side_path(str(placement_path))
+        if path is None:
+            continue
+        by_prototype.setdefault(get_prototype_root(path), set()).add(path)
+    return _build_scope(by_prototype)
+
+
+class _ReplayedDraws:
+    """Stands in for a placement's generator by replaying draws taken from it once.
+
+    Building a generator costs more than composing a placement, and a slider drag composes every placement of the
+    scope at every step with the same seed. ``uniform`` is the arithmetic numpy performs on the same double, so a
+    replay produces exactly the values the generator would have.
+    """
+
+    __slots__ = ("_index", "_values")
+
+    def __init__(self, values: tuple[float, ...]):
+        self._values = values
+        self._index = 0
+
+    def random(self) -> float:
+        """Return the next draw in [0, 1)."""
+        value = self._values[self._index]
+        self._index += 1
+        return value
+
+    def uniform(self, low: float, high: float) -> float:
+        """Return the next draw spread over [low, high), as ``numpy.random.Generator.uniform`` computes it."""
+        return low + (high - low) * self.random()
+
+
+@dataclass
+class _PreparedPlacement:
+    """Everything a re-apply reads from one placement, read once when an edit opens.
+
+    Attributes:
+        path: Prototype-side path of the placement.
+        parent_world: World transform of the instance that parents it.
+        origin: Surface the placement is composed from.
+        key: The placement's own random key.
+        yaw: Degrees the move gizmo turned it by about the stage up axis.
+        turn: Whole turn it records, or None.
+        asset_key: Comparison key of the asset it references, to find its palette entry at every step.
+        fallback_asset: Entry used when the asset is not in the palette at a step: the palette entry when the edit
+            opened, or one read from the asset file.
+    """
+
+    path: Sdf.Path
+    parent_world: Gf.Matrix4d
+    origin: ParentSpaceOrigin
+    key: int
+    yaw: float
+    turn: Gf.Matrix4d | None
+    asset_key: str
+    fallback_asset: ScatterAssetEntry
+    draws_seed: int | None = None
+    seeded_draws: tuple[float, ...] = ()
+
+    def draws(self, seed: int) -> _ReplayedDraws:
+        """Return the draws this placement's generator makes under ``seed``, taken from it once per seed."""
+        if self.draws_seed != seed:
+            values = placement_rng(self.key, seed).random(_PLACEMENT_DRAWS)
+            self.seeded_draws = tuple(float(value) for value in values)
+            self.draws_seed = seed
+        return _ReplayedDraws(self.seeded_draws)
+
+
+class PreparedReapply:
+    """The placements of a scope read once, so that every step of a live edit only recomposes and writes them.
+
+    Reading a placement back from its layer costs more than composing it, and nothing a re-apply reads from a
+    placement changes while a setting is being dragged: the edit is the only thing writing to it.
+    """
+
+    def __init__(
+        self,
+        placements: list[_PreparedPlacement],
+        before: list[PlacementTransform],
+        outcome: ReapplyOutcome,
+        stage_up: UpAxis,
+        meters_per_unit: float,
+    ):
+        """
+        Args:
+            placements: The placements a re-apply may write to.
+            before: Their transforms when the edit opened, in the same order.
+            outcome: What happened to the placements of the scope that were left out.
+            stage_up: Up axis of the stage.
+            meters_per_unit: Meters per stage unit.
+        """
+        self._placements = placements
+        self._before = before
+        self._outcome = outcome
+        self._stage_up = stage_up
+        self._meters_per_unit = meters_per_unit
+
+    @property
+    def before(self) -> list[PlacementTransform]:
+        """The transforms the re-appliable placements had when the edit opened, in scope order."""
+        return list(self._before)
+
+    def compose(
+        self, settings: ScatterBrushSettings, assets: Sequence[ScatterAssetEntry]
+    ) -> tuple[list[PlacementTransform], ReapplyOutcome]:
+        """Recompose every prepared placement under ``settings`` and ``assets`` without writing anything.
+
+        Args:
+            settings: Settings to apply.
+            assets: Brush palette, which may have changed since the edit opened.
+
+        Returns:
+            ``(after, outcome)``: the transforms to author, in the order of :attr:`before`, and what happened to the
+            placements that are not among them.
+        """
+        palette = {asset_comparison_key(entry.path): entry for entry in assets}
+        after: list[PlacementTransform] = []
+        for item in self._placements:
+            asset = palette.get(item.asset_key, item.fallback_asset)
+            translate, rotate_xyz, scale = compose_parent_space_transform(
+                item.origin,
+                item.parent_world,
+                settings,
+                item.draws(settings.seed),
+                self._stage_up,
+                asset.up_axis,
+                asset_scale_factor(asset, settings, self._meters_per_unit),
+                item.yaw,
+                item.turn,
+            )
+            after.append(
+                PlacementTransform(
+                    prim_path=str(item.path),
+                    translate=_triple(translate),
+                    rotate_xyz=_triple(rotate_xyz),
+                    scale=_triple(scale),
+                )
+            )
+        return after, dataclasses.replace(self._outcome, reapplied=len(after))
+
+
+def prepare_reapply(
     stage: Usd.Stage,
     layer: Sdf.Layer,
     scope: ReapplyScope,
     settings: ScatterBrushSettings,
     assets: Sequence[ScatterAssetEntry],
     cache: MeshSurfaceCache,
-) -> tuple[list[PlacementTransform], list[PlacementTransform], ReapplyOutcome]:
-    """Recompose every placement in ``scope`` under ``settings`` without writing anything.
+) -> PreparedReapply:
+    """Read every placement in ``scope`` that a re-apply may write to, once.
 
-    Each placement is recomposed by the same function that painted it, from the surface it recorded and its own
-    random key, so a re-apply at unchanged settings produces the transform the placement already has.
+    Placements another layer authors, that were moved by hand, or whose asset or surface cannot be resolved are
+    counted on the outcome and left out.
 
     Args:
         stage: Stage holding the placements.
         layer: Layer whose opinions are read and that the result is meant to be authored in.
         scope: Placements the caller is allowed to touch.
-        settings: Settings to apply.
+        settings: Settings when the edit opens, used only to recover a surface a placement never recorded.
         assets: Brush palette, used to recover each placement's up axis and measurement.
         cache: Mesh cache, used to project placements that recorded no surface back onto their mesh.
 
     Returns:
-        ``(before, after, outcome)``: the transforms as they are now, the transforms to author, and what happened to
-        the placements that are in neither list.
+        The prepared placements, ready to be composed at every step of the edit.
     """
     outcome = ReapplyOutcome()
     before: list[PlacementTransform] = []
-    after: list[PlacementTransform] = []
+    placements: list[_PreparedPlacement] = []
     resolver = _AssetResolver(layer, assets)
-    up_axis = stage_up_axis(stage)
-    meters_per_unit = stage_meters_per_unit(stage)
     for entry in scope.entries:
         target = build_prototype_target(stage, entry.prototype_root)
         if target is None:
@@ -296,8 +453,8 @@ def reapply_transforms(
             if is_hand_edited(spec, current):
                 outcome.hand_edited += 1
                 continue
-            asset = resolver.resolve(spec)
-            if asset is None:
+            resolved = resolver.resolve_with_key(spec)
+            if resolved is None:
                 outcome.unresolved += 1
                 continue
             origin = read_placement_origin(spec)
@@ -307,68 +464,111 @@ def reapply_transforms(
                     outcome.unresolved += 1
                     continue
                 outcome.recovered += 1
-            translate, rotate_xyz, scale = compose_parent_space_transform(
-                origin,
-                target.parent_world,
-                settings,
-                placement_rng(_read_key(spec, path), settings.seed),
-                up_axis,
-                asset.up_axis,
-                asset_scale_factor(asset, settings, meters_per_unit),
-                read_placement_yaw(spec),
-                read_placement_turn(spec),
-            )
-            before.append(current)
-            after.append(
-                PlacementTransform(
-                    prim_path=str(path),
-                    translate=_triple(translate),
-                    rotate_xyz=_triple(rotate_xyz),
-                    scale=_triple(scale),
+            asset_key, asset = resolved
+            placements.append(
+                _PreparedPlacement(
+                    path=path,
+                    parent_world=target.parent_world,
+                    origin=origin,
+                    key=_read_key(spec, path),
+                    yaw=read_placement_yaw(spec),
+                    turn=read_placement_turn(spec),
+                    asset_key=asset_key,
+                    fallback_asset=asset,
                 )
             )
-            outcome.reapplied += 1
-    return before, after, outcome
+            before.append(current)
+    return PreparedReapply(placements, before, outcome, stage_up_axis(stage), stage_meters_per_unit(stage))
+
+
+def reapply_transforms(
+    stage: Usd.Stage,
+    layer: Sdf.Layer,
+    scope: ReapplyScope,
+    settings: ScatterBrushSettings,
+    assets: Sequence[ScatterAssetEntry],
+    cache: MeshSurfaceCache,
+) -> tuple[list[PlacementTransform], list[PlacementTransform], ReapplyOutcome]:
+    """Recompose every placement in ``scope`` under ``settings`` without writing anything.
+
+    Each placement is recomposed by the same function that painted it, from the surface it recorded and its own
+    random key, so a re-apply at unchanged settings produces the transform the placement already has. A live edit
+    calls :func:`prepare_reapply` once and composes the result at every step instead.
+
+    Args:
+        stage: Stage holding the placements.
+        layer: Layer whose opinions are read and that the result is meant to be authored in.
+        scope: Placements the caller is allowed to touch.
+        settings: Settings to apply.
+        assets: Brush palette, used to recover each placement's up axis and measurement.
+        cache: Mesh cache, used to project placements that recorded no surface back onto their mesh.
+
+    Returns:
+        ``(before, after, outcome)``: the transforms as they are now, the transforms to author, and what happened to
+        the placements that are in neither list.
+    """
+    prepared = prepare_reapply(stage, layer, scope, settings, assets, cache)
+    after, outcome = prepared.compose(settings, assets)
+    return prepared.before, after, outcome
 
 
 class ReapplyDriver:
-    """Applies re-appliable settings changes to the selected placements, live, as one undo step per edit.
+    """Applies re-appliable settings changes to painted scatter, live, as one undo step per edit.
 
-    Owned by the Scatter window, which also supplies the mesh cache and tells the driver when an edit is finished so
-    that a whole slider drag commits once. Changing a setting that decides where a stroke lands is ignored, and so is
-    every change made while ``edit_selection_live`` is off or nothing relevant is selected.
+    What an edit changes is the stroke the brush just painted while it is the preview, and otherwise the selected
+    scatter. An edit of the preview adds no undo step of its own: it is part of that stroke, so one undo takes the
+    stroke and everything done to it away while the settings stay as they were left. An edit of a selection commits
+    one ``ScatterReapplyCommand`` when the edit finishes, so a whole slider drag is a single undo step.
+
+    One driver per USD context, from ``controller.get_reapply_driver``, is shared by the Scatter window and the viewport
+    gizmo; each tells it when an edit it drove is finished. Changing a setting that decides where a stroke lands is
+    ignored, and so is every change made while ``edit_selection_live`` is off or nothing relevant is in scope.
 
     Use from the main loop only; it is not thread-safe.
     """
 
-    def __init__(self, controller: ScatterBrushController, usd_context_name: str, cache: MeshSurfaceCache):
-        """Create the driver and start listening for settings and selection changes.
+    def __init__(
+        self,
+        controller: ScatterBrushController,
+        usd_context_name: str,
+        cache: MeshSurfaceCache,
+        owns_cache: bool = False,
+    ):
+        """Create the driver and start listening for settings, preview and selection changes.
 
         Args:
             controller: Brush controller whose settings changes drive the edits.
-            usd_context_name: USD context the Scatter window edits.
+            usd_context_name: USD context the edits are authored in.
             cache: Mesh cache used to project placements that recorded no surface.
+            owns_cache: Whether :meth:`destroy` also destroys ``cache``.
         """
         self._controller = controller
         self._usd_context_name = usd_context_name
         self._cache = cache
+        self._owns_cache = owns_cache
         self._known_settings = controller.settings
         self._known_assets = controller.assets
         self._scope = ReapplyScope()
+        self._previewing = False
         self._outcome = ReapplyOutcome()
         self._layer: Sdf.Layer | None = None
         self._interaction_token = None
-        self._before: list[PlacementTransform] = []
+        self._prepared: PreparedReapply | None = None
         self._after: list[PlacementTransform] = []
         self._warned_foreign_layer = False
+        self._holds = 0
 
         self.__on_scope_changed = Event(copy=True)
         self._settings_sub = controller.subscribe_settings_changed(self._on_settings_changed)
         self._assets_sub = controller.subscribe_assets_changed(self._on_assets_changed)
+        self._preview_sub = controller.subscribe_preview_changed(self._on_preview_changed)
+        usd_context = omni.usd.get_context(usd_context_name)
         self._stage_event_sub = (
-            omni.usd.get_context(usd_context_name)
-            .get_stage_event_stream()
-            .create_subscription_to_pop(self._on_stage_event, name="ScatterReapplyDriver")
+            None
+            if usd_context is None
+            else usd_context.get_stage_event_stream().create_subscription_to_pop(
+                self._on_stage_event, name="ScatterReapplyDriver"
+            )
         )
         self.refresh_scope()
 
@@ -376,6 +576,16 @@ class ReapplyDriver:
     def scope(self) -> ReapplyScope:
         """Placements the next settings change would write to."""
         return self._scope
+
+    @property
+    def previewing(self) -> bool:
+        """Whether the scope is the stroke the brush just painted rather than the selection."""
+        return self._previewing
+
+    @property
+    def controller(self) -> ScatterBrushController:
+        """Brush controller whose settings changes drive the edits."""
+        return self._controller
 
     @property
     def active(self) -> bool:
@@ -390,39 +600,70 @@ class ReapplyDriver:
             return "Select painted scatter to edit it"
         notes = self._outcome.describe()
         summary = self._scope.describe()
+        if self._previewing:
+            summary = f"Last stroke: {summary}"
         if self._scope.placement_count > LIVE_EDIT_SOFT_LIMIT:
             summary = f"{summary} (updated when the edit ends)"
         return f"{summary} - {notes}" if notes else summary
 
     def refresh_scope(self) -> None:
-        """Resolve the selection into a scope again and notify subscribers when it changed."""
+        """Resolve the preview or the selection into a scope again and notify subscribers when it changed."""
         usd_context = omni.usd.get_context(self._usd_context_name)
-        scope = resolve_scope(usd_context.get_stage(), usd_context, self._controller.settings)
-        if scope == self._scope:
+        settings = self._controller.settings
+        preview = self._controller.preview_scope(self._usd_context_name) if settings.edit_selection_live else None
+        if preview is not None:
+            scope, previewing = preview, True
+        elif usd_context is None:
+            # The context this driver edits is gone, so there is nothing left to select.
+            scope, previewing = ReapplyScope(), False
+        else:
+            scope, previewing = resolve_scope(usd_context.get_stage(), usd_context, settings), False
+        if scope == self._scope and previewing == self._previewing:
             return
         self._scope = scope
+        self._previewing = previewing
         self._outcome = ReapplyOutcome()
         self.__on_scope_changed(scope)
 
-    def edit_finished(self) -> None:
-        """Commit the open edit as one undoable command; does nothing when no edit is open.
+    def hold(self) -> None:
+        """Keep the next or open edit open across :meth:`edit_finished` until :meth:`release`.
 
-        Called by the Scatter window when a field stops being edited, so that a slider drag is a single undo step.
+        For a drag that changes settings from outside the Scatter window, such as the gizmo's rings on the preview:
+        the window ends an edit whenever a setting changes from outside its own fields, which would otherwise close
+        and reopen the edit at every step of the drag.
         """
-        if self._interaction_token is None:
+        self._holds += 1
+
+    def release(self) -> None:
+        """Undo one :meth:`hold` and finish the edit once nothing holds it any more."""
+        self._holds = max(0, self._holds - 1)
+        self.edit_finished()
+
+    def edit_finished(self) -> None:
+        """Commit the open edit; does nothing when no edit is open or something holds it open.
+
+        An edit of the preview is left in the layer as part of the stroke it belongs to. Any other edit becomes one
+        undoable command. Called by whatever drove the edit when it stops, so that a slider or gizmo drag is a single
+        undo step.
+        """
+        if self._interaction_token is None or self._holds:
             return
         if self._scope.placement_count > LIVE_EDIT_SOFT_LIMIT:
             self._apply()
-        before, after = self._before, self._after
+        before = [] if self._prepared is None else self._prepared.before
+        after = self._after
+        folded = self._previewing and self._controller.folds_into_preview(
+            self._usd_context_name, self._layer.identifier, self._scope
+        )
         self._close()
-        if not after:
+        if not after or folded:
             return
         omni.kit.commands.execute(
             "ScatterReapplyCommand",
             context_name=self._usd_context_name,
             layer_identifier=self._layer.identifier,
-            before=[transform.to_dict() for transform in before],
-            after=[transform.to_dict() for transform in after],
+            before=before,
+            after=after,
             already_applied=True,
         )
 
@@ -432,15 +673,24 @@ class ReapplyDriver:
 
     def destroy(self) -> None:
         """Commit any open edit and drop every subscription so the driver can be released."""
+        self._holds = 0
         self.edit_finished()
         self._settings_sub = None
         self._assets_sub = None
+        self._preview_sub = None
         self._stage_event_sub = None
         self.__on_scope_changed = Event(copy=True)
+        if self._owns_cache and self._cache is not None:
+            self._cache.destroy()
+        self._cache = None
 
     def _on_settings_changed(self, settings: ScatterBrushSettings) -> None:
         """Re-apply the change to the scope when it is one a placement that already exists can follow."""
         previous, self._known_settings = self._known_settings, settings
+        if previous.edit_selection_live != settings.edit_selection_live:
+            # The preview only counts while live editing is on, so turning it on or off changes the scope.
+            self.edit_finished()
+            self.refresh_scope()
         if not settings.edit_selection_live:
             self.edit_finished()
             return
@@ -469,38 +719,47 @@ class ReapplyDriver:
         if self._scope.placement_count <= LIVE_EDIT_SOFT_LIMIT:
             self._apply()
 
+    def _on_preview_changed(self) -> None:
+        """Commit what was done to the old scope, then follow the stroke the brush painted or stopped previewing."""
+        self.edit_finished()
+        self.refresh_scope()
+
     def _on_stage_event(self, event) -> None:
-        """Commit before the ground moves: a new selection or a closing stage ends the edit it was opened for."""
+        """Commit before the ground moves: a new selection or a closing stage ends the edit it was opened for.
+
+        Selecting anything also ends the preview, so the next edit goes to what the user has just picked.
+        """
         if event.type == int(omni.usd.StageEventType.SELECTION_CHANGED):
             self.edit_finished()
+            self._controller.end_preview()
             self.refresh_scope()
         elif event.type in (int(omni.usd.StageEventType.CLOSING), int(omni.usd.StageEventType.OPENED)):
             self._close()
+            self._controller.end_preview()
             self.refresh_scope()
 
     def _begin(self) -> bool:
-        """Open an edit on the current scope, or report why there is nothing to open."""
+        """Open an edit on the current scope, reading its placements once, or report there is nothing to open."""
         self.refresh_scope()
         if self._scope.is_empty:
             return False
-        stage = omni.usd.get_context(self._usd_context_name).get_stage()
+        stage = self._stage()
         if stage is None:
             return False
         self._layer = stage.GetEditTarget().GetLayer()
-        self._before = []
+        self._prepared = prepare_reapply(
+            stage, self._layer, self._scope, self._controller.settings, self._controller.assets, self._cache
+        )
         self._after = []
         self._warned_foreign_layer = False
         self._interaction_token = begin_interaction(stage)
         return True
 
     def _apply(self) -> None:
-        """Recompose the scope under the current settings and author the result straight into the edit layer."""
-        stage = omni.usd.get_context(self._usd_context_name).get_stage()
-        if stage is None:
+        """Recompose the prepared scope under the current settings and author it straight into the edit layer."""
+        if self._prepared is None:
             return
-        before, after, outcome = reapply_transforms(
-            stage, self._layer, self._scope, self._controller.settings, self._controller.assets, self._cache
-        )
+        after, outcome = self._prepared.compose(self._controller.settings, self._controller.assets)
         self._outcome = outcome
         if outcome.foreign_layer and not self._warned_foreign_layer:
             self._warned_foreign_layer = True
@@ -508,18 +767,21 @@ class ReapplyDriver:
                 f"{_LOG_PREFIX} {outcome.foreign_layer} selected scattered prim(s) are authored outside the edit "
                 f"layer '{self._layer.identifier}' and were not updated; set that layer as the edit target to edit them"
             )
-        # Kept from the first pass of the edit: every later pass recomposes the same placements from the same
-        # recorded surfaces, so the transforms to undo to are the ones they had before the edit started.
-        if not self._before:
-            self._before = before
         self._after = after
         author_placement_transforms(self._layer, after)
         self.__on_scope_changed(self._scope)
+
+    def _stage(self) -> Usd.Stage | None:
+        """Return the stage of the driver's USD context, or None when the context or its stage is gone."""
+        usd_context = omni.usd.get_context(self._usd_context_name)
+        return None if usd_context is None else usd_context.get_stage()
 
     def _close(self) -> None:
         """End the notice interaction and forget the open edit."""
         token = self._interaction_token
         self._interaction_token = None
+        self._prepared = None
+        self._after = []
         if token is not None:
             end_interaction(token)
 
@@ -531,6 +793,23 @@ class _AssetResolver:
         self._layer = layer
         self._palette = {asset_comparison_key(entry.path): entry for entry in assets}
         self._from_file: dict[str, ScatterAssetEntry] = {}
+
+    def resolve_with_key(self, spec: Sdf.PrimSpec) -> tuple[str, ScatterAssetEntry] | None:
+        """Return the comparison key of the asset a placement references together with its entry.
+
+        Args:
+            spec: Placement prim spec.
+
+        Returns:
+            ``(key, entry)``, or None when the spec carries no scatter asset attribute.
+        """
+        attribute = spec.attributes.get(SCATTER_ASSET_ATTR)
+        if attribute is None or not attribute.default:
+            return None
+        entry = self.resolve(spec)
+        if entry is None:
+            return None
+        return asset_comparison_key(self._layer.ComputeAbsolutePath(str(attribute.default))), entry
 
     def resolve(self, spec: Sdf.PrimSpec) -> ScatterAssetEntry | None:
         """Return the asset entry a placement spec references, or None when it names no asset.
@@ -705,5 +984,5 @@ def _recover_origin(
 
 def _triple(values) -> tuple[float, float, float]:
     """Return any three-component value as a tuple of three Python floats."""
-    x, y, z = (float(value) for value in values)
-    return (x, y, z)
+    # Indexed rather than unpacked from a generator: this runs for every placement at every step of a live edit.
+    return (float(values[0]), float(values[1]), float(values[2]))

@@ -92,11 +92,26 @@ The narrowest selection wins. Selecting painted placements or a scatter containe
 mesh or an instance edits what the current preset painted on it, which is how two patches painted with two presets on
 one mesh stay independent. With nothing selected, a settings change only affects the next stroke.
 
+Right after a stroke the readout says `Last stroke: ...`: until anything else happens, a settings change updates the
+stroke just painted, and those changes are part of the stroke rather than undo steps of their own. That is the loop
+for tuning a brush by eye: paint a test stroke, adjust **Base Rotation**, size or any other placement setting while
+watching it, then undo once. The stroke disappears with everything done to it, the settings stay as they were left,
+and the next stroke is painted with them. Selecting anything ends it, and edits then go to the selection as usual.
+
+**Base Rotation X**, **Y** and **Z** turn every placement about its own root, before its random rotation, about the
+stage axes. They are the setting for an asset that comes out lying down or leaning: they apply to every stroke painted
+from now on and are saved with the preset. On the stroke just painted the viewport's rotate rings set them too.
+
+**Max Surface Angle**, in the BRUSH section, is the steepest surface, in degrees from the stage up axis, the brush
+still paints on. A stamp snaps each candidate onto the closest surface, so near a wall or a ledge some land on its side
+and stand sideways; 45 suits grass, and the default of 180 keeps every candidate, which painting on a wall needs.
+
 **Turn X**, **Turn Y** and **Turn Z**, below it, show the degrees that selection has been turned by since it was
 selected. The viewport's rotate rings write them as they are dragged, and typing or dragging them turns the selection
 the same way; either is one undo step. They are greyed out while nothing scattered is selected and read zero again for
 a new selection, because a turn is measured from where the patch stood when it was picked rather than from any angle
 the placements happen to carry - each already has its own random yaw.
 
-They are not brush settings, which is why they are not bound to one: the Rotation ranges further down the section
-decide what the next stroke paints, while a turn edits scatter that is already painted.
+They are not brush settings, which is why they are not bound to one: the Rotation ranges and Base Rotation decide
+what the next stroke paints, while a turn edits scatter that is already painted. They are greyed out on the stroke
+just painted for that reason; that stroke is tuned through the brush settings, so later strokes follow.

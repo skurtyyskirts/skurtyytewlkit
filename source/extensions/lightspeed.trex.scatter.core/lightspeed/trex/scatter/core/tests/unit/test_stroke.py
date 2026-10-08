@@ -120,7 +120,10 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
         self.build_materials_payload = enter(
             mock.patch.object(stroke_module, "build_materials_payload", return_value={})
         )
-        self.erase_candidates = enter(mock.patch.object(stroke_module, "erase_candidates", return_value=[]))
+        self.placement_pool = enter(mock.patch.object(stroke_module, "placement_pool"))
+        # The pool's per-stamp query is what decides the candidates of each erase stamp.
+        self.erase_candidates = self.placement_pool.return_value.take_within
+        self.erase_candidates.return_value = []
         self.snapshot_prims = enter(mock.patch.object(stroke_module, "snapshot_prims"))
         self.remove_placements = enter(mock.patch.object(stroke_module, "remove_placements"))
         self.existing_placement_points = enter(
@@ -215,7 +218,7 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
         # Arrange
         existing = np.array([[1.0, 2.0, 3.0]])
         self.existing_placement_points.return_value = existing
-        session = self._make_session()
+        session = self._make_session(padding=5.0)
 
         # Act
         session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
@@ -226,7 +229,7 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
 
     async def test_update_on_same_target_does_not_reseed_padding_index(self):
         # Arrange
-        session = self._make_session(stamp_spacing=10.0)
+        session = self._make_session(stamp_spacing=10.0, padding=5.0)
         session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
 
         # Act
@@ -234,6 +237,16 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.existing_placement_points.assert_called_once_with(self.stage, self.target_a)
+
+    async def test_begin_without_padding_reads_no_existing_placements(self):
+        # Arrange
+        session = self._make_session(padding=0.0)
+
+        # Act
+        session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
+
+        # Assert
+        self.existing_placement_points.assert_not_called()
 
     async def test_begin_without_stage_leaves_session_inactive(self):
         # Arrange
@@ -467,7 +480,7 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
             context_name="",
             layer_identifier=_LAYER_IDENTIFIER,
             kind="PLACE",
-            records=[{"prim_name": "s_1"}, {"prim_name": "s_2"}],
+            records=records,
             already_applied=True,
             materials={},
         )
@@ -476,7 +489,8 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
 
     async def test_end_accumulates_records_across_stamps(self):
         # Arrange
-        self.generate_stamp.side_effect = [[_make_record("s_1")], [_make_record("s_2")], [_make_record("s_3")]]
+        records = [_make_record("s_1"), _make_record("s_2"), _make_record("s_3")]
+        self.generate_stamp.side_effect = [[record] for record in records]
         session = self._make_session(stamp_spacing=10.0)
         session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
         session.update(_make_hit((20.0, 0.0, 0.0)), self.target_a, _make_sample((20.0, 0.0, 0.0)))
@@ -486,10 +500,7 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(count, 3)
-        self.assertEqual(
-            self.execute.call_args.kwargs["records"],
-            [{"prim_name": "s_1"}, {"prim_name": "s_2"}, {"prim_name": "s_3"}],
-        )
+        self.assertEqual(self.execute.call_args.kwargs["records"], records)
 
     async def test_end_with_nothing_placed_executes_no_command(self):
         # Arrange
@@ -617,7 +628,7 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
         )
         self.generate_stamp.assert_not_called()
 
-    async def test_erase_stamp_passes_brush_settings_to_erase_candidates(self):
+    async def test_erase_stamp_passes_brush_settings_to_the_placement_pool(self):
         # Arrange
         session = self._make_session(erase=True, radius=40.0)
         sample = _make_sample((1.0, 2.0, 3.0))
@@ -626,14 +637,22 @@ class TestStrokeSession(omni.kit.test.AsyncTestCase):
         session.begin(_make_hit((1.0, 2.0, 3.0)), self.target_a, sample)
 
         # Assert
-        self.erase_candidates.assert_called_once()
-        args = self.erase_candidates.call_args.args
-        self.assertIs(args[0], self.stage)
-        self.assertIs(args[1], self.target_a)
-        self.assertEqual(args[2], Gf.Vec3d(1.0, 2.0, 3.0))
-        self.assertEqual(args[3], 40.0)
-        self.assertEqual(args[4], session.settings.erase_scope)
-        self.assertEqual(args[5], ["rock.usd"])
+        self.placement_pool.assert_called_once_with(
+            self.stage, self.target_a, session.settings.erase_scope, ["rock.usd"]
+        )
+        self.erase_candidates.assert_called_once_with(Gf.Vec3d(1.0, 2.0, 3.0), 40.0)
+
+    async def test_erase_stroke_reads_each_prototype_into_a_pool_once(self):
+        # Arrange
+        session = self._make_session(erase=True, stamp_spacing=10.0)
+        session.begin(_make_hit((0.0, 0.0, 0.0)), self.target_a, _make_sample((0.0, 0.0, 0.0)))
+
+        # Act
+        session.update(_make_hit((30.0, 0.0, 0.0)), self.target_a, _make_sample((30.0, 0.0, 0.0)))
+
+        # Assert
+        self.placement_pool.assert_called_once()
+        self.assertEqual(self.erase_candidates.call_count, 4)
 
     async def test_erase_session_with_no_candidates_executes_no_command(self):
         # Arrange

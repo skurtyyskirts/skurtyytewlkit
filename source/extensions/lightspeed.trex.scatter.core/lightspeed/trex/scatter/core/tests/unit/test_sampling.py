@@ -78,6 +78,32 @@ def _identity_parent() -> Gf.Matrix4d:
     return Gf.Matrix4d(1.0)
 
 
+def _rotation_matrix_between(source: Gf.Vec3d, target: Gf.Vec3d) -> Gf.Matrix4d:
+    """Row-vector rotation matrix taking one direction onto another."""
+    return Gf.Matrix4d().SetRotate(Gf.Rotation(source, target))
+
+
+def _rotate_xyz_matrix(rotate_xyz) -> Gf.Matrix4d:
+    """The rotation a rotateXYZ op applies: X, then Y, then Z."""
+    return (
+        _rotation_matrix(Gf.Vec3d.XAxis(), float(rotate_xyz[0]))
+        * _rotation_matrix(Gf.Vec3d.YAxis(), float(rotate_xyz[1]))
+        * _rotation_matrix(Gf.Vec3d.ZAxis(), float(rotate_xyz[2]))
+    )
+
+
+def _compose_upright(settings: ScatterBrushSettings, seed: int, asset_up: UpAxis = UpAxis.Z):
+    """Compose one placement on flat ground of a Z-up stage under an identity parent."""
+    return sampling.compose_parent_space_transform(
+        sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d.ZAxis(), _identity_parent(), None),
+        _identity_parent(),
+        settings,
+        np.random.default_rng(seed),
+        UpAxis.Z,
+        asset_up,
+    )
+
+
 class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
     def _assert_vec_close(self, actual, expected, tolerance: float = 1e-5):
         """Compare two 3-component vectors component-wise."""
@@ -1045,6 +1071,79 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
 
         # Assert - unit scale in world space, which is 0.5 under a parent scaled by 2
         self._assert_vec_close(scale, Gf.Vec3f(0.5, 0.5, 0.5))
+
+    async def test_compose_parent_space_transform_with_base_rotation_x_stands_a_lying_asset_up_whatever_its_yaw(self):
+        # Arrange - the asset is declared Z-up, but its geometry lies along its own +Y
+        settings = _settings(conform_to_surface=False, base_rotation_x=90.0, rotation_z_min=0.0, rotation_z_max=360.0)
+
+        # Act
+        rotations = [_compose_upright(settings, seed)[1] for seed in range(12)]
+
+        # Assert
+        for rotate_xyz in rotations:
+            self._assert_vec_close(_rotate_xyz_matrix(rotate_xyz).TransformDir(Gf.Vec3d.YAxis()), Gf.Vec3d.ZAxis())
+        # The yaws really were different, so standing up held for each of them rather than for one
+        headings = {tuple(round(v, 3) for v in _rotate_xyz_matrix(r).TransformDir(Gf.Vec3d.XAxis())) for r in rotations}
+        self.assertGreater(len(headings), 1)
+
+    async def test_compose_parent_space_transform_applies_base_rotation_after_the_asset_up_correction(self):
+        # Arrange - a Y-up asset is first stood on the Z-up stage, then turned about the stage Y axis
+        settings = _settings(conform_to_surface=False, base_rotation_y=90.0)
+
+        # Act
+        _, rotate_xyz, _ = _compose_upright(settings, 0, asset_up=UpAxis.Y)
+
+        # Assert - the other way round, the turn about Y would leave the asset's +Y alone and it would stand up on +Z
+        self._assert_vec_close(_rotate_xyz_matrix(rotate_xyz).TransformDir(Gf.Vec3d.YAxis()), Gf.Vec3d.XAxis())
+
+    async def test_compose_parent_space_transform_applies_base_rotation_before_the_random_tilt(self):
+        # Arrange
+        settings = _settings(conform_to_surface=False, base_rotation_z=90.0, rotation_x_min=90.0, rotation_x_max=90.0)
+
+        # Act
+        _, rotate_xyz, _ = _compose_upright(settings, 0)
+
+        # Assert - base first sends +X to +Y and the tilt lifts it to +Z; tilt first would leave it on +Y
+        self._assert_vec_close(_rotate_xyz_matrix(rotate_xyz).TransformDir(Gf.Vec3d.XAxis()), Gf.Vec3d.ZAxis())
+
+    async def test_compose_parent_space_transform_with_zero_base_rotation_composes_the_chain_without_one(self):
+        # Arrange - the chain as it stood before base rotations existed, so painted scatter recomposes bit for bit
+        settings = _settings(
+            base_rotation_x=0.0,
+            base_rotation_y=0.0,
+            base_rotation_z=0.0,
+            rotation_x_min=-20.0,
+            rotation_x_max=20.0,
+            rotation_y_min=-10.0,
+            rotation_y_max=30.0,
+            rotation_z_min=0.0,
+            rotation_z_max=360.0,
+        )
+        origin = sampling.to_parent_space_origin(
+            Gf.Vec3d(3.0, -4.0, 1.0), Gf.Vec3d(0.2, -0.3, 0.9), _identity_parent(), None
+        )
+        expected = []
+        for seed in range(8):
+            rotate_x, rotate_y, rotate_z = sampling.sample_rotation_degrees(np.random.default_rng(seed), settings)
+            chain = (
+                Gf.Matrix4d().SetRotate(sampling.asset_up_correction(UpAxis.Y, UpAxis.Z))
+                * _rotation_matrix(Gf.Vec3d.XAxis(), rotate_x)
+                * _rotation_matrix(Gf.Vec3d.YAxis(), rotate_y)
+                * _rotation_matrix(Gf.Vec3d.ZAxis(), rotate_z)
+                * _rotation_matrix_between(Gf.Vec3d.ZAxis(), origin.normal)
+            )
+            expected.append(sampling.rotation_to_xyz_degrees(chain))
+
+        # Act
+        composed = [
+            sampling.compose_parent_space_transform(
+                origin, _identity_parent(), settings, np.random.default_rng(seed), UpAxis.Z, UpAxis.Y
+            )[1]
+            for seed in range(8)
+        ]
+
+        # Assert
+        self.assertEqual(composed, expected)
 
     async def test_to_parent_space_origin_with_zero_normal_raises_value_error(self):
         # Arrange

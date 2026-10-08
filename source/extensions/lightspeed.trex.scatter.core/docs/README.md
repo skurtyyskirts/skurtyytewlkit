@@ -32,6 +32,9 @@ presets. It has no UI.
   settings, and commit one `ScatterReapplyCommand` per edit
 - Move that same selection by a world-space delta and settle it back onto the surface (`move.py`), which is what the
   viewport's scatter move gizmo drags
+- Keep the stroke just painted as the preview (`ScatterBrushController.begin_preview`): until anything else happens,
+  live edits change that stroke and belong to it, so it can be tuned by eye and taken away with one undo while the
+  settings it was tuned to stay set
 
 ## Non-Responsibilities
 
@@ -41,8 +44,8 @@ presets. It has no UI.
 - Does not ingest assets or show ingestion dialogs; callers gate assets with
   `lightspeed.trex.utils.widget.asset_validation` before adding them to the brush
 - Does not create or bind materials, and never overwrites a texture an asset or the user already authored; an asset without a material is painted as it is and reported through a status message
-- Does not author `UsdGeom.PointInstancer` prims or physics settling; every placement is an `Xform` with a reference so
-  the Selection Panel, Stage Manager and packaging treat it as an ordinary replacement reference
+- Does not author `UsdGeom.PointInstancer` prims (yet) or physics settling; every placement is an `Xform` with a
+  reference so the Selection Panel, Stage Manager and packaging treat it as an ordinary replacement reference
 
 ## Architecture
 
@@ -72,9 +75,16 @@ asset's own. Only inputs the asset leaves empty are ever written, and `inputs:en
 normal map the brush authors itself, because the value an asset declares without a normal map describes nothing.
 
 A stroke writes placements directly into the edit layer while the mouse moves (so the viewport updates live) and
-commits a single `ScatterStrokeCommand` on release; the first `do()` of that command is a no-op, `undo()` removes the
-placements and redo re-authors them. Erase strokes snapshot the removed specs with `Sdf.CopySpec` so undo restores
-them. No `omni.kit.undo` group is held open across frames.
+commits a single `ScatterStrokeCommand` on release; the first `do()` of that command is a no-op, `undo()` snapshots
+the placements as they stand and removes them, and redo restores that snapshot. Erase strokes snapshot the removed
+specs with `Sdf.CopySpec` so undo restores them. No `omni.kit.undo` group is held open across frames.
+
+A stamp spreads its candidates over the plane of the surface under the cursor and snaps each one onto the closest
+surface within the brush radius. Near a wall or a ledge some candidates land on the side of it, and conformed to that
+side they stand sideways. `max_surface_angle` skips every candidate, of a stamp or a flood, whose surface is steeper
+than that from the stage up axis. It is measured from the up axis rather than from the surface under the cursor
+because the cursor itself often lands on the bevel or slope beside a floor; measured from there, the blades on that
+slope all counted as in range. Painting on a wall or a ceiling needs the default of 180.
 
 ### Re-applying settings to placements that already exist
 
@@ -100,7 +110,30 @@ authored under the prototype and selected through instance proxies.
 authors the recomposed transforms straight into the edit layer with notices deferred, and commits one
 `ScatterReapplyCommand` when the caller says the edit is finished, so a whole slider drag is a single undo step. Above
 `LIVE_EDIT_SOFT_LIMIT` placements it stops following every step of a drag and updates when the edit ends instead; like
-the prim budget this changes how an edit is paced, never whether it is allowed.
+the prim budget this changes how an edit is paced, never whether it is allowed. There is one driver per USD context
+(`get_reapply_driver`), shared by the Scatter window and the viewport gizmo, so a change is applied once whichever of
+them made it and the gizmo can edit the preview while the window is closed; a caller that drives an edit through
+several settings changes, like a ring drag, holds it open with `hold` and `release`.
+
+An edit reads its placements once, when it opens (`prepare_reapply`), and every step of the drag only composes and
+writes them (`PreparedReapply.compose`): nothing a re-apply reads from a placement changes while a setting is dragged,
+and reading a placement back from its layer costs more than composing it. A placement's random draws are taken from its
+generator once per seed and replayed, with the same arithmetic numpy uses, so a replay is exact.
+
+### The stroke preview
+
+When the viewport brush commits a paint stroke it calls `begin_preview`, and the stroke on top of the undo stack
+becomes the preview. Until something else is executed, undone or redone, the selection changes or the stage closes,
+`preview_scope` is what the live-edit driver and the gizmo work on, ahead of the selection. An edit of the preview adds
+no undo step of its own (`folds_into_preview`): it stays in the layer as part of the stroke, the stroke's `undo()`
+snapshots it along with everything else, and a redo brings the stroke back tuned. Brush settings were never on the
+undo stack, so one undo removes the stroke and leaves every setting it was tuned to in place for the next one.
+
+What carries an orientation into later strokes is the base rotation (`base_rotation_x/y/z`), a brush setting applied
+right after the up-axis correction and before the random tilt and yaw, so it turns the asset in its own frame: every
+placement is stood up or leaned the same way whatever yaw it then draws. A turn of painted scatter cannot do that,
+because it is applied after the yaw and lands differently on every placement; a turn also stays with the scatter it was
+given to. On the preview the gizmo's rings therefore set the base rotation instead of turning the patch.
 
 ### Moving a patch
 
@@ -139,8 +172,12 @@ before conform — so scatter painted before turns were recorded composes to exa
 longer adds to it. With `conform_to_surface` off the settling is not reproduced either, because there is no conform
 term to carry it.
 
-`ScopeDragSession` holds the lifecycle of one drag: it takes the patch as it stands, measures every update from there
-rather than from the last one, and commits the whole drag as a single `ScatterReapplyCommand`. The viewport gizmo and
+`ScopeDragSession` holds the lifecycle of one drag: it reads the patch once as it stands (`prepare_move`), measures
+every update from there rather than from the last one, writes each step once, and commits the whole drag as a single
+`ScatterReapplyCommand`, or as part of the stroke when the patch is the preview. A slide looks for the surface in one
+batched query whose reach is the distance the slide carried the patch: each placement stood on the mesh before the
+slide, so the nearest surface is never farther than that, and the bounded search finds exactly the point a search of
+the whole mesh would. Above `LIVE_EDIT_SOFT_LIMIT` placements a drag moves the patch once, when it ends. The viewport gizmo and
 the Scatter window's Turn fields are two ways of doing the same thing and share it. The turn a patch has been given
 since it was selected lives on the controller (`selection_turn`, `set_selection_turn`,
 `subscribe_selection_turn_changed`), kept with the scope it was given to so that a different selection reads as
@@ -172,7 +209,13 @@ its rotation and scale are drawn afresh.
   stroke costs the rendered stage, which is the placements it authored multiplied by each target's instance count
 - `PrimBudgetStatus`, `prim_budget_status`, `ALERT_BUDGET_MULTIPLE` — classify a stroke's rendered-prim total
   against the `prim_budget` setting so a UI can report an expensive stroke
-- `ScatterBrushController` — singleton brush state (mode, settings, assets, presets, anchor) with events
+- `ScatterBrushController` — singleton brush state (mode, settings, assets, presets, anchor) with events; also
+  owns the stroke preview (`begin_preview`, `preview_scope`, `folds_into_preview`, `end_preview`,
+  `subscribe_preview_changed`)
+- `get_reapply_driver`, `prepare_reapply`, `PreparedReapply`, `prepare_move`, `PreparedMove` — the shared live-edit
+  driver of a context, and the read-once state an edit or a drag works from
+- `PlacementPool`, `placement_pool` — the placements of a prototype read once and taken out by distance, which is how
+  an erase stroke finds what is under the brush at every stamp without reading the whole prototype again
 - `resolve_asset_texture_set`, `build_materials_payload` — texture-set resolution and the authoring payload
 
 ## Settings
@@ -201,7 +244,7 @@ its rotation and scale are drawn afresh.
 - `prim_budget` only classifies a stroke for reporting. Nothing in this extension caps, trims or stops a paint
   stroke: `flood_max_instances` bounds a flood, but a stroke's length is bounded only by `padding`, which stops
   governing it at all when set to 0
-- No physics settling and no PointInstancer output
+- No physics settling and no PointInstancer output yet: every placement is a prim of its own
 - Erase removes only placements authored in the current edit target layer; placements that live in another layer are
   left untouched and reported once per stroke in the log
 - A single mouse move that would need more than 256 stamps (for example a grazing pick across the sky) restarts the
@@ -213,9 +256,16 @@ its rotation and scale are drawn afresh.
   it lands on
 - A turn never moves a placement, so the rotate rings cannot be used to swing a patch around its middle; painting it
   where it belongs, or sliding it with the arrows, is what places a patch
-- A turn the gizmo applies survives further moves but not a recomposition: only the yaw about the stage up axis is
-  recorded, so a settings change puts a tilt back onto the surface. The palette's up axis, not the gizmo, is where an
-  asset that is permanently mis-oriented is corrected
+- A turn stays with the scatter it was given to and never reaches the next stroke. The base rotation, or the
+  palette's up axis, is where an asset that comes out lying down is corrected for good
+- `max_surface_angle` decides where stamps land, so like the brush settings it affects the next stroke only
+- The preview ends as soon as anything else reaches the undo stack, so a stroke tuned, then followed by some other
+  edit, can no longer be taken away together with its tuning in one undo; each later edit of it is an undo step of its
+  own
+- Undoing a large stroke out of a container that already holds many placements is slow: Sdf removes a child by
+  rewriting its parent's list of children, which costs the size of the container for every placement removed (about
+  3.5 s for 10,000 out of 20,000). A stroke that has its container to itself is removed and restored in one edit. The
+  planned PointInstancer output keeps each stroke in a group of its own, which makes every undo a single edit
 - Only placement, scale and seed settings re-apply to placements that already exist. The brush and density settings
   (radius, density, strength, spacing, padding) decide where stamps land, which depends on the mouse path a stroke
   followed; that path is not recorded, so changing them affects the next stroke only

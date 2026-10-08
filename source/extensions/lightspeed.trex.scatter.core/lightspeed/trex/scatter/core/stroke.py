@@ -32,10 +32,11 @@ from pxr import Gf, Sdf, Usd
 from .commands import ScatterStrokeKind
 from .materials import build_materials_payload
 from .placement import (
+    PlacementPool,
     author_placements,
-    erase_candidates,
     existing_placement_points,
     generate_stamp,
+    placement_pool,
     remove_placements,
     snapshot_prims,
 )
@@ -102,6 +103,7 @@ class StrokeSession:
         self._padding_index: PaddingIndex | None = None
         self._materials: dict[str, list[dict[str, Any]]] = {}
         self._seeded_prototypes: set[Sdf.Path] = set()
+        self._erase_pools: dict[Sdf.Path, PlacementPool] = {}
         self._stamp_index = 0
         self._records: list[PlacementRecord] = []
         self._rendered_prims = 0
@@ -244,7 +246,10 @@ class StrokeSession:
         heading_world: Gf.Vec3d | None,
     ) -> None:
         """Generate the placements of one stamp and author them immediately."""
-        self._seed_padding(target)
+        if self._settings.padding > 0.0:
+            # Only the padding check reads the index, so with no padding the placements already on the prototype
+            # are never read at all.
+            self._seed_padding(target)
         records = generate_stamp(
             self._cache,
             target,
@@ -273,14 +278,15 @@ class StrokeSession:
         one layer handed to the erase command so each container the stroke empties stays restorable.
         """
         center_world = Gf.Vec3d(float(center.position[0]), float(center.position[1]), float(center.position[2]))
-        candidates = erase_candidates(
-            self._stage,
-            target,
-            center_world,
-            self._settings.radius,
-            self._settings.erase_scope,
-            [asset.path for asset in self._assets],
-        )
+        pool = self._erase_pools.get(target.prototype_root)
+        if pool is None:
+            # Read once per prototype per stroke: erasing removes placements, and nothing else adds any while the
+            # stroke runs, so what the pool holds stays true for the rest of the stroke.
+            pool = placement_pool(
+                self._stage, target, self._settings.erase_scope, [asset.path for asset in self._assets]
+            )
+            self._erase_pools[target.prototype_root] = pool
+        candidates = pool.take_within(center_world, self._settings.radius)
         prim_paths = [str(path) for path in candidates if self._layer.GetPrimAtPath(path) is not None]
         if len(prim_paths) < len(candidates):
             self._warn_foreign_layer_candidates(len(candidates) - len(prim_paths))
@@ -331,7 +337,9 @@ class StrokeSession:
             context_name=self._usd_context_name,
             layer_identifier=self._layer.identifier,
             kind=ScatterStrokeKind.PLACE.value,
-            records=[record.to_dict() for record in self._records],
+            # The records themselves rather than dictionaries of them: the command accepts both, and converting a
+            # stroke of thousands there and straight back costs a hitch at mouse-up and a copy on the undo stack.
+            records=list(self._records),
             already_applied=True,
             materials=self._materials,
         )

@@ -206,6 +206,9 @@ REAPPLIABLE_FIELDS = frozenset(
         "vertical_offset",
         "conform_to_surface",
         "align_to_stroke",
+        "base_rotation_x",
+        "base_rotation_y",
+        "base_rotation_z",
         "rotation_x_min",
         "rotation_x_max",
         "rotation_y_min",
@@ -234,8 +237,8 @@ REAPPLIABLE_FIELDS = frozenset(
 
 Every one of them is an input of ``compose_parent_space_transform``, so a placement that recorded the surface point
 it was composed from can be recomposed without knowing anything about the stroke that painted it. The brush fields
-(radius, density, strength, stamp_spacing, padding) are absent because they decide where stamps land, which depends
-on the mouse path the stroke followed and is not recorded.
+(radius, density, strength, stamp_spacing, padding, max_surface_angle) are absent because they decide where stamps
+land, which depends on the mouse path the stroke followed and is not recorded.
 """
 
 
@@ -253,11 +256,29 @@ class ScatterBrushSettings(BaseModel):
     strength: float = Field(1.0, ge=0.0, le=1.0)
     stamp_spacing: float = Field(25.0, ge=1.0, le=10000.0)
     padding: float = Field(10.0, ge=0.0, le=5000.0)
+    max_surface_angle: float = Field(180.0, ge=0.0, le=180.0)
+    """Steepest surface, in degrees from the stage up axis, that a stamp or a flood still paints on.
+
+    A stamp spreads its candidates over the plane of the surface under the cursor and snaps each one onto the closest
+    surface, so a candidate that falls past the edge of a floor lands on the wall beside it and, conformed to that
+    wall, stands sideways. Lowering this skips those candidates, and with them any stamp whose cursor landed on a
+    wall or a bevel. 180 keeps every candidate, which is what painting on a wall or a ceiling needs.
+    """
 
     # Placement
     vertical_offset: float = Field(0.0, ge=-10000.0, le=10000.0)
     conform_to_surface: bool = True
     align_to_stroke: bool = False
+    base_rotation_x: float = Field(0.0, ge=-180.0, le=180.0)
+    """Degrees every placement is turned about the stage X axis before its random rotation, about its own root.
+
+    The three base rotations are how an asset that comes out lying down or leaning is stood up for good: unlike a
+    turn of painted scatter, they are a brush setting, so they carry into every stroke painted afterwards.
+    """
+    base_rotation_y: float = Field(0.0, ge=-180.0, le=180.0)
+    """Degrees every placement is turned about the stage Y axis before its random rotation; see ``base_rotation_x``."""
+    base_rotation_z: float = Field(0.0, ge=-180.0, le=180.0)
+    """Degrees every placement is turned about the stage Z axis before its random rotation; see ``base_rotation_x``."""
     rotation_x_min: float = Field(0.0, ge=-180.0, le=180.0)
     rotation_x_max: float = Field(0.0, ge=-180.0, le=180.0)
     rotation_y_min: float = Field(0.0, ge=-180.0, le=180.0)

@@ -238,6 +238,73 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
         self.assertEqual(loaded.scale_mode, settings_module.ScaleMode.ABSOLUTE_SIZE)
         self.assertEqual(loaded.radius, 40.0)
 
+    async def test_init_without_arguments_leaves_every_base_rotation_at_zero(self):
+        # Act
+        settings = settings_module.ScatterBrushSettings()
+
+        # Assert
+        self.assertEqual(
+            (settings.base_rotation_x, settings.base_rotation_y, settings.base_rotation_z), (0.0, 0.0, 0.0)
+        )
+
+    async def test_init_without_arguments_keeps_candidates_at_every_surface_angle(self):
+        # Act
+        settings = settings_module.ScatterBrushSettings()
+
+        # Assert
+        self.assertEqual(settings.max_surface_angle, 180.0)
+
+    async def test_init_with_base_rotation_at_either_bound_is_accepted(self):
+        for field in ("base_rotation_x", "base_rotation_y", "base_rotation_z"):
+            for value in (-180.0, 180.0):
+                with self.subTest(title=f"{field}={value}"):
+                    # Act
+                    settings = settings_module.ScatterBrushSettings(**{field: value})
+
+                    # Assert
+                    self.assertEqual(getattr(settings, field), value)
+
+    async def test_init_with_base_rotation_out_of_range_raises_validation_error(self):
+        for field in ("base_rotation_x", "base_rotation_y", "base_rotation_z"):
+            for value in (-180.5, 180.5):
+                with self.subTest(title=f"{field}={value}"):
+                    # Arrange
+                    kwargs = {field: value}
+
+                    # Act / Assert
+                    with self.assertRaises(ValidationError):
+                        settings_module.ScatterBrushSettings(**kwargs)
+
+    async def test_init_with_max_surface_angle_out_of_range_raises_validation_error(self):
+        for value in (-1.0, 180.5):
+            with self.subTest(title=f"max_surface_angle={value}"):
+                # Arrange
+                kwargs = {"max_surface_angle": value}
+
+                # Act / Assert
+                with self.assertRaises(ValidationError):
+                    settings_module.ScatterBrushSettings(**kwargs)
+
+    async def test_reappliable_fields_include_every_base_rotation(self):
+        # Arrange
+        base_rotations = {"base_rotation_x", "base_rotation_y", "base_rotation_z"}
+
+        # Act
+        missing = base_rotations - settings_module.REAPPLIABLE_FIELDS
+
+        # Assert
+        self.assertEqual(missing, set())
+
+    async def test_reappliable_fields_exclude_max_surface_angle(self):
+        # Arrange - it decides where a stamp lands, which depends on a mouse path that is not recorded
+        field = "max_surface_angle"
+
+        # Act
+        reappliable = field in settings_module.REAPPLIABLE_FIELDS
+
+        # Assert
+        self.assertFalse(reappliable)
+
 
 class TestScatterAssetEntry(omni.kit.test.AsyncTestCase):
     async def test_init_with_path_only_uses_defaults(self):

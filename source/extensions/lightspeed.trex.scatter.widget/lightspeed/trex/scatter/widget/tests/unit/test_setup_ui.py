@@ -23,9 +23,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 import omni.kit.app
+import omni.kit.commands
 import omni.kit.test
+import omni.kit.undo
 from lightspeed.trex.scatter.core import controller as _controller_module
 from lightspeed.trex.scatter.core.controller import ScatterMode
+from lightspeed.trex.scatter.core.placement import PlacementRecord
 from lightspeed.trex.scatter.core.settings import (
     Falloff,
     ScaleMode,
@@ -36,7 +39,7 @@ from lightspeed.trex.scatter.core.settings import (
 from lightspeed.trex.scatter.widget import setup_ui as _setup_ui_module
 from omni import ui
 from omni.kit import ui_test
-from pxr import Usd, UsdGeom
+from pxr import Sdf, Usd, UsdGeom
 
 # The StageCraft context always exists in the test app; the pane only reads its stage for the instance warning.
 _CONTEXT_NAME = ""
@@ -58,12 +61,16 @@ _EXPECTED_CONTROLS = (
     ("FloatBoundedDrag", "scatter_strength"),
     ("FloatBoundedDrag", "scatter_spacing"),
     ("FloatBoundedDrag", "scatter_padding"),
+    ("FloatBoundedDrag", "scatter_max_surface_angle"),
     ("FloatBoundedDrag", "scatter_turn_x"),
     ("FloatBoundedDrag", "scatter_turn_y"),
     ("FloatBoundedDrag", "scatter_turn_z"),
     ("FloatBoundedDrag", "scatter_vertical_offset"),
     ("CheckBox", "scatter_conform"),
     ("CheckBox", "scatter_align_stroke"),
+    ("FloatBoundedDrag", "scatter_base_rotation_x"),
+    ("FloatBoundedDrag", "scatter_base_rotation_y"),
+    ("FloatBoundedDrag", "scatter_base_rotation_z"),
     ("FloatBoundedDrag", "scatter_rot_z_min"),
     ("FloatBoundedDrag", "scatter_rot_z_max"),
     ("FloatBoundedDrag", "scatter_rot_x_min"),
@@ -202,6 +209,36 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(self.controller.settings.radius, 75.0)
+
+    async def test_edit_base_rotation_x_model_updates_controller_settings(self):
+        # Arrange
+        model = self._model("base_rotation_x")
+
+        # Act
+        model.set_value(90.0)
+
+        # Assert
+        self.assertEqual(self.controller.settings.base_rotation_x, 90.0)
+
+    async def test_update_settings_base_rotation_z_pushes_value_into_model(self):
+        # Arrange
+        model = self._model("base_rotation_z")
+
+        # Act
+        self.controller.update_settings(base_rotation_z=-45.0)
+
+        # Assert
+        self.assertEqual(model.as_float, -45.0)
+
+    async def test_edit_max_surface_angle_model_updates_controller_settings(self):
+        # Arrange
+        model = self._model("max_surface_angle")
+
+        # Act
+        model.set_value(45.0)
+
+        # Assert
+        self.assertEqual(self.controller.settings.max_surface_angle, 45.0)
 
     async def test_update_settings_radius_pushes_value_into_model_without_reentry(self):
         # Arrange
@@ -741,3 +778,63 @@ class TestScatterPaneTurnFields(TestScatterPane):
 
         # Assert - no scope means no session was ever opened
         self.assertFalse(self.pane._turn_session.active)  # noqa: PLW0212
+
+
+class TestScatterPaneStrokePreview(TestScatterPane):
+    """Right after a stroke the pane edits that stroke, and says so."""
+
+    async def setUp(self):
+        await super().setUp()
+        omni.kit.undo.clear_stack()
+        self._layer = Sdf.Layer.CreateAnonymous("scatter_preview_test")
+        record = PlacementRecord(
+            container_path=f"{_ANCHOR_PROTOTYPE}/scatter_grass",
+            prim_name="s_000000000001",
+            asset_rel_path="blade.usda",
+            asset_abs_path="C:/assets/blade.usda",
+            translate=(0.0, 0.0, 0.0),
+            rotate_xyz=(0.0, 0.0, 0.0),
+            scale=(1.0, 1.0, 1.0),
+            brush_id="Grass",
+        )
+        # Committed the way a stroke is: already authored live, so the command's first do() writes nothing.
+        omni.kit.commands.execute(
+            "ScatterStrokeCommand",
+            context_name=_CONTEXT_NAME,
+            layer_identifier=self._layer.identifier,
+            kind="PLACE",
+            records=[record],
+            already_applied=True,
+        )
+
+    async def tearDown(self):
+        self.controller.end_preview()
+        omni.kit.undo.clear_stack()
+        await super().tearDown()
+
+    async def test_begin_preview_shows_the_stroke_as_the_live_edit_scope(self):
+        # Act
+        self.controller.begin_preview(_CONTEXT_NAME)
+
+        # Assert
+        self.assertTrue(self.pane._reapply_driver.previewing)  # noqa: PLW0212
+        self.assertTrue(self.pane._live_edit_label.text.startswith("Last stroke: 1 placement"))  # noqa: PLW0212
+
+    async def test_begin_preview_disables_the_turn_fields(self):
+        # Act
+        self.controller.begin_preview(_CONTEXT_NAME)
+
+        # Assert - the stroke is tuned through the brush settings instead, so later strokes follow
+        for field in self.pane._turn_fields:  # noqa: PLW0212
+            self.assertFalse(field.enabled)
+
+    async def test_end_preview_returns_the_scope_to_the_selection(self):
+        # Arrange
+        self.controller.begin_preview(_CONTEXT_NAME)
+
+        # Act
+        self.controller.end_preview()
+
+        # Assert
+        self.assertFalse(self.pane._reapply_driver.previewing)  # noqa: PLW0212
+        self.assertTrue(self.pane._reapply_driver.scope.is_empty)  # noqa: PLW0212

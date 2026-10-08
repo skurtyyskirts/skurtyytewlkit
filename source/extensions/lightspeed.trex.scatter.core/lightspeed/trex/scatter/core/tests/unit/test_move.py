@@ -15,16 +15,20 @@
 * limitations under the License.
 """
 
+import contextlib
+from unittest import mock
+
 import omni.kit.test
+from lightspeed.trex.scatter.core import move as move_module
 from lightspeed.trex.scatter.core.constants import (
     SCATTER_ORIGIN_ATTR,
     SCATTER_TRANSFORM_KEY_ATTR,
     SCATTER_TURN_ATTR,
     SCATTER_YAW_ATTR,
 )
-from lightspeed.trex.scatter.core.move import MoveOutcome, move_scope, scope_pivot
+from lightspeed.trex.scatter.core.move import MoveOutcome, ScopeDragSession, move_scope, prepare_move, scope_pivot
 from lightspeed.trex.scatter.core.sampling import turn_matrix, turn_to_degrees
-from lightspeed.trex.scatter.core.placement import author_placement_transforms
+from lightspeed.trex.scatter.core.placement import PlacementTransform, author_placement_transforms
 from lightspeed.trex.scatter.core.reapply import reapply_transforms
 from lightspeed.trex.scatter.core.sampling import twist_degrees
 from lightspeed.trex.scatter.core.targets import build_prototype_target
@@ -575,3 +579,174 @@ class TestATurnThatSurvivesASettingsChange(_MoveTestCase):
         # Assert
         recorded = [self.attribute(path, SCATTER_TURN_ATTR) for path in self.grass]
         self.assertTrue(all(abs(value[2] - 50.0) < 1e-4 for value in recorded), recorded)
+
+
+class TestPreparedMove(_MoveTestCase):
+    """A drag reads its patch once and measures every step from there."""
+
+    async def test_apply_after_another_slide_matches_a_fresh_move_by_the_new_slide(self):
+        # Arrange
+        prepared = prepare_move(self.stage, self.layer, _scope_of(self.grass), self.cache)
+        prepared.apply(_translate(80.0, -60.0, 0.0), self.cache)
+        _before, expected, expected_outcome = move_scope(
+            self.stage, self.layer, _scope_of(self.grass), _translate(30.0, 40.0, 0.0), self.cache
+        )
+
+        # Act
+        after, outcome = prepared.apply(_translate(30.0, 40.0, 0.0), self.cache)
+
+        # Assert - not carried on from where the step before left it
+        self.assertEqual(after, expected)
+        self.assertEqual(outcome, expected_outcome)
+
+    async def test_apply_of_a_turn_after_a_slide_matches_a_fresh_move_by_that_turn(self):
+        # Arrange
+        pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
+        prepared = prepare_move(self.stage, self.layer, _scope_of(self.grass), self.cache)
+        prepared.apply(_translate(80.0, -60.0, 0.0), self.cache)
+        _before, expected, expected_outcome = move_scope(
+            self.stage, self.layer, _scope_of(self.grass), _tilt(30.0, pivot), self.cache
+        )
+
+        # Act
+        after, outcome = prepared.apply(_tilt(30.0, pivot), self.cache)
+
+        # Assert
+        self.assertEqual(after, expected)
+        self.assertEqual(outcome, expected_outcome)
+
+    async def test_sliding_across_a_flat_surface_keeps_every_rotation_bit_identical(self):
+        # Arrange - angles a decomposition would hand back in another form, past 180 about Z
+        author_placement_transforms(
+            self.layer,
+            [
+                PlacementTransform(
+                    prim_path=path,
+                    translate=self.authored(path)[0],
+                    rotate_xyz=(10.0 + index, -20.0, 250.0 + index),
+                    scale=self.authored(path)[2],
+                )
+                for index, path in enumerate(self.grass)
+            ],
+        )
+        before = [self.authored(path)[1] for path in self.grass]
+
+        # Act
+        _start, after, _outcome = move_scope(
+            self.stage, self.layer, _scope_of(self.grass), _translate(30.0, 40.0, 0.0), self.cache
+        )
+
+        # Assert - the ground faces the same way, so nothing is decomposed and composed again
+        self.assertEqual([transform.rotate_xyz for transform in after], before)
+
+    async def test_sliding_a_turned_patch_across_a_flat_surface_keeps_its_recorded_turn_bit_identical(self):
+        # Arrange
+        pivot = scope_pivot(self.stage, self.layer, _scope_of(self.grass))
+        self.drag(_yaw(30.0, pivot), self.grass)
+        turns = [tuple(self.attribute(path, SCATTER_TURN_ATTR)) for path in self.grass]
+        rotations = [self.authored(path)[1] for path in self.grass]
+
+        # Act
+        self.drag(_translate(30.0, 40.0, 0.0), self.grass)
+
+        # Assert
+        self.assertEqual([tuple(self.attribute(path, SCATTER_TURN_ATTR)) for path in self.grass], turns)
+        self.assertEqual([self.authored(path)[1] for path in self.grass], rotations)
+
+
+class TestScopeDragSession(_MoveTestCase):
+    async def setUp(self):
+        await super().setUp()
+        self._stack = contextlib.ExitStack()
+        usd_context = mock.MagicMock(name="usd_context")
+        usd_context.get_stage.return_value = self.stage
+        self._stack.enter_context(mock.patch.object(move_module.omni.usd, "get_context", return_value=usd_context))
+        self.execute = self._stack.enter_context(mock.patch.object(move_module.omni.kit.commands, "execute"))
+        self.brush = mock.Mock(name="controller")
+        self.brush.folds_into_preview.return_value = False
+        self._stack.enter_context(
+            mock.patch.object(move_module, "get_scatter_brush_controller", return_value=self.brush)
+        )
+
+    async def tearDown(self):
+        self._stack.close()
+        await super().tearDown()
+
+    def open_drag(self, soft_limit: int | None = None) -> ScopeDragSession:
+        """Open a drag of the grass patch, optionally with a smaller soft limit than the real one."""
+        if soft_limit is not None:
+            self._stack.enter_context(mock.patch.object(move_module, "LIVE_EDIT_SOFT_LIMIT", soft_limit))
+        session = ScopeDragSession("", self.cache)
+        self.assertTrue(session.begin(_scope_of(self.grass), conform=True))
+        return session
+
+    def offsets_from(self, before: list[tuple]) -> list[tuple[float, float]]:
+        """How far each grass placement now stands from where it stood, in the plane of the quad."""
+        return [(now[0] - was[0], now[1] - was[1]) for now, was in zip(self.positions(self.grass), before)]
+
+    async def test_update_of_a_patch_over_the_soft_limit_writes_nothing(self):
+        # Arrange
+        session = self.open_drag(soft_limit=len(self.grass) - 1)
+        before = self.positions(self.grass)
+
+        # Act
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Assert
+        self.assertEqual(self.positions(self.grass), before)
+
+    async def test_update_of_a_patch_at_the_soft_limit_moves_it_at_once(self):
+        # Arrange
+        session = self.open_drag(soft_limit=len(self.grass))
+        before = self.positions(self.grass)
+
+        # Act
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Assert
+        for dx, dy in self.offsets_from(before):
+            self.assertAlmostEqual(dx, 30.0, places=6)
+            self.assertAlmostEqual(dy, 40.0, places=6)
+
+    async def test_commit_of_a_patch_over_the_soft_limit_applies_the_last_delta_it_reached(self):
+        # Arrange
+        session = self.open_drag(soft_limit=len(self.grass) - 1)
+        before = self.positions(self.grass)
+        session.update(_translate(80.0, -60.0, 0.0))
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Act
+        session.commit()
+
+        # Assert
+        for dx, dy in self.offsets_from(before):
+            self.assertAlmostEqual(dx, 30.0, places=6)
+            self.assertAlmostEqual(dy, 40.0, places=6)
+
+    async def test_commit_of_a_drag_that_does_not_fold_into_the_preview_executes_one_reapply_command(self):
+        # Arrange
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Act
+        session.commit()
+
+        # Assert
+        self.execute.assert_called_once()
+        self.assertEqual(self.execute.call_args.args[0], "ScatterReapplyCommand")
+        self.assertEqual(self.execute.call_args.kwargs["layer_identifier"], self.layer.identifier)
+
+    async def test_commit_of_a_drag_that_folds_into_the_preview_executes_no_command_and_keeps_the_move(self):
+        # Arrange
+        self.brush.folds_into_preview.return_value = True
+        session = self.open_drag()
+        before = self.positions(self.grass)
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Act
+        session.commit()
+
+        # Assert
+        self.execute.assert_not_called()
+        self.brush.folds_into_preview.assert_called_once_with("", self.layer.identifier, _scope_of(self.grass))
+        self.assertTrue(all(abs(dx - 30.0) < 1e-6 and abs(dy - 40.0) < 1e-6 for dx, dy in self.offsets_from(before)))

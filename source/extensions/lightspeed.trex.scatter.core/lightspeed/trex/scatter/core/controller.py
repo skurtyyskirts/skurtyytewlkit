@@ -20,12 +20,15 @@ from __future__ import annotations
 __all__ = [
     "ScatterBrushController",
     "ScatterMode",
+    "destroy_reapply_drivers",
     "destroy_scatter_brush_controller",
+    "get_reapply_driver",
     "get_scatter_brush_controller",
 ]
 
 import secrets
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -47,11 +50,13 @@ from .assets import (
     read_asset_up_axis,
     read_authored_asset_up_axis,
 )
+from .commands import ScatterStrokeCommand, ScatterStrokeKind
 from .materials import asset_source_hash, build_materials_payload, resolve_asset_texture_set
 from .picking import create_surface_picker
 from .placement import existing_placement_points, generate_flood
 from .presets import PresetStore, get_default_presets_directory
-from .reapply import ReapplyScope
+from .geometry import MeshSurfaceCache
+from .reapply import ReapplyDriver, ReapplyScope, scope_of_placements
 from .sampling import PaddingIndex, stage_meters_per_unit, stage_up_axis, stamp_rng
 from .settings import (
     RANGE_PAIRS,
@@ -70,7 +75,6 @@ from .targets import (
 )
 
 if TYPE_CHECKING:
-    from .geometry import MeshSurfaceCache
     from .picking import SurfacePicker
 
 _LOG_PREFIX = "[lightspeed.trex.scatter.core]"
@@ -122,6 +126,23 @@ def _describe_validation_error(exc: ValidationError) -> str:
     return "; ".join(messages)
 
 
+@dataclass(frozen=True)
+class _StrokePreview:
+    """The stroke the brush painted last, while live edits still belong to it.
+
+    Attributes:
+        usd_context_name: USD context the stroke was painted in.
+        layer_identifier: Layer the stroke authored its placements in.
+        scope: The stroke's placements.
+        command: The stroke's command; the preview lasts while it is the one on top of the undo stack.
+    """
+
+    usd_context_name: str
+    layer_identifier: str
+    scope: ReapplyScope
+    command: ScatterStrokeCommand
+
+
 class ScatterBrushController:
     """Process-wide brush state shared by the Scatter window and the viewport brush tool.
 
@@ -146,12 +167,18 @@ class ScatterBrushController:
         self._selection_turn: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._selection_turn_scope: ReapplyScope = ReapplyScope()
 
+        # The stroke the brush painted last, which live edits change without undo steps of their own until anything
+        # else happens, so that one undo takes the stroke away with everything done to it and keeps the settings.
+        self._preview: _StrokePreview | None = None
+
         self.__on_mode_changed = Event(copy=True)
         self.__on_settings_changed = Event(copy=True)
         self.__on_assets_changed = Event(copy=True)
         self.__on_stroke_committed = Event(copy=True)
         self.__on_status_message = Event(copy=True)
         self.__on_selection_turn_changed = Event(copy=True)
+        self.__on_preview_changed = Event(copy=True)
+        omni.kit.undo.subscribe_on_change(self._on_undo_stack_changed)
 
     @property
     def settings(self) -> ScatterBrushSettings:
@@ -502,9 +529,8 @@ class ScatterBrushController:
                 if remaining <= 0:
                     break
                 padding_index = PaddingIndex(max(self._settings.padding, 1.0))
-                existing = existing_placement_points(stage, target)
-                if len(existing):
-                    padding_index.add_many(existing)
+                if self._settings.padding > 0.0:
+                    padding_index.add_many(existing_placement_points(stage, target))
                 records = generate_flood(
                     cache,
                     target,
@@ -523,7 +549,7 @@ class ScatterBrushController:
                     "ScatterFloodCommand",
                     context_name=usd_context_name,
                     layer_identifier=layer.identifier,
-                    records=[record.to_dict() for record in records],
+                    records=records,
                     materials=materials,
                 )
                 total += len(records)
@@ -564,6 +590,83 @@ class ScatterBrushController:
         """Subscribe to the turn a patch has been given; the subscription ends when the returned object is released."""
         return EventSubscription(self.__on_selection_turn_changed, fn)
 
+    def begin_preview(self, usd_context_name: str) -> bool:
+        """Make the stroke just painted in a USD context the preview that live edits change.
+
+        The stroke is the one on top of the undo stack, which is where committing it has just put it. It stays the
+        preview until that is no longer so, the selection changes or the stage closes; until then an edit of it is
+        part of the stroke rather than an undo step of its own.
+
+        Args:
+            usd_context_name: USD context the stroke was painted in.
+
+        Returns:
+            Whether a preview started; False when the top of the undo stack is not a stroke that placed something.
+        """
+        stack = omni.kit.undo.get_undo_stack()
+        command = stack[-1].command if stack else None
+        if (
+            not isinstance(command, ScatterStrokeCommand)
+            or command.kind != ScatterStrokeKind.PLACE
+            or not command.created_paths
+        ):
+            self.end_preview()
+            return False
+        self._preview = _StrokePreview(
+            usd_context_name=usd_context_name,
+            layer_identifier=command.layer_identifier,
+            scope=scope_of_placements(command.created_paths),
+            command=command,
+        )
+        self.__on_preview_changed()
+        return True
+
+    def end_preview(self) -> None:
+        """Stop previewing the last stroke; later edits of it are undo steps of their own."""
+        if self._preview is None:
+            return
+        self._preview = None
+        self.__on_preview_changed()
+
+    def preview_scope(self, usd_context_name: str) -> ReapplyScope | None:
+        """Return the placements of the stroke being previewed in a USD context, or None when there is none.
+
+        Args:
+            usd_context_name: USD context asking.
+
+        Returns:
+            The scope, or None when no stroke of that context is still the preview.
+        """
+        preview = self._current_preview()
+        if preview is None or preview.usd_context_name != usd_context_name:
+            return None
+        return preview.scope
+
+    def folds_into_preview(self, usd_context_name: str, layer_identifier: str, scope: ReapplyScope) -> bool:
+        """Whether an edit of ``scope`` in a layer belongs to the stroke being previewed.
+
+        Such an edit adds no undo step: undoing the stroke takes it away, and redoing the stroke brings it back.
+
+        Args:
+            usd_context_name: USD context of the edit.
+            layer_identifier: Layer the edit was authored in.
+            scope: Placements the edit changed.
+
+        Returns:
+            True only while the preview is that exact stroke in that exact layer.
+        """
+        preview = self._current_preview()
+        return (
+            preview is not None
+            and preview.usd_context_name == usd_context_name
+            and preview.layer_identifier == layer_identifier
+            and preview.scope == scope
+        )
+
+    def subscribe_preview_changed(self, fn: Callable[[], None]) -> EventSubscription:
+        """Subscribe to the preview starting or ending; the subscription ends when the returned object is released."""
+        return EventSubscription(self.__on_preview_changed, fn)
+
     def subscribe_settings_changed(self, fn: Callable[[ScatterBrushSettings], None]) -> EventSubscription:
         """Subscribe to settings replacements; the subscription ends when the returned object is released."""
         return EventSubscription(self.__on_settings_changed, fn)
@@ -600,7 +703,34 @@ class ScatterBrushController:
         self.__on_stroke_committed = Event(copy=True)
         self.__on_status_message = Event(copy=True)
         self.__on_selection_turn_changed = Event(copy=True)
+        self.__on_preview_changed = Event(copy=True)
+        omni.kit.undo.unsubscribe_on_change(self._on_undo_stack_changed)
+        self._preview = None
         self._picker_factory = None
+
+    def _current_preview(self) -> _StrokePreview | None:
+        """Return the preview while its stroke is still the one on top of the undo stack, else None."""
+        preview = self._preview
+        if preview is None:
+            return None
+        stack = omni.kit.undo.get_undo_stack()
+        if not stack or stack[-1].command is not preview.command:
+            return None
+        return preview
+
+    def _on_undo_stack_changed(self, _command_names) -> None:
+        """End the preview once anything else, an undo included, has put a different command on top of the stack.
+
+        Called from inside whatever command just ran, so nothing may escape it: a fault here would fail a command
+        that has nothing to do with scatter.
+        """
+        if self._preview is None or self._current_preview() is not None:
+            return
+        try:
+            self.end_preview()
+        except Exception as exc:  # noqa: BLE001 - runs inside an unrelated command, which must not fail because of it.
+            self._preview = None
+            carb.log_error(f"{_LOG_PREFIX} Ending the scatter stroke preview failed: {exc}")
 
     def _set_settings(self, settings: ScatterBrushSettings) -> None:
         """Adopt validated settings, persist them and notify subscribers."""
@@ -662,6 +792,47 @@ class ScatterBrushController:
         return targets
 
 
+_DRIVERS: dict[str, ReapplyDriver] = {}
+
+
+def get_reapply_driver(usd_context_name: str = "") -> ReapplyDriver:
+    """Return the live-edit driver of a USD context, creating it with a mesh cache of its own on first use.
+
+    One driver per context is shared by the Scatter window and the viewport gizmo, so a settings change is applied
+    once whichever of them made it, and the gizmo can edit the preview while the window is closed. A driver follows
+    the controller it was made with, so one left over from a controller that has since been replaced is replaced too.
+
+    Args:
+        usd_context_name: USD context the edits are authored in.
+
+    Returns:
+        The context's driver.
+    """
+    controller = get_scatter_brush_controller()
+    driver = _DRIVERS.get(usd_context_name)
+    if driver is not None and driver.controller is not controller:
+        # The controller it follows was replaced, so its subscriptions lead nowhere any more.
+        driver.destroy()
+        driver = None
+    if driver is None:
+
+        def stage_getter() -> Usd.Stage | None:
+            context = omni.usd.get_context(usd_context_name)
+            return None if context is None else context.get_stage()
+
+        driver = ReapplyDriver(controller, usd_context_name, MeshSurfaceCache(stage_getter), owns_cache=True)
+        _DRIVERS[usd_context_name] = driver
+    return driver
+
+
+def destroy_reapply_drivers() -> None:
+    """Destroy every driver :func:`get_reapply_driver` created, so the next access creates fresh ones."""
+    drivers = list(_DRIVERS.values())
+    _DRIVERS.clear()
+    for driver in drivers:
+        driver.destroy()
+
+
 _CONTROLLER_INSTANCE: ScatterBrushController | None = None
 
 
@@ -676,6 +847,8 @@ def get_scatter_brush_controller() -> ScatterBrushController:
 def destroy_scatter_brush_controller() -> None:
     """Destroy the process-wide brush controller, if any, so the next access creates a fresh one."""
     global _CONTROLLER_INSTANCE
+    # Each live-edit driver holds the controller it was made with, so they go first.
+    destroy_reapply_drivers()
     if _CONTROLLER_INSTANCE is not None:
         _CONTROLLER_INSTANCE.destroy()
     _CONTROLLER_INSTANCE = None

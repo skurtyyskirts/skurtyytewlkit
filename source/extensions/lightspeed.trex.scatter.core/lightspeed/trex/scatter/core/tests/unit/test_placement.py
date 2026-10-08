@@ -16,6 +16,7 @@
 """
 
 import json
+import math
 import os
 import pathlib
 import tempfile
@@ -32,6 +33,7 @@ from lightspeed.trex.scatter.core.constants import (
 )
 from lightspeed.trex.scatter.core.geometry import MeshSurfaceCache, SurfaceSample
 from lightspeed.trex.scatter.core.placement import (
+    PlacementPool,
     PlacementRecord,
     author_placements,
     container_path_for,
@@ -65,6 +67,8 @@ _OTHER_PROTOTYPE_ROOT = "/RootNode/meshes/mesh_FEDCBA9876543210"
 _OTHER_CONTAINER_PATH = f"{_OTHER_PROTOTYPE_ROOT}/{CONTAINER_PREFIX}default"
 _PARENT_OFFSET = Gf.Vec3d(100.0, 0.0, 0.0)
 _CENTER_WORLD = np.array([100.0, 0.0, 0.0])
+_FLOOR_NORMAL = (0.0, 0.0, 1.0)
+_WALL_NORMAL = (-1.0, 0.0, 0.0)
 _HALF_SIZE = 500.0
 _XFORM_OP_ORDER = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 _ASSET_USDA = """#usda 1.0
@@ -127,10 +131,29 @@ def _make_record(
     )
 
 
-def _center_sample() -> SurfaceSample:
-    return SurfaceSample(
-        position=_CENTER_WORLD.copy(), normal=np.array([0.0, 0.0, 1.0]), triangle_index=0, distance=0.0
-    )
+def _center_sample(normal: tuple[float, float, float] = _FLOOR_NORMAL) -> SurfaceSample:
+    return SurfaceSample(position=_CENTER_WORLD.copy(), normal=np.array(normal), triangle_index=0, distance=0.0)
+
+
+class _AngledSurfaceCache:
+    """Mesh cache stand-in that leaves every candidate where it is and gives them the given normals in turn.
+
+    It is how a stamp is made to straddle the edge of a floor: the candidates alternate between the floor and the
+    wall beside it, exactly as projecting a disk past that edge would leave them.
+    """
+
+    def __init__(self, normals: list[tuple[float, float, float]]):
+        self._normals = normals
+
+    def closest_points(self, _mesh_path, candidates, _max_distance):
+        count = len(candidates)
+        normals = np.array([self._normals[index % len(self._normals)] for index in range(count)], dtype=np.float64)
+        return np.asarray(candidates, dtype=np.float64), normals.reshape(count, 3), np.ones(count, dtype=bool)
+
+
+def _recorded_normal(record: PlacementRecord) -> tuple[float, float, float]:
+    """The parent-space surface normal a record was composed from."""
+    return tuple(round(value, 9) for value in record.origin[3:6])
 
 
 class TestPlacementRecord(omni.kit.test.AsyncTestCase):
@@ -220,11 +243,13 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         padding_index: PaddingIndex | None = None,
         seed: int = 1234,
         stage_meters_per_unit: float = 1.0,
+        cache=None,
+        center: SurfaceSample | None = None,
     ) -> list[PlacementRecord]:
         return generate_stamp(
-            self._cache,
+            self._cache if cache is None else cache,
             self._target,
-            _center_sample(),
+            _center_sample() if center is None else center,
             self._settings if settings is None else settings,
             self._assets if assets is None else assets,
             np.random.default_rng(seed),
@@ -256,6 +281,17 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
 
     def _world_translate(self, record: PlacementRecord) -> Gf.Vec3d:
         return self._target.parent_world.Transform(Gf.Vec3d(*record.translate))
+
+    def _add_wall_to_quad(self) -> None:
+        """Stand a wall as large as the floor quad up along its +X edge, in the same mesh."""
+        mesh = UsdGeom.Mesh(self._stage.GetPrimAtPath(_MESH_PATH))
+        floor = [(-_HALF_SIZE, -_HALF_SIZE, 0.0), (_HALF_SIZE, -_HALF_SIZE, 0.0), (_HALF_SIZE, _HALF_SIZE, 0.0)]
+        floor.append((-_HALF_SIZE, _HALF_SIZE, 0.0))
+        wall = [(_HALF_SIZE, -_HALF_SIZE, 0.0), (_HALF_SIZE, _HALF_SIZE, 0.0)]
+        wall += [(_HALF_SIZE, _HALF_SIZE, 2.0 * _HALF_SIZE), (_HALF_SIZE, -_HALF_SIZE, 2.0 * _HALF_SIZE)]
+        mesh.GetPointsAttr().Set([*floor, *wall])
+        mesh.GetFaceVertexCountsAttr().Set([4, 4])
+        mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3, 4, 5, 6, 7])
 
     async def test_container_path_for_appends_prefixed_slug_to_prototype(self):
         # Arrange
@@ -355,7 +391,28 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(len(records), 8)
-        self.assertEqual(len(padding_index), 8)
+
+    async def test_generate_stamp_with_padding_records_every_placement_in_the_padding_index(self):
+        # Arrange
+        settings = self._settings.model_copy(update={"padding": 1e-6})
+        padding_index = PaddingIndex(1.0)
+
+        # Act
+        records = self._stamp(settings=settings, padding_index=padding_index)
+
+        # Assert
+        self.assertEqual(len(padding_index), len(records))
+
+    async def test_generate_stamp_without_padding_leaves_the_padding_index_empty(self):
+        # Arrange
+        settings = self._settings.model_copy(update={"padding": 0.0})
+        padding_index = PaddingIndex(1.0)
+
+        # Act
+        self._stamp(settings=settings, padding_index=padding_index)
+
+        # Assert
+        self.assertEqual(len(padding_index), 0)
 
     async def test_generate_stamp_strength_zero_yields_no_records(self):
         # Arrange
@@ -558,6 +615,85 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(records, [])
         self.assertEqual(len(padding_index), 0)
+
+    async def test_generate_stamp_skips_candidates_steeper_than_max_surface_angle_from_the_stage_up_axis(self):
+        # Arrange
+        cache = _AngledSurfaceCache([_FLOOR_NORMAL, _WALL_NORMAL])
+        settings = self._settings.model_copy(update={"max_surface_angle": 45.0})
+
+        # Act
+        records = self._stamp(settings=settings, cache=cache)
+
+        # Assert - every other candidate snapped onto the wall, and only those were skipped
+        self.assertEqual([_recorded_normal(record) for record in records], [_FLOOR_NORMAL] * 4)
+
+    async def test_generate_stamp_with_max_surface_angle_180_keeps_every_candidate(self):
+        # Arrange
+        cache = _AngledSurfaceCache([_FLOOR_NORMAL, _WALL_NORMAL])
+        settings = self._settings.model_copy(update={"max_surface_angle": 180.0})
+
+        # Act
+        records = self._stamp(settings=settings, cache=cache)
+
+        # Assert
+        self.assertEqual(len(records), 8)
+
+    async def test_generate_stamp_with_its_centre_on_a_wall_still_skips_the_wall(self):
+        # Arrange - the cursor landed on the wall beside the floor, as it does on a bevel or a ledge
+        cache = _AngledSurfaceCache([_FLOOR_NORMAL, _WALL_NORMAL])
+        settings = self._settings.model_copy(update={"max_surface_angle": 45.0})
+
+        # Act
+        records = self._stamp(settings=settings, cache=cache, center=_center_sample(_WALL_NORMAL))
+
+        # Assert - measured from the stage up axis, only what landed on the floor is kept
+        self.assertEqual([_recorded_normal(record) for record in records], [_FLOOR_NORMAL] * 4)
+
+    async def test_generate_stamp_keeps_a_candidate_exactly_at_max_surface_angle(self):
+        # Arrange
+        sloped = (math.sqrt(0.5), 0.0, math.sqrt(0.5))
+        cache = _AngledSurfaceCache([sloped])
+        settings = self._settings.model_copy(update={"max_surface_angle": 45.0})
+
+        # Act
+        records = self._stamp(settings=settings, cache=cache)
+
+        # Assert
+        self.assertEqual(len(records), 8)
+
+    async def test_generate_stamp_keeps_a_perpendicular_candidate_at_a_ninety_degree_limit(self):
+        # Arrange - cos(90 degrees) is not exactly zero, so this is where rounding would drop the wall
+        cache = _AngledSurfaceCache([(1.0, 0.0, 0.0)])
+        settings = self._settings.model_copy(update={"max_surface_angle": 90.0})
+
+        # Act
+        records = self._stamp(settings=settings, cache=cache)
+
+        # Assert
+        self.assertEqual(len(records), 8)
+
+    async def test_generate_flood_skips_samples_steeper_than_max_surface_angle_from_the_stage_up_axis(self):
+        # Arrange
+        self._add_wall_to_quad()
+        settings = self._settings.model_copy(update={"max_surface_angle": 45.0})
+
+        # Act
+        records = self._flood(200, settings=settings)
+
+        # Assert - a flood has no brush centre, so the wall is measured from +Z and dropped
+        self.assertGreater(len(records), 0)
+        self.assertEqual({_recorded_normal(record) for record in records}, {_FLOOR_NORMAL})
+
+    async def test_generate_flood_with_max_surface_angle_180_keeps_samples_on_the_wall(self):
+        # Arrange
+        self._add_wall_to_quad()
+        settings = self._settings.model_copy(update={"max_surface_angle": 180.0})
+
+        # Act
+        records = self._flood(200, settings=settings)
+
+        # Assert
+        self.assertTrue(any(abs(record.origin[5]) < 1e-9 for record in records))
 
     async def test_generate_flood_caps_at_max_count_and_stays_within_mesh_bbox(self):
         # Arrange
@@ -979,3 +1115,195 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertIsNone(self._layer.GetPrimAtPath(missing_path))
         self.assertIsNone(self._layer.GetPrimAtPath(_CONTAINER_PATH))
+
+    def _author_patch(self, count: int, container_path: str = _CONTAINER_PATH) -> list[PlacementRecord]:
+        """Author ``count`` placements into one container and return their records."""
+        records = [
+            _make_record(
+                f"s_{container_path[-2:]}{index:010d}", self._asset_a, (float(index), 0.0, 0.0), container_path
+            )
+            for index in range(count)
+        ]
+        self._author(*records)
+        return records
+
+    def _assert_is_scatter_container(self, layer: Sdf.Layer, container_path: str) -> None:
+        container = layer.GetPrimAtPath(container_path)
+        self.assertIsNotNone(container, container_path)
+        self.assertEqual(container.specifier, Sdf.SpecifierDef)
+        self.assertEqual(container.typeName, "Xform")
+        self.assertEqual(container.attributes[IS_REMIX_SCATTER_ATTR].default, True)
+        self.assertEqual(container.attributes[SCATTER_BRUSH_ID_ATTR].default, "Default")
+
+    def _child_names(self, layer: Sdf.Layer, container_path: str) -> list[str]:
+        return sorted(layer.GetPrimAtPath(container_path).nameChildren.keys())
+
+    async def test_remove_placements_of_every_child_of_two_containers_deletes_both_containers(self):
+        # Arrange
+        self._stage.DefinePrim(_OTHER_PROTOTYPE_ROOT, "Xform")
+        records = self._author_patch(3) + self._author_patch(2, _OTHER_CONTAINER_PATH)
+
+        # Act
+        remove_placements(self._layer, [record.prim_path for record in records])
+
+        # Assert
+        self.assertIsNone(self._layer.GetPrimAtPath(_CONTAINER_PATH))
+        self.assertIsNone(self._layer.GetPrimAtPath(_OTHER_CONTAINER_PATH))
+        self.assertIsNotNone(self._layer.GetPrimAtPath(_PROTOTYPE_ROOT))
+        self.assertIsNotNone(self._layer.GetPrimAtPath(_OTHER_PROTOTYPE_ROOT))
+
+    async def test_remove_placements_of_every_child_of_a_referencing_container_keeps_the_container(self):
+        # Arrange - a container that references something holds more than its placements
+        records = self._author_patch(2)
+        self._layer.GetPrimAtPath(_CONTAINER_PATH).referenceList.prependedItems.append(
+            Sdf.Reference(assetPath=self._asset_b)
+        )
+
+        # Act
+        remove_placements(self._layer, [record.prim_path for record in records])
+
+        # Assert
+        self.assertEqual(self._child_names(self._layer, _CONTAINER_PATH), [])
+
+    async def test_remove_placements_of_every_child_of_a_parent_that_is_no_container_keeps_the_parent(self):
+        # Arrange
+        group_path = f"{_PROTOTYPE_ROOT}/group"
+        records = self._author_patch(2, group_path)
+
+        # Act
+        remove_placements(self._layer, [record.prim_path for record in records])
+
+        # Assert
+        self.assertEqual(self._child_names(self._layer, group_path), [])
+
+    async def test_snapshot_prims_of_every_child_copies_the_container_definition_and_children(self):
+        # Arrange
+        records = self._author_patch(3)
+
+        # Act
+        snapshot = snapshot_prims(self._layer, [record.prim_path for record in records])
+
+        # Assert
+        self._assert_is_scatter_container(snapshot, _CONTAINER_PATH)
+        self.assertEqual(self._child_names(snapshot, _CONTAINER_PATH), sorted(record.prim_name for record in records))
+
+    async def test_restore_prims_of_every_child_after_the_container_was_deleted_restores_container_and_children(self):
+        # Arrange
+        records = self._author_patch(3)
+        paths = [record.prim_path for record in records]
+        snapshot = snapshot_prims(self._layer, paths)
+        remove_placements(self._layer, paths)
+        self.assertIsNone(self._layer.GetPrimAtPath(_CONTAINER_PATH))
+
+        # Act
+        restore_prims(self._layer, snapshot, paths)
+
+        # Assert
+        self._assert_is_scatter_container(self._layer, _CONTAINER_PATH)
+        self.assertEqual(
+            self._child_names(self._layer, _CONTAINER_PATH), sorted(record.prim_name for record in records)
+        )
+        for record in records:
+            spec = self._layer.GetPrimAtPath(record.prim_path)
+            self.assertEqual(spec.attributes["xformOp:translate"].default, Gf.Vec3d(*record.translate))
+            self.assertTrue(self._stage.GetPrimAtPath(record.prim_path).IsDefined())
+
+    async def test_restore_prims_of_a_subset_of_a_whole_container_snapshot_restores_only_that_subset(self):
+        # Arrange
+        records = self._author_patch(3)
+        paths = [record.prim_path for record in records]
+        snapshot = snapshot_prims(self._layer, paths)
+        remove_placements(self._layer, paths)
+
+        # Act
+        restore_prims(self._layer, snapshot, [records[0].prim_path])
+
+        # Assert
+        self._assert_is_scatter_container(self._layer, _CONTAINER_PATH)
+        self.assertEqual(self._child_names(self._layer, _CONTAINER_PATH), [records[0].prim_name])
+
+    async def test_restore_prims_into_a_container_that_still_exists_keeps_its_other_children(self):
+        # Arrange
+        records = self._author_patch(2)
+        snapshot = snapshot_prims(self._layer, [records[0].prim_path])
+        remove_placements(self._layer, [records[0].prim_path])
+
+        # Act
+        restore_prims(self._layer, snapshot, [records[0].prim_path])
+
+        # Assert
+        self.assertEqual(
+            self._child_names(self._layer, _CONTAINER_PATH), sorted(record.prim_name for record in records)
+        )
+
+    async def test_snapshot_prims_into_a_snapshot_already_holding_the_container_keeps_its_earlier_children(self):
+        # Arrange - an erase stroke: the first stamp took one placement, the next one takes the last
+        records = self._author_patch(2)
+        snapshot = snapshot_prims(self._layer, [records[0].prim_path])
+        remove_placements(self._layer, [records[0].prim_path])
+
+        # Act
+        snapshot_prims(self._layer, [records[1].prim_path], into=snapshot)
+
+        # Assert
+        self.assertEqual(self._child_names(snapshot, _CONTAINER_PATH), sorted(record.prim_name for record in records))
+
+    async def test_restore_prims_from_an_erase_snapshot_built_stamp_by_stamp_restores_every_child(self):
+        # Arrange
+        records = self._author_patch(3)
+        snapshot = snapshot_prims(self._layer, [records[0].prim_path])
+        remove_placements(self._layer, [records[0].prim_path])
+        snapshot_prims(self._layer, [records[1].prim_path, records[2].prim_path], into=snapshot)
+        remove_placements(self._layer, [records[1].prim_path, records[2].prim_path])
+        self.assertIsNone(self._layer.GetPrimAtPath(_CONTAINER_PATH))
+
+        # Act
+        restore_prims(self._layer, snapshot, [record.prim_path for record in records])
+
+        # Assert
+        self._assert_is_scatter_container(self._layer, _CONTAINER_PATH)
+        self.assertEqual(
+            self._child_names(self._layer, _CONTAINER_PATH), sorted(record.prim_name for record in records)
+        )
+        self.assertTrue(all(self._stage.GetPrimAtPath(record.prim_path).IsDefined() for record in records))
+
+
+class TestPlacementPool(omni.kit.test.AsyncTestCase):
+    def _pool(self) -> PlacementPool:
+        """Three placements on the X axis at 0, 10 and 100."""
+        paths = [Sdf.Path(f"{_CONTAINER_PATH}/s_00000000000{index}") for index in range(3)]
+        return PlacementPool(paths, np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [100.0, 0.0, 0.0]]))
+
+    async def test_take_within_returns_the_placements_within_the_radius_in_pool_order(self):
+        # Arrange
+        pool = self._pool()
+
+        # Act
+        taken = pool.take_within(Gf.Vec3d(5.0, 0.0, 0.0), 5.0)
+
+        # Assert
+        self.assertEqual(
+            taken, [Sdf.Path(f"{_CONTAINER_PATH}/s_000000000000"), Sdf.Path(f"{_CONTAINER_PATH}/s_000000000001")]
+        )
+
+    async def test_take_within_takes_the_placements_it_returns_out_of_the_pool(self):
+        # Arrange
+        pool = self._pool()
+        pool.take_within(Gf.Vec3d(0.0, 0.0, 0.0), 20.0)
+
+        # Act
+        taken_again = pool.take_within(Gf.Vec3d(0.0, 0.0, 0.0), 20.0)
+
+        # Assert
+        self.assertEqual(taken_again, [])
+        self.assertEqual(len(pool), 1)
+
+    async def test_take_within_of_an_empty_pool_returns_nothing(self):
+        # Arrange
+        pool = PlacementPool([], np.empty((0, 3)))
+
+        # Act
+        taken = pool.take_within((0.0, 0.0, 0.0), 1000.0)
+
+        # Assert
+        self.assertEqual(taken, [])

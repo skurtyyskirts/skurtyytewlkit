@@ -88,6 +88,22 @@ def _define_stacked_quads_mesh(stage: Usd.Stage, path: str = _MESH_PATH) -> UsdG
     return _define_mesh(stage, path, [*_QUAD_POINTS, *upper], [4, 4], [0, 1, 2, 3, 4, 5, 6, 7])
 
 
+def _define_bumpy_grid_mesh(stage: Usd.Stage, cells: int, path: str = _MESH_PATH) -> UsdGeom.Mesh:
+    """A ``cells`` x ``cells`` grid of 10x10 quads whose height rolls, so neighbouring triangles face different ways."""
+    side = cells + 1
+    points = [
+        (10.0 * column, 10.0 * row, 3.0 * np.sin(column * 0.7) + 2.0 * np.cos(row * 1.3))
+        for row in range(side)
+        for column in range(side)
+    ]
+    indices = []
+    for row in range(cells):
+        for column in range(cells):
+            corner = row * side + column
+            indices += [corner, corner + 1, corner + side + 1, corner + side]
+    return _define_mesh(stage, path, points, [4] * (cells * cells), indices)
+
+
 def _define_translated_xform(stage: Usd.Stage, path: str, translate: Sequence[float]) -> UsdGeom.Xform:
     xform = UsdGeom.Xform.Define(stage, path)
     xform.AddTranslateOp().Set(Gf.Vec3d(*translate))
@@ -408,6 +424,60 @@ class TestGeometryFunctions(omni.kit.test.AsyncTestCase):
         self.assertEqual(positions.shape, (0, 3))
         self.assertEqual(normals.shape, (0, 3))
         self.assertEqual(valid.shape, (0,))
+
+    async def test_closest_points_spread_over_a_mesh_in_several_groups_matches_each_point_queried_alone(self):
+        # Arrange - more points than one neighbourhood group holds, over a bumpy grid so the normals differ
+        stage = Usd.Stage.CreateInMemory()
+        geometry = build_mesh_geometry(_define_bumpy_grid_mesh(stage, cells=16).GetPrim())
+        points = np.random.default_rng(3).uniform([-10.0, -10.0, -6.0], [170.0, 170.0, 10.0], size=(700, 3))
+        expected = [closest_point_on_triangles(point, geometry, max_distance=4.0) for point in points]
+        expected_valid = [sample is not None for sample in expected]
+        self.assertTrue(0 < sum(expected_valid) < len(points))
+
+        # Act
+        positions, normals, valid = closest_points(points, geometry, max_distance=4.0)
+
+        # Assert
+        np.testing.assert_array_equal(valid, expected_valid)
+        np.testing.assert_array_equal(positions[valid], [sample.position for sample in expected if sample is not None])
+        np.testing.assert_array_equal(normals[valid], [sample.normal for sample in expected if sample is not None])
+
+    async def test_morton_order_returns_a_permutation_of_every_point_index(self):
+        # Arrange
+        points = np.random.default_rng(5).uniform(-1000.0, 1000.0, size=(1000, 3))
+
+        # Act
+        order = geometry_module._morton_order(points)
+
+        # Assert
+        self.assertEqual(order.dtype, np.int64)
+        np.testing.assert_array_equal(np.sort(order), np.arange(1000))
+
+    async def test_morton_order_of_coincident_points_returns_a_permutation_of_every_point_index(self):
+        # Arrange - no extent at all along any axis
+        points = np.full((300, 3), 7.0)
+
+        # Act
+        order = geometry_module._morton_order(points)
+
+        # Assert
+        np.testing.assert_array_equal(np.sort(order), np.arange(300))
+
+    async def test_morton_order_puts_the_points_of_one_neighbourhood_next_to_each_other(self):
+        # Arrange - two far apart clusters, interleaved in the input
+        rng = np.random.default_rng(9)
+        near = rng.uniform(0.0, 10.0, size=(50, 3))
+        far = rng.uniform(1000.0, 1010.0, size=(50, 3))
+        points = np.empty((100, 3))
+        points[0::2] = near
+        points[1::2] = far
+
+        # Act
+        order = geometry_module._morton_order(points)
+
+        # Assert
+        self.assertEqual({int(index) % 2 for index in order[:50]}, {0})
+        self.assertEqual({int(index) % 2 for index in order[50:]}, {1})
 
     async def test_raycast_with_stacked_quads_returns_nearest_triangle_and_t(self):
         # Arrange

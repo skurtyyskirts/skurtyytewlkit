@@ -58,6 +58,11 @@ _BARYCENTRIC_EPSILON = 1e-9
 _DEGENERATE_CROSS_LENGTH = 1e-12
 # Upper bound on the (points x triangles) boolean mask evaluated in one numpy chunk during candidate search.
 _PAIR_CHUNK_BUDGET = 1 << 22
+# Query points searched against the triangles near them as one group. A batch larger than this is split into groups of
+# neighbouring points first, so that points spread over a whole mesh are not each tested against all of it.
+_LOCAL_GROUP_SIZE = 256
+# Bits per axis of the Morton code that orders points into neighbourhoods; three of them fit an unsigned 64-bit key.
+_MORTON_BITS = 21
 
 _Vector3Like = Any
 
@@ -668,7 +673,13 @@ def _nearest_on_surface(
 def _candidate_pairs(
     points: np.ndarray, geometry: MeshGeometry, max_distance: float | None
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (point index, triangle index) pairs whose expanded triangle bounds contain the point."""
+    """Return (point index, triangle index) pairs whose expanded triangle bounds contain the point.
+
+    Triangles are first narrowed to those near the whole batch, which is enough for a brush stamp, whose points are
+    all close together. A larger batch, such as every placement of a patch being dragged, can be spread over the
+    whole mesh, so it is split into groups of neighbouring points and each group is narrowed on its own; a point gets
+    exactly the candidates it would get searched alone either way.
+    """
     triangle_count = geometry.triangle_count
     point_count = points.shape[0]
     if max_distance is None:
@@ -677,6 +688,30 @@ def _candidate_pairs(
             np.tile(np.arange(triangle_count, dtype=np.int64), point_count),
         )
     expand = abs(float(max_distance))
+    if point_count <= _LOCAL_GROUP_SIZE:
+        return _candidate_pairs_near(points, np.arange(point_count, dtype=np.int64), geometry, expand)
+    order = _morton_order(points)
+    point_chunks = []
+    triangle_chunks = []
+    for start in range(0, point_count, _LOCAL_GROUP_SIZE):
+        group = order[start : start + _LOCAL_GROUP_SIZE]
+        group_points, group_triangles = _candidate_pairs_near(points[group], group, geometry, expand)
+        point_chunks.append(group_points)
+        triangle_chunks.append(group_triangles)
+    return np.concatenate(point_chunks), np.concatenate(triangle_chunks)
+
+
+def _candidate_pairs_near(
+    points: np.ndarray, point_ids: np.ndarray, geometry: MeshGeometry, expand: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the candidate pairs of a group of points, narrowing the triangles to those near the group first.
+
+    Args:
+        points: (K, 3) query points of the group.
+        point_ids: (K,) index of each of them in the whole batch, which is what the pairs report.
+        geometry: Mesh to search.
+        expand: Distance the triangle bounds are expanded by.
+    """
     query_min = points.min(axis=0) - expand
     query_max = points.max(axis=0) + expand
     triangle_ids = np.nonzero(
@@ -689,14 +724,42 @@ def _candidate_pairs(
     chunk = max(1, _PAIR_CHUNK_BUDGET // triangle_ids.size)
     point_chunks = []
     triangle_chunks = []
-    for start in range(0, point_count, chunk):
+    for start in range(0, points.shape[0], chunk):
         block = points[start : start + chunk]
         inside = np.all(block[:, None, :] >= lower[None, :, :], axis=2)
         inside &= np.all(block[:, None, :] <= upper[None, :, :], axis=2)
         block_points, block_triangles = np.nonzero(inside)
-        point_chunks.append(block_points + start)
+        point_chunks.append(point_ids[block_points + start])
         triangle_chunks.append(triangle_ids[block_triangles])
     return np.concatenate(point_chunks), np.concatenate(triangle_chunks)
+
+
+def _morton_order(points: np.ndarray) -> np.ndarray:
+    """Return the indices that sort points along a Z-order curve, so consecutive points are near each other.
+
+    Args:
+        points: (K, 3) points.
+
+    Returns:
+        (K,) int64 permutation of the point indices.
+    """
+    low = points.min(axis=0)
+    span = np.maximum(points.max(axis=0) - low, 1e-12)
+    scale = float((1 << _MORTON_BITS) - 1)
+    cells = np.clip((points - low) / span * scale, 0.0, scale).astype(np.uint64)
+    code = _spread_bits(cells[:, 0]) | (_spread_bits(cells[:, 1]) << np.uint64(1))
+    code |= _spread_bits(cells[:, 2]) << np.uint64(2)
+    return np.argsort(code, kind="stable").astype(np.int64)
+
+
+def _spread_bits(values: np.ndarray) -> np.ndarray:
+    """Insert two zero bits between each of the low 21 bits of every value, the interleave a 3D Morton code needs."""
+    spread = values & np.uint64(0x1FFFFF)
+    spread = (spread | (spread << np.uint64(32))) & np.uint64(0x1F00000000FFFF)
+    spread = (spread | (spread << np.uint64(16))) & np.uint64(0x1F0000FF0000FF)
+    spread = (spread | (spread << np.uint64(8))) & np.uint64(0x100F00F00F00F00F)
+    spread = (spread | (spread << np.uint64(4))) & np.uint64(0x10C30C30C30C30C3)
+    return (spread | (spread << np.uint64(2))) & np.uint64(0x1249249249249249)
 
 
 def _closest_points_on_triangle_pairs(

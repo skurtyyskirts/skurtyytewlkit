@@ -27,6 +27,7 @@ __all__ = [
     "TestScatterAssetModel",
     "TestScatterAssetTextureSource",
     "TestScatterPane",
+    "TestScatterPaneStrokePreview",
     "TestScatterPaneTurnFields",
     "TestScatterWindow",
     "TestScatterWindowE2E",
@@ -47,6 +48,6 @@ from .unit.test_asset_list import (
 from .unit.test_combo_model import TestChoicesComboModel
 from .unit.test_extension import TestTrexScatterWindowExtension
 from .unit.test_presets_ui import TestPresetsWidget
-from .unit.test_setup_ui import TestScatterPane, TestScatterPaneTurnFields
+from .unit.test_setup_ui import TestScatterPane, TestScatterPaneStrokePreview, TestScatterPaneTurnFields
 from .unit.test_value_model import TestDragValueModel, TestFieldBounds
 from .unit.test_workspace import TestScatterWindow
