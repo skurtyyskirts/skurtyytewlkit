@@ -17,7 +17,8 @@ Extension names encode their role:
 - `.menu` — Menu items only, exposes subscriptions. Often skipped — a simple menu can live directly in the top-level
   feature entry extension.
 - `.model` — Data models for tree/list views (`omni.ui.AbstractItemModel`)
-- `.service` — REST API endpoints (FastAPI via Omniverse microservices)
+- `.service` — Reusable Flux REST services, such as `omni.flux.validator.mass.service`. Toolkit REST routes live in
+  `lightspeed.trex.service.core` `routes/` instead (see [Implementing REST Service Endpoints](../patterns/services.md))
 - `.plugin.*` — Plugin implementations loaded by a factory
 - `.app.resources` — Shared assets (icons, images, fonts) for an application. No code.
 - `.style` — Global application stylesheet. No per-widget inline styles; all styles come from here.
@@ -135,9 +136,24 @@ dependencies = [
 
 **Notes:**
 
-- Only declare dependencies that are actually imported by this extension.
+- Declare dependencies with a demonstrated runtime or test purpose: imports, loading, settings, resources, or dependency
+  aggregation.
 - Add `"omni.flux.pip_archive" = {}` if the extension uses any third-party pip packages.
 - Never rely on transitive dependencies — if you import it, declare it.
+
+### MDL Backend Initialization
+
+Declare `omni.flux.material_api` as a dependency when using `ShaderInfoAPI`. Its `MaterialApiExtension.on_startup()` calls
+`omni.mdl.neuraylib.ensure_running()` synchronously, so dependent extensions can resolve MDL assets and query shader
+metadata after startup without waiting for a material selection or renderer activity. Consumers that already depend on
+a material widget or service using this API inherit that startup ordering and do not need another initialization call.
+
+Loading `omni.mdl.neuraylib` alone does not establish this contract. Without `rtx.hydra`, Neuray must be started explicitly
+to register MDL search paths with the USD asset resolver; see
+[MDL module resolution without the RTX renderer](https://docs.omniverse.nvidia.com/kit/docs/omni.mdl.neuraylib/latest/USAGE_PYTHON.html#enable-mdl-module-resolution-without-the-rtx-renderer).
+The application still owns the configured search paths, such as those in
+[the rendering settings](../../source/apps/lightspeed.app.rendering.settings.toml); initializing the backend does not
+provide missing MDL content.
 
 ---
 

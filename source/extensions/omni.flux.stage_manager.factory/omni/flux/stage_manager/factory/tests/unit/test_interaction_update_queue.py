@@ -63,6 +63,33 @@ class TestStageManagerInteractionUpdateQueue(omni.kit.test.AsyncTestCase):
         """Create a minimally configured interaction plugin."""
         return _TestInteractionPlugin.model_construct(display_name="TestInteraction", tooltip="For tests", **kwargs)
 
+    async def test_select_all_selects_published_tree_items(self):
+        """Select the published tree items through the scrolling tree widget."""
+        # Arrange
+        plugin = self._make_plugin(tree=Mock())
+        plugin.tree.model.get_items_by_path.return_value = []
+        plugin._tree_widget = Mock()
+
+        # Act
+        plugin.select_all()
+
+        # Assert
+        plugin._tree_widget.select_all.assert_called_once_with()
+
+    async def test_select_all_expands_root_node(self):
+        """Expand the retained RootNode row when selecting all."""
+        # Arrange
+        root_node = Mock()
+        plugin = self._make_plugin(tree=Mock())
+        plugin.tree.model.get_items_by_path.return_value = [root_node]
+        plugin._tree_widget = Mock()
+
+        # Act
+        plugin.select_all()
+
+        # Assert
+        plugin._tree_widget.set_expanded.assert_called_once_with(root_node, True, False)
+
     async def test_on_hidden_clears_stale_ui_refresh_targets(self):
         """Clear stale UI refresh targets when the interaction is hidden."""
         # Arrange

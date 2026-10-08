@@ -1,6 +1,15 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [3.1.7]
+### Added
+- Added Copy Light and Paste Light actions for mesh asset, descendant, and instance selections to the Stage Manager context menu, separated from the following viewport actions.
+
+## [3.1.6]
+### Fixed
+- Stopped the delete and restore action classifier from raising when the stage closes during a refresh.
+- Named the selected ComfyUI workflow by its display name in the AI Tools action tooltip, as the job queue does.
+
 ## [3.1.5]
 ### Changed
 - Sourced hidden-category state labels from the authoritative USD schema.

@@ -16,9 +16,10 @@
 """
 
 import carb
-import carb.settings
 import omni.ext
+from omni.flux.service.factory import get_instance as _get_service_factory_instance
 
+from .routes import ROUTE_SERVICES as _ROUTE_SERVICES
 from .service import CoreService as _CoreService
 
 
@@ -31,6 +32,10 @@ class TrexCoreServiceExtension(omni.ext.IExt):
     def on_startup(self, _ext_id):
         carb.log_info("[lightspeed.trex.service.core] Startup")
 
+        # Route services must register before CoreService resolves the configured service names
+        # against the factory.
+        _get_service_factory_instance().register_plugins(_ROUTE_SERVICES)
+
         self._core_service = _CoreService()
 
     def on_shutdown(self):
@@ -39,3 +44,5 @@ class TrexCoreServiceExtension(omni.ext.IExt):
         if self._core_service:
             self._core_service.destroy()
             self._core_service = None
+
+        _get_service_factory_instance().unregister_plugins(_ROUTE_SERVICES)

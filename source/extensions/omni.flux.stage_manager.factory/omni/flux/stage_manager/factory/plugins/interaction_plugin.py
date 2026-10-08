@@ -25,6 +25,7 @@ from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+import omni.appwindow
 import omni.kit.app
 import omni.usd
 from omni import ui
@@ -406,6 +407,15 @@ class StageManagerInteractionPlugin(_StageManagerUIPluginBase, abc.ABC):
                     ui.Image("", name="TimerStatic", height=32)
                     ui.Label("Updating", name="LoadingLabel", height=0, alignment=ui.Alignment.CENTER)
                     ui.Spacer(width=0)
+
+    def select_all(self) -> None:
+        """Select every retained prim and expand the Stage Manager root."""
+        if not self._tree_widget:
+            return
+
+        self._tree_widget.select_all()
+        for root_node in self.tree.model.get_items_by_path("/RootNode"):
+            self._tree_widget.set_expanded(root_node, True, False)
 
     def set_active(self, value: bool):
         """

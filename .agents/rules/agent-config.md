@@ -9,7 +9,7 @@
 | `.agents/context/` | Project facts: overview, architecture, resources |
 | `.agents/rules/` | Agent behavior rules |
 | `.agents/commands/` | Multi-step workflows |
-| `.agents/skills/*/SKILL.md` | Shared skill wrappers, direct `@.agents/...` refs |
+| `.agents/skills/*/SKILL.md` | Shared skill wrappers, direct `@` refs to the canonical file |
 | `.agents/subagents/` | Canonical specialist role prompts |
 | `.agents/hooks/` | Portable hook targets only |
 | `.agents/scripts/` | Portable helper launchers; not hooks |
@@ -38,7 +38,10 @@ Python globs: `code-style`, `code-comments`, `license`, `engineering-standards`,
 ### Skills
 
 On-demand rules/commands -> `.agents/skills/*/SKILL.md`. Pi/Codex/Cursor use shared skills. Claude needs matching
-`.claude/skills/*/SKILL.md` wrappers. Skill body = direct `@.agents/...` ref, not prose path instruction. `AGENTS.md`
+`.claude/skills/*/SKILL.md` wrappers. Skill body = direct `@` ref to the canonical file, not prose path
+instruction. Canonical is usually `.agents/`; a skill published outward lives at `skills/<name>/SKILL.md`
+and the wrapper points there, repeating the description because that is what decides whether a harness
+loads it. `AGENTS.md`
 requires clients without native `@` expansion to read those references recursively. Keep auto model invocation on
 unless safety reason documented.
 
@@ -50,8 +53,8 @@ and document reason here. Cursor skill discovery version-sensitive.
 - Add/rename/remove shared rule, command, context, skill, subagent, hook, or MCP -> update matching Tool Surfaces row and
   every direct ref.
 - No duplication. If wrapper cannot import, keep inline minimum and point to `.agents/`.
-- `.agents/` agent-agnostic. No Pi/Codex/Claude/Cursor/private state paths. Hook targets may take `--agent` only for
-  output contract formatting.
+- `.agents/` agent-agnostic. No Pi/Codex/Claude/Cursor/private state paths. Hook targets may take `--agent` only to
+  interpret the agent's hook input protocol and format its output contract.
 - Local/private checks -> ignored local config, not shared hooks.
 - Hook targets live in `.agents/hooks/`; helpers live in `.agents/scripts/`.
 - All shared hook commands use one entrypoint: `.agents/scripts/run_packman_python.cmd`. It is a polyglot shim:
@@ -62,8 +65,10 @@ and document reason here. Cursor skill discovery version-sensitive.
 - Keep hook arguments as real argv tokens. Do not combine the script path and flags into one `args` item; use
   `--agent=<agent>` when one token is clearer.
 - Stop hook runner: `.agents/hooks/run_stop_checks.py --agent=<codex|claude|cursor> <check>...`.
-  Check scripts return `0` allow, `2` block + stderr. Runner remaps by agent: `claude` keeps exit `2` + stderr;
-  `codex` exits `0` + JSON `decision:block`/`reason`; `cursor` exits `0` + JSON `followup_message`.
+  Check scripts return `0` allow, `2` block + stderr. Run checks on every Stop; allow at most one automatic repair or
+  feedback continuation, only with explicit first-stop metadata. Persistent failures or missing/invalid metadata
+  end the turn with diagnostics, never another automatic continuation. Protocol details:
+  `docs_dev/tools/ai-agents.md` -> Shared Hooks.
 - Memory watch only via ignored `.agents/memory-promotion.local.json` or env vars; no private state hardcode.
 - New rule -> `.agents/rules/`, Cursor wrapper if always/glob, shared + Claude skill if on-demand, wire
   `.agents/instructions.md`.
@@ -80,7 +85,8 @@ and document reason here. Cursor skill discovery version-sensitive.
 - Project `.pi/settings.json` and `.omp/settings.json` stay ignored. Users own packages, credentials, trust, model
   defaults, UI preferences, and built-in hook configuration locally. The repo ships no Pi/OMP hook adapter.
 - `.omp/` mirrors the Pi wrapper set for OMP, which reads `.omp/` and ignores `.pi/`: `.omp/agents/<name>.md` are
-  byte-identical copies of the Pi wrappers. Add or rename a Pi wrapper -> make the same change under `.omp/`.
+  copies of the Pi wrappers plus an OMP `model` role alias with an `"@default"` fallback. Add or rename a Pi wrapper ->
+  make the same change under `.omp/`.
 - Permissions/trust boundaries are agent-specific, not `.agents/`; Claude permissions in `.claude/settings.json`.
 - Plans/specs -> `docs/plans/` (gitignored). Not `docs/superpowers/`. If using new plan dir, ignore it first or Sphinx
   fails on unlinked docs.

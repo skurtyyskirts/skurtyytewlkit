@@ -22,14 +22,19 @@ from enum import Enum
 from pathlib import Path
 
 import carb
+import carb.settings
 import carb.eventdispatcher
 import carb.input
+import carb.tokens
 import omni.appwindow
 import omni.client
+import omni.kit.clipboard
+import omni.kit.undo
 import omni.ui as ui
 import omni.usd
 from carb.input import KeyboardInput
 from lightspeed.common import constants as _constants
+from lightspeed.hdremix.renderer_settings.dlss_settings import SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE
 from lightspeed.layer_manager.core import LayerManagerCore as _LayerManagerCore
 from lightspeed.layer_manager.core import LayerType as _LayerType
 from lightspeed.trex.contexts import get_instance as _trex_contexts_instance
@@ -51,6 +56,10 @@ MATERIAL_ROOT_PATH = "/RootNode/Looks/"
 RELATIVE_SOURCE_TEXTURE_PATH = "project_example/sources/textures/"
 RELATIVE_CAPTURE_TEXTURE_PATH = "project_example/deps/captures/materials/textures/"
 METAL_WALL_ASSET_PARTIAL_BASENAME = "T_MetalPanelWall_HeavyRust_"
+DLSS_MATERIAL_GROUP_PREFIXES = (
+    "DLSS 3D-Guided Neural Generation",
+    "DLSS Neural Rendering",
+)
 # Map of property name to whether it has a texture attribute set in the test material
 PROPERTY_BRANCHES_MAP = {
     "Base Material": True,
@@ -64,6 +73,7 @@ PROPERTY_BRANCHES_MAP = {
     "Normal": True,
     "Displacement": False,
     "Subsurface": False,
+    "DLSS Neural Rendering": False,
 }
 BRANCHES_TO_EXPAND: list[bool] = list(PROPERTY_BRANCHES_MAP.values())
 # texture types in order that they appear
@@ -263,6 +273,47 @@ class TestMaterialPropertyWidget(AsyncTestCase):
 
         finally:
             await self.__destroy(_window, _material_property_wid)
+
+    async def test_set_dlss_neural_rendering_availability_updates_material_group_visibility(self):
+        settings = carb.settings.get_settings()
+        original_availability = settings.get(SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE)
+        settings.set(SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE, False)
+        _window = None
+        _material_property_wid = None
+
+        try:
+            _window, _material_property_wid = await self.__setup_widget()
+            usd_context = omni.usd.get_context()
+            usd_context.get_selection().set_selected_prim_paths(["/RootNode/meshes/mesh_0AB745B8BEE1F16B/mesh"], False)
+            await ui_test.human_delay(human_delay_speed=3)
+
+            labels = [
+                item.widget.text
+                for item in ui_test.find_all(f"{_window.title}//Frame/**/Label[*]")
+                if item.widget.visible
+            ]
+            self.assertIn("Base Material", labels)
+            self.assertFalse(any(label.startswith(DLSS_MATERIAL_GROUP_PREFIXES) for label in labels))
+
+            settings.set(SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE, True)
+            await ui_test.human_delay(human_delay_speed=3)
+
+            labels = [
+                item.widget.text
+                for item in ui_test.find_all(f"{_window.title}//Frame/**/Label[*]")
+                if item.widget.visible
+            ]
+            self.assertEqual(
+                sum(label.startswith(DLSS_MATERIAL_GROUP_PREFIXES) for label in labels),
+                1,
+            )
+        finally:
+            if _window is not None and _material_property_wid is not None:
+                await self.__destroy(_window, _material_property_wid)
+            if original_availability is None:
+                settings.destroy_item(SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE)
+            else:
+                settings.set(SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE, original_availability)
 
     async def test_material_property_field_stays_inside_narrow_panel_when_shown_after_hidden_build(self):
         _window, _material_property_wid = await self.__setup_widget(width=240)
@@ -1160,15 +1211,34 @@ class TestMaterialPropertyWidget(AsyncTestCase):
             await self.__destroy(_window, _material_property_wid)
 
     async def test_burger_menu_populates(self):
+        """Resolve the selected material's MDL file, convert through its menu, and undo."""
+        await self.__open_temp_project()
         _window, _material_property_wid = await self.__setup_widget()
 
         try:
             # select
-            usd_context = omni.usd.get_context()
+            usd_context = omni.usd.get_context("")
             usd_context.get_selection().set_selected_prim_paths(
                 ["/RootNode/instances/inst_0AB745B8BEE1F16B_0/mesh"], False
             )
             await ui_test.human_delay(10)
+
+            # The copied path must already resolve on the first selection, before opening the conversion menu.
+            material_name_label = ui_test.find(f"{_window.title}//Frame/**/Label[*].identifier=='material_label'")
+            self.assertIsNotNone(material_name_label)
+            omni.kit.clipboard.copy("")
+            await material_name_label.click(right_click=True)
+            await ui_test.human_delay(5)
+            await ui_test.menu.select_context_menu("Copy Material MDL Path")
+            await ui_test.human_delay(15)
+            copied_mdl_path = Path(omni.kit.clipboard.paste())
+            expected_mdl_path = Path(
+                carb.tokens.get_tokens_interface().resolve(
+                    "${lightspeed.trex.app.resources}/deps/omni_core_materials/Base/AperturePBR_Opacity.mdl"
+                )
+            )
+            self.assertTrue(copied_mdl_path.is_file(), f"First selection copied an invalid MDL path: {copied_mdl_path}")
+            self.assertEqual(copied_mdl_path.resolve(), expected_mdl_path.resolve())
 
             # grab burger menu and click
             # NOTE: There are value grabbing limitations with `omni.kit.ui_test.menu`
@@ -1179,11 +1249,14 @@ class TestMaterialPropertyWidget(AsyncTestCase):
 
             # grab hamburger menu and ensure it is populated correctly
             context_menu = await omni.kit.ui_test.menu.get_context_menu()
-            self.assertTrue("Convert to Translucent" in context_menu.get("_"))
+            self.assertIn("_", context_menu, f"No enabled material actions after first selection: {context_menu}")
+            self.assertIn("Convert to Translucent", context_menu["_"])
 
-            # click away and reset context_menu var
+            # Covers populated-menu dismissal; pending-work dismissal through user input is not covered.
             await ui_test.emulate_mouse_move_and_click(menu_image.position - ui_test.Vec2(10, 0))
             await ui_test.human_delay(10)
+            self.assertIsNone(_material_property_wid._SetupUI__menu)
+            self.assertIsNone(_material_property_wid._material_menu_task)
 
             # select something different
             usd_context.get_selection().set_selected_prim_paths(
@@ -1199,14 +1272,93 @@ class TestMaterialPropertyWidget(AsyncTestCase):
 
             # grab hamburger menu and ensure it is populated correctly
             context_menu = await omni.kit.ui_test.menu.get_context_menu()
-            self.assertTrue("Convert to Translucent" in context_menu.get("_"))
+            self.assertIn("_", context_menu, f"No enabled material actions after changing selection: {context_menu}")
+            self.assertIn("Convert to Translucent", context_menu["_"])
+            self.assertTrue(
+                any(
+                    "/RootNode/instances/inst_CED45075A077A49A_0/mesh" in child.tooltip
+                    for child in ui.Inspector.get_children(ui.Menu.get_current())
+                )
+            )
 
-            # click away to avoid interference with other tests
+            # Convert through the reopened menu and verify the authored material reference.
+            stage = usd_context.get_stage()
+            replacement_layer = Sdf.Layer.FindOrOpen(stage.GetRootLayer().ComputeAbsolutePath("./replacements.usda"))
+            self.assertIsNotNone(replacement_layer)
+            self.assertEqual(stage.GetEditTarget().GetLayer(), replacement_layer)
+            material_path = f"{MATERIAL_ROOT_PATH}mat_{MATERIAL_HASH}"
+            material_spec = replacement_layer.GetPrimAtPath(material_path)
+            self.assertIsNotNone(material_spec)
+            references_before = material_spec.GetInfo(Sdf.PrimSpec.ReferencesKey)
+            source_path = f"{material_path}/Shader.info:mdl:sourceAsset"
+            identifier_path = f"{source_path}:subIdentifier"
+            source_before = stage.GetAttributeAtPath(source_path).Get().path
+            identifier_before = stage.GetAttributeAtPath(identifier_path).Get()
+            self.assertEqual(source_before, "AperturePBR_Opacity.mdl")
+            self.assertEqual(identifier_before, "AperturePBR_Opacity")
+
+            await ui_test.menu.select_context_menu("Convert to Translucent")
+            await ui_test.human_delay()
+            for _ in range(120):
+                if (
+                    stage.GetAttributeAtPath(source_path).Get().path == "AperturePBR_Translucent.mdl"
+                    and stage.GetAttributeAtPath(identifier_path).Get() == "AperturePBR_Translucent"
+                ):
+                    break
+                await ui_test.human_delay(1)
+            else:
+                self.fail(
+                    "Convert to Translucent did not update the material source and subidentifier within 120 updates"
+                )
+
+            self.assertEqual(stage.GetAttributeAtPath(identifier_path).Get(), "AperturePBR_Translucent")
+            self.assertEqual(stage.GetAttributeAtPath(source_path).Get().path, "AperturePBR_Translucent.mdl")
+            references = replacement_layer.GetPrimAtPath(material_path).referenceList.explicitItems
+            self.assertEqual(len(references), 1)
+            self.assertEqual(Path(references[0].assetPath).as_posix(), "materials/AperturePBR_Translucent.usda")
+            self.assertEqual(references[0].primPath, Sdf.Path("/Looks/mat_AperturePBR_Translucent"))
+            self.assertIsNone(_material_property_wid._SetupUI__menu)
+            self.assertIsNone(_material_property_wid._material_menu_task)
+
+            # One undo restores the complete reference list-op and the original opaque shader.
+            omni.kit.undo.undo()
+            await ui_test.human_delay()
+            for _ in range(120):
+                if (
+                    stage.GetAttributeAtPath(source_path).Get().path == source_before
+                    and stage.GetAttributeAtPath(identifier_path).Get() == identifier_before
+                ):
+                    break
+                await ui_test.human_delay(1)
+            else:
+                self.fail("Undo did not restore the material source and subidentifier within 120 updates")
+
+            self.assertEqual(
+                replacement_layer.GetPrimAtPath(material_path).GetInfo(Sdf.PrimSpec.ReferencesKey),
+                references_before,
+            )
+            self.assertEqual(stage.GetAttributeAtPath(source_path).Get().path, source_before)
+            self.assertEqual(stage.GetAttributeAtPath(identifier_path).Get(), identifier_before)
+
+            # The restored material still has a working menu that releases ownership when dismissed.
+            menu_image = ui_test.find(f"{_window.title}//Frame/**/Image[*].identifier=='menu_burger_image'")
+            self.assertIsNotNone(menu_image)
+            await menu_image.click()
+            await ui_test.human_delay(15)
+            context_menu = await ui_test.menu.get_context_menu()
+            self.assertIn("_", context_menu, f"No enabled material actions after undo: {context_menu}")
+            self.assertIn("Convert to Translucent", context_menu["_"])
+            self.assertIs(_material_property_wid._SetupUI__menu, ui.Menu.get_current())
             await ui_test.emulate_mouse_move_and_click(menu_image.position - ui_test.Vec2(10, 0))
             await ui_test.human_delay(10)
+            self.assertIsNone(_material_property_wid._SetupUI__menu)
+            self.assertIsNone(_material_property_wid._material_menu_task)
 
         finally:
-            await self.__destroy(_window, _material_property_wid)
+            try:
+                await self.__destroy(_window, _material_property_wid)
+            finally:
+                await omni.usd.get_context("").close_stage_async()
 
     async def test_texture_string_field_tooltips_set_and_update(self):
         # setup

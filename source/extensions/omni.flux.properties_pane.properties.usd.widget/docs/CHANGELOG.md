@@ -2,6 +2,14 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.14.5]
+### Fixed
+- Verify numeric drag undo grouping through the undo stack and Undo/Redo instead of preview command history.
+
+## [2.14.4]
+### Added
+- Added lookup-table support for semantic vector channel names in value tooltips.
+
 ## [2.14.3]
 ### Added
 - Added public expand and collapse all group forwarding for embedding property panes.

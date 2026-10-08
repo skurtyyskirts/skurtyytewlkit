@@ -143,6 +143,28 @@ the relevant `.agents/rules/` file first, then update wrappers only when discove
 Internal-only procedures live under `.agents/commands/internal/` and are indexed from that directory's README. They are
 not listed in the public command tables or shared skill discovery unless a tool needs a deliberate internal wrapper.
 
+### Review Scheduling
+
+These scheduling rules apply to every caller of the review CLI, including direct local use. `--deadline-seconds`
+remains optional: omitting it imposes no whole-run or synthesis-reservation cutoff, while the normal per-worker
+timeouts still apply. With an explicit deadline, all callers use the budget rules below. Provider defaults and
+`--jobs` remain the source of concurrency; no Coworker environment variables, 100-minute cap, or 16-worker cap are
+required or imposed by this scheduler.
+
+The scripted Remix review reserves synthesis time from the candidate evidence already produced. It starts with a
+900-second reserve and caps growth at 25% of the caller's budget, or 900 seconds for a shorter budget. Planning
+rejects budgets that cannot fit the measured minimum upstream stages plus that floor. File count does not reserve
+speculative compaction waves. New evidence cannot shorten the window of workers already in flight.
+
+Worker timeouts are maximum runtimes. A queued packet can start with less time left than its normal timeout; its
+timeout is clipped to the remaining stage budget. Compaction shares the remaining synthesis time with the final
+pass. All stages remain bounded by the absolute whole-run deadline, including time spent preparing workers.
+
+A queue with pending packets, no active workers, and no admission or completion progress fails immediately with
+`SCHEDULER_STALLED`. A stage cutoff reports time still available in the whole run; it is distinct from whole-run
+deadline expiry. Deadline-exhausted packets do not split into retries. Missing required review or verification
+receipts still prevent publication of an assessment, and the immutable-checkout checks remain mandatory.
+
 ### Specialist Roles
 
 Specialist role instructions live in `.agents/subagents/`. Use them when a task matches the domain: documentation,
@@ -164,6 +186,29 @@ The shared hook targets are:
 | `.agents/hooks/run_stop_checks.py`        | Stop-hook runner; runs configured checks and formats failures per agent                 |
 | `.agents/hooks/check_completion_gates.py` | Checks changed source Python files against formatting/lint completion expectations      |
 | `.agents/hooks/check_memory_promotion.py` | Detects configured local memory changes that may need promotion to repo docs or rules   |
+
+Stop hooks run the checks on every invocation and allow at most one automatic continuation to repair a failure or
+request feedback. That continuation asks for one focused repair; if a check cannot be satisfied or conflicts with
+the user's direction, the agent's final response should name the failed checks, explain why automatic continuation
+stopped, and ask one concrete question for guidance. Ending with a blocker does not mean the checks passed or waive
+version, changelog, or release requirements.
+
+The runner uses each agent's Stop input to bound continuation: Codex and Claude Code require an explicit
+`stop_hook_active: false`; Cursor requires integer `loop_count: 0` and `status: "completed"`. A first failure returns
+Codex's `decision: "block"`, Claude Code's exit code `2`, or Cursor's `followup_message`. These request another agent
+turn. When continuation is withheld, the failure report distinguishes a prior Stop continuation, missing or invalid
+Stop metadata, and Cursor's `aborted` or `error` status. Codex and Claude Code receive `continue: false` with
+`stopReason` and `systemMessage`; Cursor receives `{}` on stdout and diagnostics on stderr. No further automatic
+continuation is requested. Cursor also sets `loop_limit: 1` in its hook configuration. See the
+[Codex Stop contract](https://learn.chatgpt.com/docs/hooks#stop),
+[Claude Code Stop contract](https://code.claude.com/docs/en/hooks#stop), and
+[Cursor Stop contract](https://cursor.com/docs/hooks#stop).
+
+Cursor documents `loop_count` as the number of automatic Stop follow-ups in the conversation. The native client
+controls this counter and may stop invoking the hook once `loop_limit` is reached, so a final hook report is not
+guaranteed. Its Stop output contract documents only `followup_message`, whose nonempty value requests another agent
+turn; stderr diagnostics are not guaranteed to appear in chat. The allowed continuation therefore asks the agent to
+include unresolved failures and the guidance question in its final response.
 
 Tool-specific hook configuration stays in `.claude/settings.json`, `.codex/hooks.json`, and `.cursor/hooks.json`.
 Those files should invoke shared `.agents/scripts/` launchers and `.agents/hooks/` targets instead of cloning logic.

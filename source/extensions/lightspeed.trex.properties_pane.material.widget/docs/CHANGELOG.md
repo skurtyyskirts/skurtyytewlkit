@@ -1,6 +1,28 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.3.7]
+### Fixed
+- Skip texture types without material inputs when assigning a texture set, and do not assign them from words in their file name.
+
+## [2.3.6]
+### Changed
+- Use the material API's startup initialization for MDL asset resolution.
+
+## [2.3.5]
+### Fixed
+- Preserved complete material targets and built actions only when their menu opens.
+
+## [2.3.4]
+### Fixed
+- Hid the **DLSS 3D-Guided Neural Generation [Experimental]** material group when runtime support is unavailable while retaining compatibility with legacy group names and accounting for it in E2E texture-group expansion.
+
+## [2.3.3]
+### Fixed
+- Initialize the MDL backend before resolving material assets.
+### Added
+- Regression coverage for the resolved MDL path and conversion actions on first material selection.
+
 ## [2.3.2]
 ### Added
 - Added expand-all and collapse-all forwarding for TREX material property groups.

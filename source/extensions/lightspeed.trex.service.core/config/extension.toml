@@ -1,6 +1,6 @@
 [package]
 kit_sdk_version = "110.*"
-version = "1.2.3"
+version = "2.0.1"
 authors =["Pierre-Oliver Trottier <ptrottier@nvidia.com>"]
 title = "NVIDIA RTX Remix Micro-Service Core"
 description = "Micro-Service for NVIDIA RTX Remix Core"
@@ -12,10 +12,18 @@ category = "other"
 preview_image = "data/preview.png"
 
 [dependencies]
-"lightspeed.trex.service.ingestcraft" = {}
-"lightspeed.trex.service.stagecraft" = {}
-"omni.flux.pip_archive" = {}
+"lightspeed.common" = {}
+"lightspeed.layer_manager.core" = {}
+"lightspeed.trex.asset_replacements.core.shared" = {}
+"lightspeed.trex.texture_replacements.core.shared" = {}
+"omni.flux.asset_importer.core" = {}
+"omni.flux.factory.base" = {}
+"omni.flux.pip_archive" = {}  # Required for pydantic & fast_version
 "omni.flux.service.factory" = {}
+"omni.flux.validator.factory" = {}
+"omni.flux.validator.manager.core" = {}
+"omni.flux.validator.mass.core" = {}
+"omni.flux.validator.mass.service" = {}
 "omni.services.core" = {}
 "omni.flux.validator.plugin.check.usd" = {}  # Must be loaded before the services
 "omni.flux.validator.plugin.context.usd_stage" = {}  # Must be loaded before the services

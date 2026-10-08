@@ -7,6 +7,8 @@ This is the base widget that let you build property widget(s) from any attribute
 Because this is a base widget, by default, crating this widget will do nothing. You need to implement what the widget
 has to show.
 
+When a pixel-sized name column is used, the widget adjusts it as the panel resizes without redrawing rows for an unchanged width.
+
 ## Implementation
 
 The widget uses multiple components:
@@ -60,6 +62,10 @@ This is a regular `ui.AbstractItemDelegate`. The delegate will show each value o
 - value(s) in column 2
 
 `_build_widget` has to be subclassed if you want to show your data.
+
+`Delegate` owns the shared `DragFieldGroupCoordinator` used by linked drag-field rows. Factory builders that return an
+`AbstractDragFieldGroup` should set both `supports_field_cleanup=True` and `builds_drag_field_group=True` so the delegate
+passes the row cleanup callback and shared coordinator to the builder.
 
 
 ## Implementation example(s)

@@ -15,6 +15,4 @@
 * limitations under the License.
 """
 
-from .unit.test_texture_info import TestTextureInfo
-
-__all__ = ("TestTextureInfo",)
+__all__ = ()

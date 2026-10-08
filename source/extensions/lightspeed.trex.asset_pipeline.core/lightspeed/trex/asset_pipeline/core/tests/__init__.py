@@ -18,8 +18,10 @@
 from .e2e.test_apply_processed_textures import TestApplyProcessedTexturesE2E
 from .e2e.test_context import TestRemixAssetPipelineContextE2E
 from .e2e.test_convert_materials import TestConvertMaterialsE2E
+from .e2e.test_convert_normal import TestConvertNormalE2E
 from .e2e.test_discover_textures import TestDiscoverTexturesE2E
-from .e2e.test_job import TestMeshOptimizationGraphE2E, TestTextureProcessingJobE2E
+from .e2e.test_gltf_material import TestExtractTextureChannelE2E, TestGltfMaterialE2E
+from .e2e.test_job import TestMeshOptimizationGraphE2E, TestTextureOptimizationJobE2E
 from .e2e.test_legacy_fixtures import TestLegacyFixtureParityE2E
 from .e2e.test_material_cleanup import TestMaterialCleanupE2E
 from .e2e.test_meta import TestMetaE2E
@@ -28,12 +30,14 @@ from .e2e.test_utils import TestAssetPublicationE2E
 from .e2e.test_reference import TestReferenceE2E
 from .e2e.test_runner import TestPipelineRunnerE2E
 from .unit.test_apply_handler import TestApplyHandler
+from .unit.test_apply_processed_textures import TestApplyProcessedTexturesStep
 from .unit.test_builder import TestPipelineBuilder
 from .unit.test_codecs import TestCodecAssemblies
 from .unit.test_context import TestRemixAssetPipelineContext
 from .unit.test_convert_dds import TestConvertDDS
 from .unit.test_convert_materials import TestConvertMaterials
 from .unit.test_convert_normal import TestConvertNormal
+from .unit.test_extract_texture_channel import TestExtractTextureChannelStep
 from .unit.test_graphs import TestGraphFactories
 from .unit.test_mesh_optimization import TestMeshOptimizationJob
 from .unit.test_metadata import TestMetadataUtilities
@@ -42,23 +46,30 @@ from .unit.test_models import (
     TestMeshOptimizationResult,
     TestPrepareOptimizationResult,
     TestResolveProcessedTextures,
-    TestTextureProcessingItem,
-    TestTextureProcessingRequest,
-    TestTextureProcessingResult,
+    TestTextureOptimizationItem,
+    TestTextureOptimizationRequest,
+    TestTextureOptimizationResult,
 )
+from .unit.test_prepare_optimization import TestPrepareOptimizationJob
 from .unit.test_runner import TestRemixAssetPipelineRunner
 from .unit.test_standardize_input import TestStandardizeInput
+from .unit.test_standardize_linear_textures import TestStandardizeLinearTextures
 
 __all__ = (
     "TestApplyHandler",
     "TestApplyProcessedTexturesE2E",
+    "TestApplyProcessedTexturesStep",
     "TestAssetPublicationE2E",
     "TestCodecAssemblies",
     "TestConvertDDS",
     "TestConvertMaterials",
     "TestConvertMaterialsE2E",
     "TestConvertNormal",
+    "TestConvertNormalE2E",
     "TestDiscoverTexturesE2E",
+    "TestExtractTextureChannelE2E",
+    "TestExtractTextureChannelStep",
+    "TestGltfMaterialE2E",
     "TestGraphFactories",
     "TestLegacyFixtureParityE2E",
     "TestMaterialCleanupE2E",
@@ -71,6 +82,7 @@ __all__ = (
     "TestNormalizeEmissiveIntensityE2E",
     "TestPipelineBuilder",
     "TestPipelineRunnerE2E",
+    "TestPrepareOptimizationJob",
     "TestPrepareOptimizationResult",
     "TestReferenceE2E",
     "TestRemixAssetPipelineContext",
@@ -78,8 +90,9 @@ __all__ = (
     "TestRemixAssetPipelineRunner",
     "TestResolveProcessedTextures",
     "TestStandardizeInput",
-    "TestTextureProcessingItem",
-    "TestTextureProcessingJobE2E",
-    "TestTextureProcessingRequest",
-    "TestTextureProcessingResult",
+    "TestStandardizeLinearTextures",
+    "TestTextureOptimizationItem",
+    "TestTextureOptimizationJobE2E",
+    "TestTextureOptimizationRequest",
+    "TestTextureOptimizationResult",
 )

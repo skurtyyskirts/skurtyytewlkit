@@ -5,6 +5,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Loaded the Scatter window (lightspeed.trex.scatter.widget) in StageCraft.
 
+## [1.8.11]
+### Added
+- Extended Ctrl+A coverage and corrected viewport ownership in test cleanup.
+
+## [1.8.10]
+### Fixed
+- Covered first-click Ingestion activation in the isolated StageCraft startup test and declared the direct `omni.usd` dependency.
+
+## [1.8.9]
+### Changed
+- Verify Stage Manager Ctrl+A selection while the pointer is outside its frame.
+
+## [1.8.8]
+### Added
+- Added Stage Manager E2E coverage for Ctrl+A selection respecting active tabs, filters, and search-field focus.
+- Added end-to-end coverage for exact Stage Manager selection across related tabs.
+
 ## [1.8.7]
 ### Added
 - Added shipped-schema regression coverage for Stage Manager context refresh rules and the Skeleton ancestor policy.

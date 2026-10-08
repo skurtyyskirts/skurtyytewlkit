@@ -42,6 +42,7 @@ icon = "data/icon.png"
 "omni.kit.viewport.menubar.lighting" = {}
 "omni.kit.window.file" = {}
 "omni.ui" = {}
+"omni.usd" = {}
 
 [[python.module]]
 name = "lightspeed.trex.control.stagecraft"

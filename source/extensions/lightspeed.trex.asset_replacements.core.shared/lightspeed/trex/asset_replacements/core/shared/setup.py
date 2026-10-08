@@ -25,6 +25,7 @@ from collections.abc import Callable, Sequence
 
 import carb
 import omni.client
+import omni.kit.clipboard
 import omni.kit.commands
 import omni.kit.undo
 import omni.usd
@@ -42,6 +43,8 @@ from lightspeed.trex.utils.common.prim_utils import get_children_prims
 from lightspeed.trex.utils.common.prim_utils import get_extended_selection as _get_extended_selection
 from lightspeed.trex.utils.common.prim_utils import get_prim_paths as _get_prim_paths
 from lightspeed.trex.utils.common.prim_utils import get_prototype as _get_prototype
+from lightspeed.trex.utils.common.prim_utils import is_light as _is_light
+from lightspeed.trex.utils.common.prim_utils import is_mesh_asset as _is_mesh_asset
 from omni.flux.asset_importer.core.data_models import SUPPORTED_ASSET_EXTENSIONS as _SUPPORTED_ASSET_EXTENSIONS
 from omni.flux.asset_importer.core.data_models import SUPPORTED_TEXTURE_EXTENSIONS as _SUPPORTED_TEXTURE_EXTENSIONS
 from omni.flux.asset_importer.core.data_models import TextureTypes as _TextureTypes
@@ -51,6 +54,7 @@ from omni.flux.utils.common.omni_url import OmniUrl as _OmniUrl
 from omni.flux.utils.dialog import ErrorPopup
 from omni.kit.usd_undo import UsdLayerUndo as _UsdLayerUndo
 from omni.usd.commands import remove_prim_spec as _remove_prim_spec
+from pydantic import BaseModel, ConfigDict, ValidationError
 from pxr import Sdf, Usd, UsdGeom, UsdShade, UsdSkel
 
 if typing.TYPE_CHECKING:
@@ -91,6 +95,17 @@ from .skeleton import (
 _DEFAULT_PRIM_TAG = "<Default Prim>"
 
 
+class _LightClipboardModel(BaseModel):
+    """Represent a serialized copied-light clipboard payload."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    context_name: str
+    root_layer_identifier: str
+    session_layer_identifier: str
+    source_prim_path: str
+
+
 class Setup:
     def __init__(self, context_name: str):
         self._default_attr = {
@@ -103,6 +118,104 @@ class Setup:
         self._context_name = context_name
         self._context = omni.usd.get_context(context_name)
         self._layer_manager = _LayerManagerCore(context_name=context_name)
+
+    def can_copy_light(self, source_prim_path: Sdf.Path | str) -> bool:
+        """Return whether a path identifies an added light."""
+        return self._get_copyable_light(source_prim_path) is not None
+
+    def copy_light_to_clipboard(self, source_prim_path: Sdf.Path | str) -> bool:
+        """Copy an added light path and its stage identity to the clipboard."""
+        source_prim = self._get_copyable_light(source_prim_path)
+        if not source_prim:
+            carb.log_warn(f"Could not copy light '{source_prim_path}': the source is invalid or not an added light.")
+            return False
+
+        stage = source_prim.GetStage()
+        source_path = str(source_prim.GetPath())
+        omni.kit.clipboard.copy(
+            _LightClipboardModel(
+                context_name=self._context_name,
+                root_layer_identifier=stage.GetRootLayer().identifier,
+                session_layer_identifier=stage.GetSessionLayer().identifier,
+                source_prim_path=source_path,
+            ).model_dump_json()
+        )
+        carb.log_info(f"Copied light '{source_path}' to the clipboard.")
+        return True
+
+    def can_paste_light_from_clipboard(self, dest_prim_path: Sdf.Path | str) -> bool:
+        """Return whether the copied light can be pasted under a mesh asset."""
+        return self._get_light_clipboard_prims(dest_prim_path) is not None
+
+    def paste_light_from_clipboard(self, dest_prim_path: Sdf.Path | str) -> str | None:
+        """Duplicate the copied light under a mesh asset."""
+        prims = self._get_light_clipboard_prims(dest_prim_path)
+        if not prims:
+            carb.log_warn(f"Could not paste light to '{dest_prim_path}': the clipboard or destination is invalid.")
+            return None
+        source_prim, dest_prim = prims
+        stage = self._context.get_stage()
+        new_path = omni.usd.get_stage_next_free_path(
+            stage, str(dest_prim.GetPath().AppendChild(source_prim.GetName())), False
+        )
+        success, _ = omni.kit.commands.execute(
+            "CopyPrimCommand",
+            path_from=str(source_prim.GetPath()),
+            path_to=new_path,
+            combine_layers=True,
+            usd_context_name=self._context_name,
+        )
+        if not success:
+            carb.log_warn(f"Failed to paste light '{source_prim.GetPath()}' to '{new_path}'.")
+            return None
+        carb.log_info(f"Pasted light '{source_prim.GetPath()}' to '{new_path}'.")
+        return new_path
+
+    def _get_light_clipboard_prims(self, dest_prim_path: Sdf.Path | str) -> tuple[Usd.Prim, Usd.Prim] | None:
+        """Return validated source-light and destination-mesh prims."""
+        stage = self._context.get_stage()
+        if not stage:
+            return None
+        try:
+            payload = _LightClipboardModel.model_validate_json(omni.kit.clipboard.paste())
+        except (TypeError, ValidationError):
+            return None
+
+        if (
+            payload.context_name != self._context_name
+            or payload.root_layer_identifier != stage.GetRootLayer().identifier
+            or payload.session_layer_identifier != stage.GetSessionLayer().identifier
+        ):
+            return None
+
+        source_prim = self._get_copyable_light(payload.source_prim_path)
+        dest_prim = stage.GetPrimAtPath(str(dest_prim_path))
+        if not source_prim or not dest_prim:
+            return None
+
+        source_prim = _get_prototype(source_prim) or source_prim
+        dest_mesh_prim = self._get_mesh_asset_prim(dest_prim)
+        if not dest_mesh_prim or self._get_mesh_asset_prim(source_prim) == dest_mesh_prim:
+            return None
+        return source_prim, dest_mesh_prim
+
+    def _get_copyable_light(self, prim_path: Sdf.Path | str) -> Usd.Prim | None:
+        """Return an added light prim, if the path identifies one."""
+        stage = self._context.get_stage()
+        prim = stage.GetPrimAtPath(str(prim_path)) if stage else None
+        if not prim or not _is_light(prim) or self.prim_is_from_a_capture_reference(prim):
+            return None
+        return prim
+
+    @staticmethod
+    def _get_mesh_asset_prim(prim: Usd.Prim) -> Usd.Prim | None:
+        """Return the prototype mesh asset containing a prim."""
+        prim = _get_prototype(prim)
+        while prim and prim.IsValid():
+            if _is_mesh_asset(prim):
+                return prim
+            prim = prim.GetParent()
+        return None
 
     # DATA MODEL FUNCTIONS
 
@@ -778,13 +891,12 @@ class Setup:
         return children_prims
 
     def get_scope_prims_without_imageable_children(self, prims) -> list[Usd.Prim]:
+        """Return scopes without Imageable or Subset descendants."""
         result = []
-        scoped_children = self.filter_scope_prims(prims)
-        for scope in scoped_children:
-            scope_children = self.get_children_from_prim(scope)
-            imageable_children = self.filter_imageable_prims(scope_children)
-            # if this is a scope prim, and this scope prim doesn't have any imageable prim, we keep it
-            if not imageable_children:
+        for scope in self.filter_scope_prims(prims):
+            descendants = iter(Usd.PrimRange(scope, Usd.PrimAllPrimsPredicate))
+            next(descendants)
+            if not any(UsdGeom.Imageable(child) or child.IsA(UsdGeom.Subset) for child in descendants):
                 result.append(scope)
         return result
 
@@ -1016,6 +1128,7 @@ class Setup:
         remove_if_remix_ref: bool = True,
         create_if_remix_ref: bool = True,
         use_undo_group: bool = True,
+        preserve_other_references: bool = False,
     ) -> tuple[Sdf.Reference, str]:
         """Remove one authored reference and add a replacement reference.
 
@@ -1030,6 +1143,7 @@ class Setup:
             create_if_remix_ref: Whether replacement references on Remix reference prims should be authored on a new child.
             use_undo_group: Whether to wrap the remove and add operations in one undo group. Disable this when the caller
                 already owns the outer undo group.
+            preserve_other_references: Whether to preserve the owner and all references except the selected reference.
 
         Returns:
             The replacement reference and the prim path where it was authored.
@@ -1039,7 +1153,12 @@ class Setup:
                 or adding the replacement reference.
         """
         with omni.kit.undo.group() if use_undo_group else nullcontext():
-            self.remove_reference(stage, prim_path, current_ref, current_layer, remove_if_remix_ref=remove_if_remix_ref)
+            if preserve_other_references:
+                self.remove_selected_reference(stage, prim_path, current_ref, current_layer)
+            else:
+                self.remove_reference(
+                    stage, prim_path, current_ref, current_layer, remove_if_remix_ref=remove_if_remix_ref
+                )
             ref_prim_path = self.get_reference_prim_path_from_asset_path(
                 asset_path, current_layer, edit_target_layer, current_ref
             )
@@ -1380,6 +1499,24 @@ class Setup:
         prim_spec = layer.GetPrimAtPath(prim_path)
         return bool(prim_spec and prim_spec.hasReferences and prim_spec.referenceList.ContainsItemEdit(reference))
 
+    def remove_selected_reference(
+        self, stage: Usd.Stage, prim_path: Sdf.Path, ref: Sdf.Reference, intro_layer: Sdf.Layer
+    ) -> None:
+        """Remove only the selected reference. Preserve the owner, its children, and unrelated references."""
+        edit_target_layer = stage.GetEditTarget().GetLayer()
+        references = [
+            self.__anchor_reference_asset_path_to_layer(reference, layer, edit_target_layer)
+            for reference, layer in omni.usd.get_composed_references_from_prim(stage.GetPrimAtPath(prim_path))
+            if (reference, layer) != (ref, intro_layer)
+        ]
+        omni.kit.commands.execute(
+            "SetExplicitReferencesCommand",
+            stage=stage,
+            prim_path=str(prim_path),
+            reference=ref,
+            to_set=references,
+        )
+
     def remove_reference(
         self,
         stage: Usd.Stage,
@@ -1554,6 +1691,7 @@ class Setup:
         prim paths so that transformations will act on all instances.
         """
         transformable = []
+        capture_layer_cache = {}
         regex_in_instance = re.compile(constants.REGEX_IN_INSTANCE_PATH)
         regex_light_pattern = re.compile(constants.REGEX_LIGHT_PATH)
         for path in paths:
@@ -1569,7 +1707,7 @@ class Setup:
                 # we don't allow moving prim in mesh directly, a prim in an instance has to be selected
                 # we don't allow moving an instance directly
                 # enable also for live light in mesh
-                if self.prim_is_from_a_capture_reference(prim):
+                if self.prim_is_from_a_capture_reference(prim, capture_layer_cache):
                     # in a case we duplicated a captured prim
                     parent = prim.GetParent()
                     if parent and parent.GetAttribute(constants.IS_REMIX_REF_ATTR):
@@ -1588,11 +1726,17 @@ class Setup:
 
     @staticmethod
     def get_instance_from_mesh(mesh_paths: list[str], instance_paths: list[str]) -> list[str]:
+        """Map mesh paths to supplied instances sharing the same Remix hash."""
+        if not mesh_paths or not instance_paths:
+            return []
+
+        instances_by_hash: dict[str, list[str]] = {}
+        for instance_path in instance_paths:
+            instances_by_hash.setdefault(Setup.get_prim_hash(instance_path), []).append(instance_path)
+
         instances = set()
         for mesh_path in mesh_paths:
-            for instance_path in instance_paths:
-                if Setup.get_prim_hash(instance_path) != Setup.get_prim_hash(mesh_path):
-                    continue
+            for instance_path in instances_by_hash.get(Setup.get_prim_hash(mesh_path), ()):
                 instances.add(constants.COMPILED_REGEX_MESH_TO_INSTANCE_SUB.sub(instance_path, mesh_path))
         return list(instances)
 

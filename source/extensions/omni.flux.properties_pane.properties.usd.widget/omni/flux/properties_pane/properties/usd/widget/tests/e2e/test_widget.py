@@ -15,6 +15,8 @@
 * limitations under the License.
 """
 
+from typing import Any
+
 import carb.input
 import omni.kit.clipboard
 import omni.kit.undo
@@ -52,7 +54,7 @@ class TestUSDPropertiesWidget(AsyncTestCase):
         self,
         width=WINDOW_WIDTH,
         height=WINDOW_HEIGHT,
-        lookup_table: dict[str, dict[str, str]] | None = None,
+        lookup_table: dict[str, dict[str, Any]] | None = None,
     ) -> (ui.Window, "_PropertyWidget"):
         window = ui.Window("TestPropertyWidget", width=width, height=height)
         with window.frame:
@@ -65,11 +67,27 @@ class TestUSDPropertiesWidget(AsyncTestCase):
 
     async def __destroy(self, window, widget):
         # if we destroy viewports before the stage is fully loaded than it will be stuck in loading state.
-        await wait_stage_loading()
+        try:
+            await wait_stage_loading()
+        finally:
+            try:
+                widget.destroy()
+            finally:
+                window.destroy()
+                await ui_test.human_delay()
 
-        widget.destroy()
-        window.destroy()
-        await ui_test.human_delay()
+    async def __collect_float_drag_tooltips(self, window_title: str) -> set[str]:
+        tooltips = set()
+        fields = ui_test.find_all(
+            f"{window_title}//Frame/**/FloatBoundedDrag[*].identifier=="
+            "'/Xform/Cube.clippingRange,/Xform/Cube.clippingRange'"
+        )
+        self.assertEqual(len(fields), 2)
+        for field in fields:
+            await ui_test.emulate_mouse_move(field.center)
+            await ui_test.human_delay()
+            tooltips.add(field.widget.tooltip)
+        return tooltips
 
     @staticmethod
     def __find_item_by_attribute_path(widget: "_PropertyWidget", attribute_path: str) -> _USDAttributeItem | None:
@@ -534,8 +552,8 @@ class TestUSDPropertiesWidget(AsyncTestCase):
         prim = stage.GetPrimAtPath("/Xform/Cube")
         original_value = prim.GetAttribute("xformOp:translate").Get()
 
-        # Snapshot the current undo history so the drag can be inspected in isolation.
-        latest_history_key = max(omni.kit.undo.get_history().keys(), default=0)
+        # Command history includes previews executed with undo disabled; count undoable actions instead.
+        original_undo_count = sum(entry.level == 0 for entry in omni.kit.undo.get_undo_stack())
 
         # Drag the X field far enough to generate multiple intermediate UI updates.
         widget_ref = widgets[0]
@@ -545,11 +563,9 @@ class TestUSDPropertiesWidget(AsyncTestCase):
         await omni.kit.ui_test.emulate_mouse_drag_and_drop(widget_ref.center, target)
         await ui_test.human_delay()
 
-        # The minimal fix should collapse the drag into a single ChangeProperty write.
-        drag_history_entries = [entry for key, entry in omni.kit.undo.get_history().items() if key > latest_history_key]
-        change_property_entries = [entry for entry in drag_history_entries if entry.name == "ChangeProperty"]
-        self.assertEqual(len(change_property_entries), 1)
-        self.assertNotEqual(prim.GetAttribute("xformOp:translate").Get()[0], original_value[0])
+        self.assertEqual(sum(entry.level == 0 for entry in omni.kit.undo.get_undo_stack()), original_undo_count + 1)
+        final_value = prim.GetAttribute("xformOp:translate").Get()
+        self.assertNotEqual(final_value[0], original_value[0])
 
         # One undo should restore both USD and the property panel value.
         omni.kit.undo.undo()
@@ -558,6 +574,15 @@ class TestUSDPropertiesWidget(AsyncTestCase):
         widgets = self.__find_translate_widgets(_window.title)
         self.assertAlmostEqual(prim.GetAttribute("xformOp:translate").Get()[0], original_value[0], places=5)
         self.assertAlmostEqual(widgets[0].widget.model.get_value_as_float(), original_value[0], places=5)
+        self.assertEqual(sum(entry.level == 0 for entry in omni.kit.undo.get_undo_stack()), original_undo_count)
+
+        # Redo restores the released value in both USD and the rebuilt field.
+        omni.kit.undo.redo()
+        await ui_test.human_delay()
+
+        widgets = self.__find_translate_widgets(_window.title)
+        self.assertEqual(prim.GetAttribute("xformOp:translate").Get(), final_value)
+        self.assertAlmostEqual(widgets[0].widget.model.get_value_as_float(), final_value[0], places=5)
 
         await self.__destroy(_window, _widget)
 
@@ -658,3 +683,27 @@ class TestUSDPropertiesWidget(AsyncTestCase):
         self.assertIsNone(item.get_step_value())
 
         await self.__destroy(_window, _widget)
+
+    async def test_lookup_table_applies_vector_tooltip_channel_names(self):
+        """Lookup-table channel names should reach rendered vector fields."""
+        stage = omni.usd.get_context(_CONTEXT_NAME).get_stage()
+        prim = stage.GetPrimAtPath("/Xform/Cube")
+        attr = prim.CreateAttribute("clippingRange", Sdf.ValueTypeNames.Float2)
+        attr.Set(Gf.Vec2f(1.0, 1000.0))
+        lookup_table = {
+            "clippingRange": {
+                "name": "Clipping Range",
+                "tooltip_channel_names": ["Near", "Far"],
+            }
+        }
+        _window, _widget = await self.__setup_widget(lookup_table=lookup_table)
+        try:
+            # A user opens the cube's properties and hovers its rendered numeric fields.
+            _widget.refresh(["/Xform/Cube"])
+            await ui_test.human_delay()
+            tooltips = await self.__collect_float_drag_tooltips(_window.title)
+
+            self.assertIn("Clipping Range Near: 1.0", tooltips)
+            self.assertIn("Clipping Range Far: 1000.0", tooltips)
+        finally:
+            await self.__destroy(_window, _widget)

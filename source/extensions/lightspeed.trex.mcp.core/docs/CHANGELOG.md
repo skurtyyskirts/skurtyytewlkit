@@ -1,6 +1,33 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.4.1]
+### Changed
+- Name `lightspeed.trex.service.core` as the owner of the REST routes this server adapts
+
+## [1.4.0]
+### Changed
+- Upgrade to FastMCP 4.0.10 and the MCP SDK 2.2.0. Tool schemas inline their definitions, so `Optional[Enum]` parameters no longer reference `#/components/schemas/` definitions the schema omits, which strict clients such as llama.cpp rejected. Tools advertise an output schema, return structured results and carry a title derived from their name; descriptions no longer include FastAPI's generated 422 section. Arguments are no longer checked against the input schema before the REST call: a missing body, a missing path parameter or a wrong type comes back as the REST service's HTTP 422, values the route can convert, such as `"3"` for an integer, are accepted, and unknown arguments are dropped
+
+## [1.3.0]
+### Changed
+- Changed the preferred port from `8000` to `18014`, with fallback limited to `18014–18019`. Update clients from `http://127.0.0.1:8000/mcp/` to `http://127.0.0.1:18014/mcp/`
+- MCP clients now see a smaller, more relevant tool list. The transport's own health, readiness, status and asyncapi endpoints, the OpenAPI metadata routes and the root-level UI-automation routes are dropped from the tool manifest; every other route is still exposed as a tool
+- Log the complete connection URL at warning level whenever port fallback selects a different endpoint
+- Document the current transports and bundled protocol support without planned upgrade or removal claims
+- Remove duplicated input-parameter prose from MCP tool descriptions while preserving authored guidance, response documentation and input schemas
+- Allow one second for graceful shutdown so an idle server can close without a spurious timeout error
+
+### Added
+- Publish a current-user-only Windows discovery manifest after successful MCP startup, including fallback endpoints, and remove it on clean shutdown without deleting a newer instance's record
+
+### Removed
+- MCP workflow prompts; the server exposes Toolkit operations as tools
+
+### Fixed
+- Reserve MCP listener addresses exclusively on Windows so another Toolkit instance selects a fallback port.
+- Publish loopback connection URLs for wildcard MCP and REST bind addresses.
+
 ## [1.2.7]
 ### Added
 - Added a `transport` setting to select the MCP transport, with the legacy `sse` transport still available.

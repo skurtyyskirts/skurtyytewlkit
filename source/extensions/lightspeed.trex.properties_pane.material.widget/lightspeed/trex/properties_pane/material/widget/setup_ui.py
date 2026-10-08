@@ -24,10 +24,12 @@ from functools import partial
 from pathlib import Path
 
 import carb
+import carb.settings
 import omni.client
 import omni.kit.app
 from lightspeed.common import constants as _constants
 from lightspeed.common.constants import PROPERTIES_NAMES_COLUMN_WIDTH
+from lightspeed.hdremix.renderer_settings.dlss_settings import SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE
 from lightspeed.tool.material.core import ToolMaterialCore as _ToolMaterialCore
 from lightspeed.trex.asset_replacements.core.shared import Setup as _AssetReplacementsCore
 from lightspeed.trex.asset_replacements.core.shared.usd_copier import copy_non_usd_asset as _copy_non_usd_asset
@@ -61,6 +63,13 @@ from omni.kit.window.drop_support import ExternalDragDrop as _ExternalDragDrop
 from pxr import Sdf, Usd, UsdShade
 
 from .texture_assignment_model import Delegate, Model
+
+
+_DLSS_NEURAL_RENDERING_GROUP_NAMES = {
+    "DLSS 3D-Guided Neural Generation [Experimental]",
+    "DLSS Neural Rendering",
+    "DLSS Neural Rendering [Experimental]",
+}
 
 
 class TextureDialog(ui.Window):
@@ -102,6 +111,7 @@ class SetupUI(_PropertyGroupExpansionMixin):
             "_convert_translucent_button": None,
             "_sub_on_material_refresh_done": None,
             "_external_drag_and_drop": None,
+            "_dlss_availability_subscription": None,
             "_texture_dialog": None,
         }
         for attr, value in self._default_attr.items():
@@ -109,6 +119,7 @@ class SetupUI(_PropertyGroupExpansionMixin):
 
         self._context_name = context_name
         self._context = usd.get_context(self._context_name)
+        self._settings = carb.settings.get_settings()
         self._layer_transfer_menu_fn = layer_transfer_menu_fn
         self._asset_replacement_core = _AssetReplacementsCore(context_name)
         self._core = _MaterialCore(context_name)
@@ -117,6 +128,8 @@ class SetupUI(_PropertyGroupExpansionMixin):
         self._current_single_material: Sdf.Path | None = None
         self._current_material_mdl_file: Path | None = None
         self._unfiltered_selected_prims: list[Usd.Prim] = []
+        self._material_menu_task: asyncio.Task | None = None
+        self.__menu: ui.Menu | None = None
         self._material_properties_frames = {}
         self._texture_dialog = None
 
@@ -124,6 +137,9 @@ class SetupUI(_PropertyGroupExpansionMixin):
         self._context_menu: ui.Menu | None = None
 
         self.__create_ui()
+        self._dlss_availability_subscription = self._settings.subscribe_to_node_change_events(
+            SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE, self._on_dlss_neural_rendering_availability_changed
+        )
 
         self.__on_material_changed = _Event()
         self.__on_go_to_ingest_tab = _Event()
@@ -142,7 +158,39 @@ class SetupUI(_PropertyGroupExpansionMixin):
         return _EventSubscription(self.__on_go_to_ingest_tab, func)
 
     def __show_material_menu(self):
-        self.__menu.show()
+        self.__clear_material_menu()
+        if self._context is None:
+            return
+        stage = self._context.get_stage()
+        selection_generation = self._unfiltered_selected_prims
+        if not stage or not selection_generation or not self._material_properties_frames[self.MAT_PROP_FRAME].visible:
+            return
+
+        menu = ui.Menu(identifier="material_actions_menu")
+        self.__menu = menu
+        with menu:
+            ui.MenuItem("Loading material actions…", enabled=False, identifier="material_actions_loading")
+
+        def on_shown_changed(shown):
+            if not shown and self.__menu is menu:
+                self.__clear_material_menu()
+
+        menu.set_shown_changed_fn(on_shown_changed)
+        menu.show()
+        self._material_menu_task = asyncio.ensure_future(
+            self._refresh_material_menu(menu, selection_generation, tuple(selection_generation), stage)
+        )
+
+    def __clear_material_menu(self):
+        task = self._material_menu_task
+        menu = self.__menu
+        self._material_menu_task = None
+        self.__menu = None
+        if task is not None:
+            task.cancel()
+        if menu is not None:
+            menu.hide()
+            menu.destroy()
 
     def get_custom_field_builders(self) -> _USDBuilderList:
         field_builders = _USDBuilderList()
@@ -286,10 +334,35 @@ class SetupUI(_PropertyGroupExpansionMixin):
         material. And setting callback for setting texture edit status.
         """
         items = self._material_properties_widget.property_model.get_all_items(include_hidden=True)
+        self._update_dlss_neural_rendering_group_visibility(items)
         for item in items:
             for value_model in item.value_models:
                 if usd_properties_utils.get_type_name(value_model.metadata) == Sdf.ValueTypeNames.Asset:
                     value_model.set_callback_pre_set_value(self.__check_asset_was_ingested_and_in_proj_dir)
+
+    def _on_dlss_neural_rendering_availability_changed(self, *_args, **_kwargs) -> None:
+        """Update the material controls when DLSS Neural Rendering availability changes."""
+        if self._material_properties_widget is None:
+            return
+        items = self._material_properties_widget.property_model.get_all_items(include_hidden=True)
+        self._update_dlss_neural_rendering_group_visibility(items)
+
+    def _update_dlss_neural_rendering_group_visibility(self, items: list) -> None:
+        """Show the DLSS Neural Rendering material group only when the runtime reports support.
+
+        Args:
+            items: Material property items generated from the active MDL.
+        """
+        if self._settings is None:
+            return
+        hidden = not bool(self._settings.get(SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE))
+        for item in items:
+            if (
+                item.can_have_children
+                and item.name_models
+                and item.name_models[0].get_value_as_string() in _DLSS_NEURAL_RENDERING_GROUP_NAMES
+            ):
+                item.hidden = hidden
 
     def _texture_assignment(
         self, selected_paths: list[Path], items, allow_dialog_skip=True, basename=None, found_paths=None
@@ -308,11 +381,16 @@ class SetupUI(_PropertyGroupExpansionMixin):
             basename_parts = basename_parts[basename]
         base_parts_len = len(basename_parts)
         all_path_parts = _parse_texture_paths([p.name for p in selected_paths])
+        # Ingested textures with a known type but no material input (e.g. Skybox) must not be assigned by name later.
+        non_material_paths = []
 
         for path in selected_paths:
             if path.suffix != ".dds":
                 continue
             texture_type = _get_texture_type_from_filename(str(path))
+            if texture_type and texture_type not in _TEXTURE_TYPE_INPUT_MAP:
+                non_material_paths.append(path)
+                continue
             # If it's an already ingested texture, we can just ignore the tags
             path_parts = all_path_parts[path.name]
             if path_parts[-1] == "rtex":
@@ -321,12 +399,15 @@ class SetupUI(_PropertyGroupExpansionMixin):
             if similar_len == 0:
                 continue
             if texture_type and similar_len >= base_parts_len - 1:
-                name = _TEXTURE_TYPE_INPUT_MAP[texture_type].replace("inputs:", "")
+                name = _TEXTURE_TYPE_INPUT_MAP[texture_type]
+                name = name.replace("inputs:", "")
                 if name not in texture_dict:
                     texture_dict[name] = str(path)
 
         for value in texture_dict.values():
             selected_paths.remove(Path(value))
+        for path in non_material_paths:
+            selected_paths.remove(path)
 
         texture_types = _determine_ideal_types([str(path) for path in selected_paths])
         for path, texture_type in texture_types.items():
@@ -589,6 +670,8 @@ class SetupUI(_PropertyGroupExpansionMixin):
             self._set_material_label("None")
             self._set_material_mdl_label("")
 
+        self.__clear_material_menu()
+        self._texture_edit_status = False
         self._unfiltered_selected_prims = []
         self._current_material_mdl_file = None
         self._current_single_material = None
@@ -596,6 +679,7 @@ class SetupUI(_PropertyGroupExpansionMixin):
 
         # Filter prims and handle prims with refs
         filtered_items = []
+        properties_hidden = False
         for item in items:
             if not isinstance(item, Usd.Prim):
                 continue
@@ -609,9 +693,13 @@ class SetupUI(_PropertyGroupExpansionMixin):
             if not resolved_item:
                 continue
 
-            # If not a mat prim and has reference, refresh widget to clear
-            if not _is_material_prototype(resolved_item) and _get_reference_file_paths(resolved_item)[1]:
-                self.refresh([])
+            if (
+                not properties_hidden
+                and not _is_material_prototype(resolved_item)
+                and _get_reference_file_paths(resolved_item)[1]
+            ):
+                hide_properties()
+                properties_hidden = True
 
             # Add the item; Should be mat or mesh prim
             filtered_items.append(resolved_item)
@@ -623,7 +711,8 @@ class SetupUI(_PropertyGroupExpansionMixin):
         # Gather materials
         materials = self.get_materials_from_prims(filtered_items)
         if not materials:
-            hide_properties()
+            if not properties_hidden:
+                hide_properties()
             return
 
         # Build material property widget accordingly
@@ -640,7 +729,6 @@ class SetupUI(_PropertyGroupExpansionMixin):
                     mdl_file = source_asset.resolvedPath
                     mdl_files.add(Path(mdl_file))
 
-        asyncio.ensure_future(self._refresh_material_menu())
         self._material_properties_widget.show(True)
         # TODO: For multi-selection, properties are ordered by USD, not click-order in Stage Manager or Selection Tree.
         #  Displaying only one set of shared property values is not the best UX.
@@ -686,7 +774,33 @@ class SetupUI(_PropertyGroupExpansionMixin):
         return False
 
     @omni.usd.handle_exception
-    async def _refresh_material_menu(self):
+    async def _refresh_material_menu(
+        self,
+        menu: ui.Menu,
+        selection_generation: list[Usd.Prim],
+        selected_prims: tuple[Usd.Prim, ...],
+        stage: Usd.Stage,
+    ):
+        """Populate an open menu while its stage and selection remain current.
+
+        Args:
+            menu: Loading menu owned by this request.
+            selection_generation: Selection-list object retained to detect refreshes.
+            selected_prims: Ordered input snapshot captured when the menu opened.
+            stage: Stage containing the selected prims when the menu opened.
+        """
+        current_task = asyncio.current_task()
+
+        def is_current():
+            return (
+                self._material_menu_task is current_task
+                and self.__menu is menu
+                and self._unfiltered_selected_prims is selection_generation
+                and self._context is not None
+                and self._context.get_stage() == stage
+                and menu.shown
+            )
+
         # for instance materials, we allow the user to override the reference in stage
         def refresh_instance_items(prims, num_prims):
             if num_prims > 0:
@@ -699,6 +813,7 @@ class SetupUI(_PropertyGroupExpansionMixin):
 
                 item = omni.ui.MenuItem(
                     "\tRemove Material Override",
+                    identifier="remove_material_override",
                     visible=self._has_material_override(prims),
                     tooltip="Removes the material override instance (if it exists) from this specific object only.\n"
                     "This does not apply to shared materials.",
@@ -706,19 +821,26 @@ class SetupUI(_PropertyGroupExpansionMixin):
                 item.set_triggered_fn(partial(self.__remove_material_override, prims))
                 item = omni.ui.MenuItem(
                     "\tCreate Material Override (Opaque)",
+                    identifier="create_material_override_opaque",
                     tooltip="Creates an opaque material override and applies to this prim only.\n"
                     "Unlike shared materials, this will create a new unique material for each selected object.",
                 )
                 item.set_triggered_fn(partial(self.__new_material_override, _constants.SHADER_NAME_OPAQUE, prims))
                 item = omni.ui.MenuItem(
                     "\tCreate Material Override (Translucent)",
+                    identifier="create_material_override_translucent",
                     tooltip="Creates a translucent material override and applies to this prim only.\n"
                     "Unlike shared materials, this will create a new unique material for each selected object.",
                 )
                 item.set_triggered_fn(partial(self.__new_material_override, _constants.SHADER_NAME_TRANSLUCENT, prims))
 
         # for shared (i.e. capture) materials, we only show the ability to convert the material type
-        async def refresh_shared_items(prims: list[Usd.Prim], num_prims: int):
+        def refresh_shared_items(
+            prims: list[Usd.Prim],
+            num_prims: int,
+            opaque_prims: list[Usd.Prim],
+            translucent_prims: list[Usd.Prim],
+        ):
             if num_prims > 0:
                 omni.ui.Separator(
                     text=" Shared Material ("
@@ -727,29 +849,9 @@ class SetupUI(_PropertyGroupExpansionMixin):
                     tooltip=SetupUI._concat_list_to_string([prim.GetPath() for prim in prims]),
                 )
 
-                # only do conversion for materials when the conversion target type is different from the current type,
-                # so we must separate the incoming prims into the two type buckets
-                opaque_prims = []
-                translucent_prims = []
-                for p in prims:
-                    prim_path = p.GetPath()
-                    material_prims = _ToolMaterialCore.get_materials_from_prim_paths(
-                        [prim_path], context_name=self._context_name
-                    )
-                    shaders = [usd.get_shader_from_material(material_prim) for material_prim in material_prims]
-                    for shader in shaders:
-                        identifier = await _ToolMaterialCore.get_shader_subidentifier(shader)
-                        if identifier is None:
-                            continue
-                        if identifier == Path(_constants.SHADER_NAME_OPAQUE).stem:
-                            opaque_prims.append(p)
-                            break
-                        if identifier == Path(_constants.SHADER_NAME_TRANSLUCENT).stem:
-                            translucent_prims.append(p)
-                            break
-
                 item = omni.ui.MenuItem(
                     "\tConvert to Opaque",
+                    identifier="convert_material_opaque",
                     enabled=bool(translucent_prims),
                     tooltip="Convert the selected shared material(s) to opaque (if not already opaque).\n"
                     "This will update all usages of this material, even if it's shared between multiple "
@@ -760,6 +862,7 @@ class SetupUI(_PropertyGroupExpansionMixin):
                 )
                 item = omni.ui.MenuItem(
                     "\tConvert to Translucent",
+                    identifier="convert_material_translucent",
                     enabled=bool(opaque_prims),
                     tooltip="Convert the selected shared material(s) to translucent (if not already translucent).\n"
                     "This will update all usages of this material, even if it's shared between multiple "
@@ -769,21 +872,54 @@ class SetupUI(_PropertyGroupExpansionMixin):
                     partial(self.__convert_material, _constants.SHADER_NAME_TRANSLUCENT, opaque_prims)
                 )
 
-        self.__menu = omni.ui.Menu()
-        with self.__menu:
+        try:
+            await omni.kit.app.get_app().next_update_async()
+            if not is_current():
+                return
+
             shared_material_items: list[Usd.Prim] = []
             instance_material_items: list[Usd.Prim] = []
-            # sort prims into buckets with independent controls
-            for prim in self._unfiltered_selected_prims:
+            capture_layer_cache = {}
+            for prim in selected_prims:
                 if prim.IsValid():
-                    if _AssetReplacementsCore.prim_is_from_a_capture_reference(prim):
+                    if _AssetReplacementsCore.prim_is_from_a_capture_reference(prim, capture_layer_cache):
                         shared_material_items.append(prim)
                     else:
                         instance_material_items.append(prim)
-            # build the menus
-            refresh_instance_items(instance_material_items, len(instance_material_items))
-            await refresh_shared_items(shared_material_items, len(shared_material_items))
-        self._texture_edit_status = False
+
+            opaque_prims = []
+            translucent_prims = []
+            for prim in shared_material_items:
+                material_prims = _ToolMaterialCore.get_materials_from_prim_paths(
+                    [prim.GetPath()], context_name=self._context_name
+                )
+                shaders = [usd.get_shader_from_material(material_prim) for material_prim in material_prims]
+                for shader in shaders:
+                    identifier = await _ToolMaterialCore.get_shader_subidentifier(shader)
+                    if not is_current():
+                        return
+                    if identifier == Path(_constants.SHADER_NAME_OPAQUE).stem:
+                        opaque_prims.append(prim)
+                        break
+                    if identifier == Path(_constants.SHADER_NAME_TRANSLUCENT).stem:
+                        translucent_prims.append(prim)
+                        break
+
+            if not is_current():
+                return
+            menu.clear()
+            with menu:
+                refresh_instance_items(instance_material_items, len(instance_material_items))
+                refresh_shared_items(shared_material_items, len(shared_material_items), opaque_prims, translucent_prims)
+        except Exception:
+            if is_current():
+                menu.clear()
+                with menu:
+                    ui.MenuItem("Unable to load material actions.", enabled=False, identifier="material_actions_error")
+            raise
+        finally:
+            if self._material_menu_task is current_task:
+                self._material_menu_task = None
 
     def _show_copy_menu(self, button):
         """
@@ -825,6 +961,13 @@ class SetupUI(_PropertyGroupExpansionMixin):
         self._context_menu.show()
 
     def show(self, value: bool):
+        """Show material properties and release menu work when hidden.
+
+        Args:
+            value: Whether the material properties are visible.
+        """
+        if not value:
+            self.__clear_material_menu()
         self._material_properties_widget.show(value)  # to disable the listener
 
     def _iter_property_group_widgets(self) -> tuple[_PropertyGroupExpansionWidget | None, ...]:
@@ -851,7 +994,13 @@ class SetupUI(_PropertyGroupExpansionMixin):
         return list(materials)
 
     def destroy(self):
+        """Release owned menu work and material-widget subscriptions."""
+        self.__clear_material_menu()
         self._unfiltered_selected_prims = []
+        if self._settings is not None and self._dlss_availability_subscription is not None:
+            self._settings.unsubscribe_to_change_events(self._dlss_availability_subscription)
+        self._dlss_availability_subscription = None
+        self._settings = None
         if self._external_drag_and_drop:
             self._external_drag_and_drop.destroy()
             self._external_drag_and_drop = None

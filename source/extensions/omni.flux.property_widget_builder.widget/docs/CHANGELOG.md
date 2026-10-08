@@ -2,6 +2,21 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.12.10]
+### Fixed
+- Avoid an unnecessary redraw when a property widget first measures an unchanged name column.
+
+### Changed
+- Make initial column layout regression test exports and documentation explicit.
+
+## [2.12.9]
+### Fixed
+- Groups without children no longer expand in the shared tree delegate.
+
+## [2.12.8]
+### Changed
+- Coordinated linked drag-field rows across property widget rebuilds and active-row changes.
+
 ## [2.12.7]
 ### Changed
 - Exposed PropertyWidget tree column sizing options while preserving default minimum column widths

@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a viewport asset scattering brush: a Scatter window docked next to the Editor and a viewport toolbar tool (Ctrl+B) that paints, erases and floods ingested assets onto captured meshes with Paint-Tool-style density, falloff, spacing, padding, strength, random rotation and scale, per-asset weights, presets and per-stroke undo; painted assets are given their ingested texture set (albedo, normal, roughness, height) automatically, using the same detection as Assign Texture Sets. While painting, the cursor reports the prims the stroke is adding to the rendered stage, counting a placement once per instance of the prototype it lands on, and turns amber at the brush's Prim Budget and red at five times it; it reports only and never interrupts a stroke. Scatter that has already been painted can be tuned afterwards: with painted placements, a scatter container, a mesh or an instance selected, changing a placement, scale or seed setting updates the selected scatter live and commits as one undo step, while everything outside the selection is left exactly as it was. That same selection also gets the familiar transform gizmo in the viewport: dragging its arrows or rotate rings moves the whole patch, which settles back onto the surface it lands on, or aims it where it stands without moving it, again as a single undo step. Right after a stroke, that stroke is what live edits and the gizmo change: tune it by eye, including a Base Rotation that stands up an asset that comes out lying down, then undo once to remove it with the tuned settings kept for the next stroke. A Max Surface Angle setting keeps stamps from snapping onto walls and ledges, and live edits and gizmo drags of large patches are several times faster
 - REMIX-5930: Added an "Open Project with Capture..." recent-project action that selects and saves the active capture before opening StageCraft.
 - REMIX-5976: Added an in-process typed texture and mesh asset-processing graph with ingestion parity, durable queue restart, publication and metadata Apply, and context isolation.
+- REMIX-5971: Added Ctrl+A selection for selectable prim rows retained by the active Stage Manager tab and filters, including hierarchy parents and collapsed descendants.
+- REMIX-2698: Added linked Position, Rotation, and Scale XYZ editing that copies X across all axes and keeps subsequent edits synchronized.
+- Added runtime-gated **DLSS 3D-Guided Neural Generation [Experimental]** global controls, including Model A/B/C selection and advanced highlight and volumetric controls, to the viewport Render Settings pane and Edit > Preferences > HdRemix Renderer, plus capability-gated per-material control-mask settings in MDL material properties. Global controls are seeded from each current-schema capture's resolved runtime config without writing those values back, pre-release capture values are reset to the release defaults, and all related UI remains hidden when the feature is unavailable.
+- REMIX-6128: Added app-wide Ctrl+A selection using the active Stage Manager tab and filters, including when the mouse is outside the Stage Manager.
+- REMIX-5957: Added a headless StageCraft app, a curated MCP tool list with less duplicated description text, and a published Agent Skill with task recipes and installed `.agents/skills` and `.claude/skills` discovery paths; changed the preferred MCP port from `8000` to `18014` and REST from automatic port selection (`0`) to preferred `8011`, limiting MCP fallback to `18014–18019` and retaining REST fallback; published a current-user-only Windows endpoint discovery manifest with clean-shutdown cleanup, logged fallback MCP endpoints, and removed MCP prompts
+- REMIX-6006: Routed tagged ComfyUI texture and mesh workflow outputs through the texture and asset pipelines, with per-output Apply settings, mesh reference selection, and one atomic Apply, Reapply, and Revert for every result.
+- REMIX-3131: Added Copy Light and Paste Light actions with console success and failure messages and mesh-instance targeting to the Property Panel and Stage Manager.
+- Added docs for downloading prebuilt Toolkit development packages from GitHub Actions, installing the published `rtx-remix-modding` skill with `npx skills add`, and registering the MCP server in Claude Code
+- REMIX-2659: Added linear BC6H UF16 encoding, float image I/O, and float octahedral normal conversion without 8-bit rounding.
+- REMIX-2659: Added HDRI Skybox textures as linear BC6H UF16 DDS, linear float OpenEXR standardization for all texture inputs, and matched the runtime color space of each texture type.
 
 ### Changed
 
@@ -89,6 +99,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tree data, cooperatively pacing worker work, and safely falling back when custom Prim-name fonts are unavailable.
 - REMIX-5566: Sourced Remix category metadata from the authoritative HdRemix USD schema, displayed `remix_category:decal_Static` as Decal, kept non-Decal categories visible when Decal is absent, disabled assignment when schema data is unavailable without blocking Toolkit, made deprecated decal migration composition-safe on undo, and updated Stage Manager category filtering controls.
 - REMIX-6016: Improved Project Wizard capture discovery and capture activation.
+- Tightened test review scope to require evidence that the MR introduced or worsened each reported issue, excluding unrelated pre-existing test debt.
+- Update Remix target dependencies: hdremix and omni_core_materials to `ext-5fcc864-main`
+- Update Remix target dependencies: hdremix and omni_core_materials to `ext-996fe27-main`
+- Set OMP model roles for project subagents.
+- Automatically build the Windows Toolkit package for Remix dependency bot merge requests and require packaging to succeed.
+- Moved the Toolkit REST routes from six `.service` extensions into `lightspeed.trex.service.core` without changing the REST API or MCP tools, and fixed hot-reloading `lightspeed.trex.service.core` failing to restart and doubling its OpenAPI tags
+- Update Remix target dependencies: hdremix and omni_core_materials to `ext-f337894-main`
 
 ### Removed
 
@@ -153,6 +170,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - REMIX-4777: Decoupled Stage Manager action tests from the Remix viewport renderer, restored context-bound frame requests, and added real delete/restore click plus app-level viewport Delete-key coverage.
 - REMIX-4314: Enabled continuous viewport camera drags with native cursor capture while restoring the prior cursor mode when each drag ends.
 - Fixed Remix Review failing on a failed required CI check and made `remix-review-post-threads` post inline diff threads with Jira-style `BLOCKER`/`P0`/`P1`/`P2` priorities.
+- Fixed ambiguous Remix review follow-up routing and allowed thread follow-up across rewritten history while preserving review snapshots, discussion IDs, and scores.
+- REMIX-6083: Fixed Stage Manager Meshes, Materials, and Categories tabs highlighting related prims as selected while preserving related-item framing.
+- Fixed intermittent failures loading material properties and conversion menus.
+- REMIX-5614: Fixed camera clipping-range value tooltips to identify the Near and Far fields instead of X and Y axes.
+- REMIX-5621: Added shared pip archive consistency coverage.
+- REMIX-6062: Fixed first-click Ingestion activation.
+- Fixed Remix Review losing scores on uncertain concerns and conflicting worker instructions, retained MR-description
+  quality checks as advisory feedback without score penalties, added automatic MR/PR score comparisons that preserve
+  the previewed choice and support `--from-scratch`, carried verified rebuttals and explicit defect acceptances through
+  current-code rechecks, added changed-line scoring with severity ceilings and a whole-change pass for cross-component
+  bugs, design, and duplication with configurable reasoning, clarified cross-file evidence and duplication boundaries,
+  aligned readiness probes with worker models and reasoning, and matched extension version bumps and review checks
+  to change compatibility.
+- REMIX-6104: Fixed delayed Open-with-Capture feedback and repeated input by showing progress after wizard dismissal, blocking duplicate requests, and logging preparation failures.
+- Fixed Remix Review spending its review budget on speculative synthesis reservations and idle worker queues while preserving required coverage and deadline enforcement.
+- REMIX-6129: Reduced large-selection stalls in Properties and the viewport.
+- Fixed MCP tool schemas that referenced `#/components/schemas/*` without including the definitions, which strict clients such as llama.cpp rejected, by upgrading the MCP server to FastMCP 4.0.10 with FastAPI 0.142.2, Starlette 1.7.0 and Pydantic 2.13.5 (GitHub rtx-remix#1097).
+- REMIX-5215: Fixed label jitter during idle polling and redundant label redraws when Capture Details or Mod Details loads.
+- Initialize the shared MDL backend before material API consumers run, including ComfyUI job preparation.
+- Fixed repository completion checks selecting downstream branches as their base and ignoring staged or unstaged version and changelog updates.
+- REMIX-5137: Updated paired Remix schema dependencies and fixed Camera Light contributing to volumetric lighting by setting the fallback light's volumetric radiance scale to zero.
+- Fixed completion hooks repeatedly restarting blocked agents by limiting automatic repair to one attempt and preserving unresolved failures for user feedback.
+- Fixed the RTX Remix modding Agent Skill suggesting file edits or other workarounds when asked to delete a prim; it now points to the Remix Toolkit instead (NVBug 6713667).
+- REMIX-6099: Fixed numeric property drags to preview live while preserving multi-selection behavior, one undoable change on release, and original authored state on cancellation.
+- REMIX-6232: Fixed ingestion jobs that never started after the Pydantic 2.13.5 and FastAPI 0.142.2 upgrade. `OmniUrl` fields failed JSON serialization, and FastAPI rejected schema update requests that had no `Content-Type` header.
 
 ## [1.5.2-0]
 

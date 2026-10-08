@@ -16,8 +16,11 @@
 """
 
 import abc
+import asyncio
 import copy
+import traceback
 from collections.abc import Callable
+from contextlib import ExitStack
 from typing import Any
 
 import carb
@@ -29,6 +32,8 @@ from omni.flux.property_widget_builder.widget import ItemValueModel as _ItemValu
 from omni.flux.property_widget_builder.widget import Serializable as _Serializable
 from omni.flux.utils.common import path_utils as _path_utils
 from omni.flux.utils.common.interactive_usd_notices import defer_usd_notices as _defer_usd_notices
+from omni.kit.app import get_app
+from omni.kit.usd_undo import UsdLayerUndo
 from pxr import Gf, Sdf, Usd
 
 from ..mapping import GF_TO_PYTHON_TYPE, MULTICHANNEL_BUILDER_TABLE, VEC_TYPES, VecType
@@ -70,6 +75,14 @@ def _safe_deepcopy(value):
             # If all else fails, return the original value.
             # Caller should be aware this may not be a true copy.
             return value
+
+
+def _undo_group_added_since(undo_stack_size: int) -> None:
+    """Undo and discard the completed group only when this scope added an undo entry."""
+    if len(omni.kit.undo.get_undo_stack()) > undo_stack_size and omni.kit.undo.undo():
+        # Starting a new top-level action clears Kit's redo stack; remove the empty action itself.
+        with omni.kit.undo.group(remove_if_empty=True):
+            pass
 
 
 class UsdAttributeBase(_Serializable, abc.ABC):
@@ -124,12 +137,18 @@ class UsdAttributeBase(_Serializable, abc.ABC):
         self._ignore_refresh = False
         self._attributes: list[Usd.Attribute] = None
         self._is_batch_editing = False
+        self._pending_preview_task = None
+        self._preview_layer_undos: dict[tuple[str, Sdf.Path], UsdLayerUndo] = {}
 
     def init_attributes(self):
         # cache the attributes
         self._attributes = _get_item_attributes(self.stage, self.attribute_paths)
         # initial read of attribute values
         self._on_usd_changed()
+
+    def destroy(self) -> None:
+        """Cancel pending previews and restore their specs before item teardown."""
+        self.cancel_property_edit_interaction()
 
     def register_serializer_hooks(self, serializer):
         super().register_serializer_hooks(serializer)
@@ -362,6 +381,13 @@ class UsdAttributeBase(_Serializable, abc.ABC):
     def _on_dirty(self):
         pass
 
+    def _get_write_value(self, current_value):
+        """Return the value to author for one represented attribute."""
+        return self._value
+
+    def _refresh_linked_value_models(self) -> None:
+        """Refresh value models that share speculative edit state with this model."""
+
     def refresh(self):
         if self._ignore_refresh:
             return
@@ -384,6 +410,8 @@ class UsdAttributeBase(_Serializable, abc.ABC):
         if self._skip_set_value(value):
             return False
 
+        self._check_preview_restored()
+
         new_value = value
         if self._convert_type is not None:
             try:
@@ -399,35 +427,56 @@ class UsdAttributeBase(_Serializable, abc.ABC):
 
         if self._is_batch_editing:
             self._on_dirty()
+            self._schedule_preview()
             return True
 
         if not self._stage:
             return False
 
-        if self._related_override_paths:
-            with omni.kit.undo.group():
-                wrote_value = self._write_value_to_usd()
+        if self._related_override_paths or len(self._attribute_paths) > 1:
+            undo_stack_size = len(omni.kit.undo.get_undo_stack())
+            owns_undo_group = False
+            try:
+                with omni.kit.undo.group(remove_if_empty=True):
+                    owns_undo_group = len(omni.kit.undo.get_undo_stack()) > undo_stack_size
+                    succeeded, wrote_value = self._write_value_to_usd()
+            except Exception:
+                if owns_undo_group:
+                    _undo_group_added_since(undo_stack_size)
+                self.refresh()
+                self._refresh_linked_value_models()
+                raise
+            if owns_undo_group and not succeeded and wrote_value:
+                _undo_group_added_since(undo_stack_size)
         else:
-            wrote_value = self._write_value_to_usd()
+            succeeded, wrote_value = self._write_value_to_usd()
 
-        if wrote_value:
+        if succeeded and wrote_value:
             self.refresh()
             return True
+        if not succeeded:
+            self.refresh()
+            self._refresh_linked_value_models()
+            return False
         # value was not changed, but we do want to refresh the delegate
         self._on_dirty()
         return False
 
-    def _write_value_to_usd(self) -> bool:
+    def _write_value_to_usd(self, *, group_undo: bool = False) -> tuple[bool, bool]:
         """Write the current in-memory value to USD for all attribute paths.
 
-        Returns True if at least one attribute was updated, False otherwise.
+        Args:
+            group_undo: Group changed targets without opening a group for unchanged values.
+
+        Returns:
+            Whether every requested command succeeded and whether any command wrote a value.
         """
         if not self._stage:
-            return False
+            return False, False
         wrote_any = False
         self._ignore_refresh = True
         try:
-            with _defer_usd_notices(self._stage):
+            with _defer_usd_notices(self._stage), ExitStack() as undo_scope:
                 for attribute_path in self._attribute_paths:
                     prim = self._stage.GetPrimAtPath(attribute_path.GetPrimPath())
                     if prim.IsValid():
@@ -438,17 +487,27 @@ class UsdAttributeBase(_Serializable, abc.ABC):
                             current_value = self._get_default_value(attr)
                         else:
                             continue
-                        if current_value != self._value:
+                        new_value = self._get_write_value(current_value)
+                        if current_value != new_value:
+                            if group_undo:
+                                undo_scope.enter_context(omni.kit.undo.group(remove_if_empty=True))
+                                group_undo = False
                             target_layer = self._get_target_layer(attr)
-                            wrote_any = self._ensure_related_override_specs(attr, target_layer) or wrote_any
-                            wrote_any = self._set_attribute_value(attr, self._value, target_layer) or wrote_any
+                            succeeded, wrote_related = self._ensure_related_override_specs(attr, target_layer)
+                            wrote_any = wrote_related or wrote_any
+                            if not succeeded:
+                                return False, wrote_any
+                            if not self._set_attribute_value(attr, new_value, target_layer):
+                                return False, wrote_any
+                            wrote_any = True
         except Exception:
             if self._read_value_from_usd():
                 self._on_dirty()
+            self._refresh_linked_value_models()
             raise
         finally:
             self._ignore_refresh = False
-        return wrote_any
+        return True, wrote_any
 
     def _get_target_layer(self, attr: Usd.Attribute) -> Sdf.Layer:
         """Get the layer that should receive a value write for the attribute."""
@@ -466,8 +525,12 @@ class UsdAttributeBase(_Serializable, abc.ABC):
             target_layer = self._stage.GetEditTarget().GetLayer()
         return target_layer
 
-    def _ensure_related_override_specs(self, attr: Usd.Attribute, target_layer: Sdf.Layer) -> bool:
-        """Author missing related property specs in the same layer as a value write."""
+    def _ensure_related_override_specs(self, attr: Usd.Attribute, target_layer: Sdf.Layer) -> tuple[bool, bool]:
+        """Author missing related property specs in the same layer as a value write.
+
+        Returns:
+            Whether every command succeeded and whether any command wrote a spec.
+        """
         wrote_any = False
         attr_path = attr.GetPath()
         prim_path = attr_path.GetPrimPath()
@@ -479,7 +542,8 @@ class UsdAttributeBase(_Serializable, abc.ABC):
             related_attr = self._stage.GetAttributeAtPath(related_path)
             if not related_attr or not related_attr.IsValid():
                 continue
-            omni.kit.commands.execute(
+            self._reserve_preview_property(related_attr, target_layer)
+            succeeded, _result = omni.kit.commands.execute(
                 "ChangeProperty",
                 prop_path=str(related_path),
                 value=related_attr.Get(),
@@ -487,40 +551,135 @@ class UsdAttributeBase(_Serializable, abc.ABC):
                 prev=None,
                 usd_context_name=self._context_name,
             )
+            if not succeeded:
+                return False, wrote_any
             wrote_any = True
-        return wrote_any
+        return True, wrote_any
+
+    def _schedule_preview(self) -> None:
+        """Coalesce cached drag values into one undo-free write on the next update."""
+        if not self._stage or self._pending_preview_task is not None:
+            return
+
+        async def preview_async():
+            try:
+                await get_app().next_update_async()
+                if self._is_batch_editing:
+                    with omni.kit.undo.disabled():
+                        succeeded, _wrote_value = self._write_value_to_usd()
+                    if not succeeded:
+                        self.cancel_property_edit_interaction()
+            except Exception:  # noqa: BLE001 - Ruff does not recognize Carbonite traceback logging.
+                carb.log_error(f"Failed to preview property edit\n{traceback.format_exc()}")
+                try:
+                    self.cancel_property_edit_interaction()
+                except Exception:  # noqa: BLE001 - Ruff does not recognize Carbonite traceback logging.
+                    carb.log_error(f"Failed to cancel property preview\n{traceback.format_exc()}")
+            finally:
+                if self._pending_preview_task is task:
+                    self._pending_preview_task = None
+
+        task = asyncio.ensure_future(preview_async())
+        self._pending_preview_task = task
+
+    def _reserve_preview_property(self, attr: Usd.Attribute, target_layer: Sdf.Layer | None = None) -> None:
+        """Reserve a property's original spec once in its effective edit target."""
+        if not self._is_batch_editing:
+            return
+        edit_target = self._stage.GetEditTarget()
+        if target_layer is not None:
+            if attr.GetCustomDataByKey("nonpersistant"):
+                target_layer = self._stage.GetSessionLayer()
+            edit_target = self._stage.GetEditTargetForLocalLayer(target_layer).ComposeOver(edit_target)
+        layer = edit_target.GetLayer()
+        property_path = edit_target.MapToSpecPath(attr.GetPath())
+        reservation_key = (layer.identifier, property_path)
+        if reservation_key in self._preview_layer_undos:
+            return
+        layer_undo = UsdLayerUndo(layer)
+        layer_undo.reserve(property_path)
+        self._preview_layer_undos[reservation_key] = layer_undo
+
+    def _restore_preview(self) -> None:
+        """Restore every previewed property, retaining failed reservations for explicit retry."""
+        task = self._pending_preview_task
+        self._pending_preview_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        was_ignoring_refresh = self._ignore_refresh
+        self._ignore_refresh = True
+        first_error = None
+        try:
+            with _defer_usd_notices(self._stage), Sdf.ChangeBlock():
+                for reservation_key, layer_undo in tuple(self._preview_layer_undos.items()):
+                    layer_identifier, property_path = reservation_key
+                    try:
+                        layer_undo.undo()
+                    except Exception as exc:  # noqa: BLE001 - Ruff does not recognize Carbonite traceback logging.
+                        carb.log_error(
+                            f"Failed to restore property preview in layer {layer_identifier} at {property_path}\n"
+                            f"{traceback.format_exc()}"
+                        )
+                        if first_error is None:
+                            first_error = exc
+                    else:
+                        del self._preview_layer_undos[reservation_key]
+        finally:
+            self._ignore_refresh = was_ignoring_refresh
+        if first_error is not None:
+            raise first_error
+
+    def _check_preview_restored(self) -> None:
+        """Reject edits until explicit cleanup restores a failed preview rollback."""
+        if not self._is_batch_editing and self._preview_layer_undos:
+            raise RuntimeError("Property preview rollback is incomplete; cancel or destroy the model before editing")
 
     def begin_batch_edit(self):
-        """Start a drag batch so intermediate values stay in memory until release."""
+        """Start a drag batch with live previews that leave undo history unchanged."""
+        self._check_preview_restored()
         self._is_batch_editing = True
-        omni.kit.undo.begin_group()
 
     def end_batch_edit(self):
-        """Flush the final drag value to USD and close the undo group."""
+        """Restore previewed properties and commit the final drag value as one undo step."""
+        self._check_preview_restored()
+        succeeded = False
+        undo_stack_size = None
         try:
+            final_value = _safe_deepcopy(self._value)
+            self._restore_preview()
+            self._value = final_value
+            self._is_batch_editing = False
             if not self._stage:
                 return
-            if self._write_value_to_usd():
-                self.refresh()
+            undo_stack_size = len(omni.kit.undo.get_undo_stack())
+            succeeded, wrote_value = self._write_value_to_usd(group_undo=True)
         finally:
             self._is_batch_editing = False
-            omni.kit.undo.end_group()
+            if not succeeded and undo_stack_size is not None:
+                _undo_group_added_since(undo_stack_size)
+                self.refresh()
+                self._refresh_linked_value_models()
+        if succeeded and wrote_value:
+            self.refresh()
 
     def _cancel_batch_edit(self):
+        """Restore the original authored properties and cache without recording undo."""
         try:
+            self._restore_preview()
             if self._stage and self._read_value_from_usd():
                 self._value_changed()
+            self._refresh_linked_value_models()
         finally:
             self._is_batch_editing = False
-            omni.kit.undo.end_group()
 
     def _refresh_after_cancel_property_edit(self) -> None:
         pass
 
     def cancel_property_edit_interaction(self) -> None:
+        """Cancel editing and retry any retained preview restorations before notifying listeners."""
         first_error: Exception | None = None
         try:
-            if self.is_batch_editing:
+            if self.is_batch_editing or self._preview_layer_undos:
                 self._cancel_batch_edit()
         except Exception as exc:  # noqa: BLE001 - parent cancel callbacks must still run.
             first_error = exc
@@ -553,6 +712,7 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
         value_type_name: Sdf.ValueTypeName | None = None,
         tooltip_display_name: str | None = None,
         related_override_paths: list[Sdf.Path] | None = None,
+        tooltip_channel_name: str | None = None,
     ):
         """
         Value model of an attribute value
@@ -566,6 +726,7 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
             tooltip_display_name: optional display name used to prefix value widget tooltips
             default_value: optional override for the default value
             related_override_paths: optional related properties that should receive specs with this value write
+            tooltip_channel_name: optional channel suffix used instead of the default axis name
         """
         super().__init__(
             context_name,
@@ -573,15 +734,66 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
             read_only=read_only,
             value_type_name=value_type_name,
             tooltip_display_name=tooltip_display_name,
+            tooltip_channel_name=tooltip_channel_name,
             related_override_paths=related_override_paths,
         )
         self._channel_index = channel_index
         # should we treat value as a "multi" value or by channel.
         self._is_multichannel = MULTICHANNEL_BUILDER_TABLE.get(self._value_type_name, False)
-        self._tooltip_channel_name = _get_channel_name(channel_index) if self._is_multichannel else None
+        if self._tooltip_channel_name is None and self._is_multichannel:
+            self._tooltip_channel_name = _get_channel_name(channel_index)
         self._has_wrong_value = False
         self._default_value = default_value
+        self._group_edit_models = ()
+        self._group_edit_enabled = False
+        self._copy_current_first_channel = False
         self.init_attributes()
+
+    def configure_group_edit(self, models: list["UsdAttributeValueModel"], enabled: bool) -> None:
+        """Configure the sibling channels that should receive this model's value."""
+        self._group_edit_models = tuple(models)
+        self._group_edit_enabled = enabled
+
+    def synchronize_group_edit_value(self, value) -> None:
+        """Synchronize this channel's cached vector during a grouped edit."""
+        self._value = _safe_deepcopy(value)
+        self._on_dirty()
+
+    def copy_first_channel_to_all_attributes(self) -> bool:
+        """Copy each represented attribute's first channel across its full vector atomically.
+
+        This operation must own a top-level Kit undo group because nested groups flatten and
+        cannot be rolled back independently.
+
+        Raises:
+            RuntimeError: If rollback is unresolved or another Kit undo group is already active.
+        """
+        if not self._is_multichannel or self.read_only or not self._stage:
+            return False
+        self._check_preview_restored()
+        undo_stack_size = len(omni.kit.undo.get_undo_stack())
+        self._copy_current_first_channel = True
+        try:
+            with omni.kit.undo.group(remove_if_empty=True):
+                if len(omni.kit.undo.get_undo_stack()) == undo_stack_size:
+                    raise RuntimeError("Group-edit copying requires a top-level undo operation")
+                succeeded, wrote_value = self._write_value_to_usd()
+        except Exception:
+            _undo_group_added_since(undo_stack_size)
+            self.refresh()
+            for model in self._group_edit_models:
+                if model is not self:
+                    model.refresh()
+            raise
+        finally:
+            self._copy_current_first_channel = False
+        if not succeeded and wrote_value:
+            _undo_group_added_since(undo_stack_size)
+        self.refresh()
+        for model in self._group_edit_models:
+            if model is not self:
+                model.refresh()
+        return succeeded
 
     def begin_paste(self):
         """Refresh ``self._value`` from USD before this channel's deserialize.
@@ -612,9 +824,39 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
     def _set_internal_value(self, new_value):
         """Inverse of get_value. Prep widget value for storing in self._value."""
         if self._is_multichannel:
-            self._value[self._channel_index] = new_value
+            new_value = type(self._value[self._channel_index])(new_value)
+            if self._group_edit_enabled:
+                for channel_index in range(len(self._value)):
+                    self._value[channel_index] = new_value
+                for model in self._group_edit_models:
+                    if model is self:
+                        continue
+                    model.synchronize_group_edit_value(self._value)
+            else:
+                self._value[self._channel_index] = new_value
         else:
             self._value = new_value
+
+    def _get_write_value(self, current_value):
+        """Preserve each selected attribute's untouched channels during a single-axis edit."""
+        if self._copy_current_first_channel:
+            new_value = _safe_deepcopy(current_value)
+            for channel_index in range(len(new_value)):
+                new_value[channel_index] = current_value[0]
+            return new_value
+        if not self._is_multichannel or self._group_edit_enabled:
+            return self._value
+        new_value = _safe_deepcopy(current_value)
+        new_value[self._channel_index] = self._value[self._channel_index]
+        return new_value
+
+    def _refresh_linked_value_models(self) -> None:
+        """Restore grouped sibling caches after a canceled or failed edit."""
+        if not self._group_edit_enabled:
+            return
+        for model in self._group_edit_models:
+            if model is not self:
+                model.refresh()
 
     def _get_default_value(self, attr):
         """Get the USD default value, or the override if provided"""
@@ -685,8 +927,10 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
             # we set back to the USD value
             should_refresh = self._has_wrong_value
             self._has_wrong_value = False
-            if should_refresh and self._read_value_from_usd():
-                self._value_changed()
+            if should_refresh:
+                if self._read_value_from_usd():
+                    self._value_changed()
+                self._refresh_linked_value_models()
         except Exception as exc:  # noqa: BLE001 - parent end callback must still run.
             if first_error is None:
                 first_error = exc
@@ -701,8 +945,10 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
     def _refresh_after_cancel_property_edit(self) -> None:
         should_refresh = self._has_wrong_value
         self._has_wrong_value = False
-        if should_refresh and self._read_value_from_usd():
-            self._value_changed()
+        if should_refresh:
+            if self._read_value_from_usd():
+                self._value_changed()
+            self._refresh_linked_value_models()
 
     # TODO: Remove usages after dealing with Asset path type. Most cases would be better served with get_value().
     def get_attributes_raw_value(self, element_current_idx) -> Any | None:
@@ -759,7 +1005,8 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
         if target_layer is None:
             target_layer = self._get_target_layer(attr)
 
-        omni.kit.commands.execute(
+        self._reserve_preview_property(attr, target_layer)
+        succeeded, _result = omni.kit.commands.execute(
             "ChangeProperty",
             prop_path=attribute_path,
             value=new_value,
@@ -767,7 +1014,7 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
             prev=None,
             usd_context_name=self._context_name,
         )
-        return True
+        return succeeded
 
     def _on_dirty(self):
         self._value_changed()
@@ -792,6 +1039,7 @@ class VirtualUsdAttributeValueModel(UsdAttributeValueModel):
         create_callback: Callable[[Usd.Attribute, Any], None] | None = None,
         tooltip_display_name: str | None = None,
         related_override_paths: list[Sdf.Path] | None = None,
+        tooltip_channel_name: str | None = None,
     ):
         self._create_callback = create_callback
 
@@ -809,6 +1057,7 @@ class VirtualUsdAttributeValueModel(UsdAttributeValueModel):
             read_only=read_only,
             value_type_name=value_type_name,
             tooltip_display_name=tooltip_display_name,
+            tooltip_channel_name=tooltip_channel_name,
             related_override_paths=related_override_paths,
         )
 
@@ -818,6 +1067,11 @@ class VirtualUsdAttributeValueModel(UsdAttributeValueModel):
     def _get_default_value(self, attr):
         # Since the attribute does not exist, we need to retrieve the stored value.
         return self._default_value
+
+    def _schedule_preview(self) -> None:
+        """Preview virtual values only when creation has a known property-only mutation."""
+        if self._create_callback is None:
+            super()._schedule_preview()
 
     @property
     def metadata(self):
@@ -855,13 +1109,15 @@ class VirtualUsdAttributeValueModel(UsdAttributeValueModel):
             if not path.IsPropertyPath():
                 raise ValueError(f"Cannot create virtual attribute from invalid property path: {path}")
             prim = self._stage.GetPrimAtPath(path.GetPrimPath())
-            omni.kit.commands.execute(
+            self._reserve_preview_property(attr)
+            succeeded, _result = omni.kit.commands.execute(
                 "CreateUsdAttributeCommand",
                 prim=prim,
                 attr_name=path.name,
                 attr_type=self._value_type_name,
                 attr_value=new_value,
             )
+            return succeeded
         return True
 
     def _set_attribute_value(self, attr: Usd.Attribute, new_value: Any, target_layer: Sdf.Layer | None = None) -> bool:

@@ -15,4 +15,6 @@
 * limitations under the License.
 """
 
+from .unit import TestPropertyWidget
+
 from .e2e.test_widget import *

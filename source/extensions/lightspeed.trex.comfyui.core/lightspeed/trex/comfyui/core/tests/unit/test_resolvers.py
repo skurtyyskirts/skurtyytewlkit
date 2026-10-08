@@ -18,13 +18,9 @@
 import pathlib
 from unittest.mock import MagicMock, patch
 
-from omni.flux.asset_importer.core.data_models import TEXTURE_TYPE_INPUT_MAP, TextureTypes
-from omni.kit.test import AsyncTestCase
-from pxr import Sdf
-
-from lightspeed.trex.comfyui.core.enums import IntroducingLayer, RemixType
-from lightspeed.trex.comfyui.core.keys import type_key
-from lightspeed.trex.comfyui.core.resolvers import (
+from ...enums import IntroducingLayer, RemixType
+from ...keys import type_key
+from ...resolvers import (
     RESOLVER_PLUGINS,
     AllStageTexturesResolver,
     ConstantResolver,
@@ -39,6 +35,9 @@ from lightspeed.trex.comfyui.core.resolvers import (
     create_resolver,
     get_resolver_rule,
 )
+from omni.flux.asset_importer.core.data_models import TEXTURE_TYPE_INPUT_MAP, TextureTypes
+from omni.kit.test import AsyncTestCase
+from pxr import Sdf
 
 
 class TestValueResolver(AsyncTestCase):
@@ -236,7 +235,7 @@ class TestValueResolver(AsyncTestCase):
 
         # Assert
         self.assertIsInstance(resolver, ConstantResolver)
-        self.assertEqual(resolver.value, complex())
+        self.assertEqual(resolver.value, 0j)
 
     async def test_resolver_factory_registers_exact_catalog_plugins(self):
         """Resolver rules come only from explicitly registered exact plugin classes."""
@@ -396,8 +395,9 @@ class TestValueResolver(AsyncTestCase):
         # Assert
         self.assertIs(parameter.value_type, TextureTypes)
         self.assertEqual(parameter.get_value(), TextureTypes.DIFFUSE)
-        self.assertEqual(parameter.choices, tuple(t for t in TextureTypes if t is not TextureTypes.OTHER))
+        self.assertEqual(parameter.choices, tuple(t for t in TEXTURE_TYPE_INPUT_MAP if t is not TextureTypes.OTHER))
         self.assertNotIn(TextureTypes.OTHER, parameter.choices)
+        self.assertNotIn(TextureTypes.SKYBOX, parameter.choices)
         self.assertEqual(parameter.label, "Texture Type")
 
     async def test_selected_texture_parameter_updates_texture_type(self):

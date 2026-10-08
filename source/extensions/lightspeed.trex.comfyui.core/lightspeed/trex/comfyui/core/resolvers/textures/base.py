@@ -30,7 +30,9 @@ from ..base import ResolverParameter, ResolverValueError, ValueResolver
 
 # The dropdown offers real texture inputs only; OTHER is a diffuse fallback, not a selectable type.
 SELECTABLE_TEXTURE_TYPES = tuple(
-    texture_type for texture_type in TextureTypes if texture_type is not TextureTypes.OTHER
+    texture_type
+    for texture_type in TextureTypes
+    if texture_type in TEXTURE_TYPE_INPUT_MAP and texture_type is not TextureTypes.OTHER
 )
 
 
@@ -48,20 +50,6 @@ class TextureResolverBase(ValueResolver[pathlib.Path]):
 
     remix_types: ClassVar[tuple[RemixType, ...]] = (RemixType.TEXTURE_FILE_PATH,)
     texture_type: TextureTypes = TextureTypes.DIFFUSE
-    context_name: str | None = None
-
-    @classmethod
-    def create(cls, default_value: object, context_name: str | None = None) -> "TextureResolverBase":
-        """Create a texture resolver bound to its owning USD context.
-
-        Args:
-            default_value: Authored workflow value unused by semantic texture resolution.
-            context_name: USD context containing the selected material.
-
-        Returns:
-            Texture resolver bound to the supplied context.
-        """
-        return cls(context_name=context_name)
 
     @property
     def parameters(self) -> tuple[ResolverParameter[TextureTypes], ...]:

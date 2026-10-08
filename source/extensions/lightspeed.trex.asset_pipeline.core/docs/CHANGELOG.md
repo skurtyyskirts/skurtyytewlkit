@@ -1,6 +1,26 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.4.0]
+### Added
+- Added `StandardizeLinearTexturesStep`, which writes every non-DDS texture as a linear float OpenEXR file and resolves every UDIM tile list before channel extraction, factor application, normal conversion, and DDS encoding. Added Skybox textures with linear BC6H UF16 output, and used linear BC4 for Anisotropy and Measurement Distance and linear BC7 for Single Scattering. The pipeline identifies DDS sources by their `DDS ` magic number, not their suffix, and DDS sources skip every step except the final DDS step.
+
+## [1.3.0]
+### Changed
+- Added public frozen `TextureInfo` and `TEXTURE_INFO` in `constants`, keyed by `TextureTypes` with NVTT `BlockFormat` and `MipmapFilter` settings. `ConvertNormalStep` uses `OctahedralConverter.convert_file_to_octahedral` and does not run when no texture is a DirectX or OpenGL normal. DDS outputs from OpenEXR and Radiance HDR sources encode again one time, because their `src_hash` value now adds a fixed suffix to the file hash.
+
+## [1.2.1]
+### Added
+- Added glTF/GLB material conversion with packed texture channel extraction and extra textures beside mesh outputs, renamed the optimization stages to Optimization preparation, Texture optimization, and Mesh optimization, restored the default material for meshes without a surface shader, renamed `TextureProcessingJob`, `TextureProcessingRequest`, `TextureProcessingResult`, and `TextureProcessingItem` to `TextureOptimization*` (persisted codec ids unchanged), and made the optimization jobs settle as skipped with outputs when there is no work: the prepare and mesh jobs skip with "Asset already optimized" for a source with a valid `.meta` sidecar and publish it in place so Apply still runs, and the texture job skips with "No textures to optimize" for an empty batch.
+
+### Changed
+- Removed the unused `lightspeed.trex.utils.common` dependency.
+- `ConvertDDSStep` copies a `.dds` source unchanged, whatever its file name, so an encoded texture is never compressed twice. `RemixAssetPipelineContext.force_dds_reencode` re-enables the re-encode. Removed `get_legacy_dds_suffixes`.
+
+### Fixed
+- Preserved distinct texture factor values in output paths and reused DDS tiles already at their workspace destination.
+- Restored legacy model material name rules and converter selection, and required successful metadata validation before mesh optimization skips.
+
 ## [1.2.0]
 ### Added
 - Added the Remix texture and mesh pipelines as typed job-queue graphs, published lineage, a public `metadata` module, default Apply handlers, and e2e tests that prove legacy-ingested fixtures are named, hashed, and reused as the retired validator did; the collect/update/metadata steps and stage cache are replaced by texture discovery, texture application, and an async pooled USD context lease.

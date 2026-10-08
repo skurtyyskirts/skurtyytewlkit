@@ -18,6 +18,7 @@
 import pathlib
 import tempfile
 
+import carb.tokens
 import omni.kit.app
 import omni.kit.test
 from omni.flux.asset_importer.core.data_models import TextureTypes
@@ -34,6 +35,49 @@ from lightspeed.trex.asset_pipeline.core import (
 
 
 class TestPipelineRunnerE2E(omni.kit.test.AsyncTestCase):
+    async def test_dds_udim_pipeline_publishes_unchanged_tiles(self):
+        """Publish DDS tiles unchanged despite channel, factor, or normal conversion markers."""
+        resource_root = pathlib.Path(carb.tokens.get_tokens_interface().resolve("${lightspeed.trex.app.resources}"))
+        fixture = resource_root / "data/tests/usd/project_example/sources/textures/ingested/16px_metallic.m.rtex.dds"
+        source_bytes = fixture.read_bytes()
+        cases = (
+            (False, TextureTypes.METALLIC),
+            (True, TextureTypes.NORMAL_DX),
+            (True, TextureTypes.NORMAL_OGL),
+        )
+        for use_ledger, texture_type in cases:
+            with (
+                self.subTest(use_ledger=use_ledger, texture_type=texture_type),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = pathlib.Path(temp_dir)
+                source_tiles = tuple(root / f"metallic.{tile}.dds" for tile in (1001, 1002))
+                for tile in source_tiles:
+                    tile.write_bytes(source_bytes)
+                source_pattern = root / "metallic.<UDIM>.dds"
+                item = RemixAssetItem.from_texture(source_pattern, texture_type)
+                item.textures[0].channel = "G"
+                item.textures[0].factor = (0.5,)
+                if use_ledger:
+                    item.textures[0].path = source_tiles[0]
+                    item.textures[0].udim_tiles = source_tiles
+                context = RemixAssetPipelineContext(items=[item])
+                output_dir = root / "processed"
+
+                # Publish both input representations through the production texture pipeline.
+                await run_remix_asset_pipeline(
+                    RemixAssetPipelineConfig(output_dir=output_dir, texture_type=texture_type),
+                    context,
+                    steps=build_remix_texture_pipeline(),
+                )
+
+                expected_tiles = tuple(output_dir / tile.name for tile in source_tiles)
+                self.assertEqual(item.textures[0].udim_tiles, expected_tiles)
+                self.assertEqual(item.textures[0].path, expected_tiles[0])
+                self.assertEqual(item.textures[0].texture_type, texture_type)
+                for tile in expected_tiles:
+                    self.assertEqual(tile.read_bytes(), source_bytes)
+
     async def test_texture_pipeline_processes_real_normal_map_to_final_dds(self):
         """The canonical pipeline processes a real normal texture into final published outputs."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -58,8 +102,8 @@ class TestPipelineRunnerE2E(omni.kit.test.AsyncTestCase):
             self.assertTrue(final_texture.exists())
             self.assertEqual(final_texture.read_bytes()[:4], b"DDS ")
 
-            # Successful completion removes both the intermediate PNG and the pipeline working directory.
-            self.assertFalse((output_dir / "Normal_Map_Test_DirectX_OTH_Normal.png").exists())
+            # Intermediate work files must not remain beside the published texture.
+            self.assertFalse((output_dir / "Normal_Map_Test_DirectX_OTH_Normal.exr").exists())
             self.assertEqual(
                 sorted(path for path in temp_path.iterdir() if path.name.startswith("remix_asset_pipeline_")),
                 [],
