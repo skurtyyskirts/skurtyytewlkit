@@ -270,6 +270,54 @@ class TestAssets(omni.kit.test.AsyncTestCase):
                     # Assert
                     self.assertAlmostEqual(result, 1.0)
 
+    async def test_read_asset_meters_per_unit_with_an_unusable_authored_unit_returns_one(self):
+        # A palette entry only accepts a positive unit scale, so passing one of these on fails every stroke.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, authored in enumerate((0.0, -0.01, float("inf"), float("nan"))):
+                with self.subTest(authored=authored):
+                    # Arrange
+                    # Kept open rather than saved, so the value is read back exactly as it was authored.
+                    stage = Usd.Stage.CreateNew((Path(temp_dir) / f"unit_{index}.usda").as_posix())
+                    UsdGeom.SetStageMetersPerUnit(stage, authored)
+
+                    # Act
+                    result = assets.read_asset_meters_per_unit(stage.GetRootLayer().identifier)
+
+                    # Assert
+                    self.assertEqual(result, 1.0)
+
+    async def test_read_asset_meters_per_unit_with_an_unusable_authored_unit_warns_once_per_asset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Arrange
+            stage = Usd.Stage.CreateNew((Path(temp_dir) / "zero_unit.usda").as_posix())
+            UsdGeom.SetStageMetersPerUnit(stage, 0.0)
+
+            with mock.patch.object(assets.carb, "log_warn") as log_warn:
+                # Act
+                for _ in range(3):
+                    assets.read_asset_meters_per_unit(stage.GetRootLayer().identifier)
+
+        # Assert
+        log_warn.assert_called_once()
+
+    async def test_read_asset_natural_extent_with_a_bound_of_no_finite_size_returns_zeros(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Arrange - a size like this would be stored and divided by on every stroke
+            path = _write_ingested_shaped_asset(Path(temp_dir), "cube.usda", cube_size=10.0)
+            aligned_range = mock.Mock()
+            aligned_range.IsEmpty.return_value = False
+            aligned_range.GetSize.return_value = Gf.Vec3d(float("inf"), 10.0, float("nan"))
+
+            with mock.patch.object(assets.UsdGeom, "BBoxCache") as bbox_cache_class:
+                bound = bbox_cache_class.return_value.ComputeUntransformedBound.return_value
+                bound.ComputeAlignedRange.return_value = aligned_range
+
+                # Act
+                result = assets.read_asset_natural_extent(path)
+
+        # Assert
+        self.assertEqual(result, (0.0, 0.0, 0.0))
+
     async def test_read_asset_natural_extent_returns_the_default_prim_size(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             # Arrange

@@ -30,6 +30,7 @@ __all__ = [
     "resolve_reference_asset_from_selection",
 ]
 
+import math
 import os
 from pathlib import PurePosixPath
 
@@ -47,7 +48,10 @@ from pxr import Sdf, Usd, UsdGeom
 
 from .settings import UpAxis
 
+_LOG_PREFIX = "[lightspeed.trex.scatter.core]"
 _USD_SUFFIXES = frozenset(suffix.lower() for suffix in common_constants.USD_EXTENSIONS)
+# Asset paths already reported as authoring an unusable unit scale, so reading one on every stroke warns once.
+_WARNED_UNIT_SCALES: set[str] = set()
 
 
 def resolve_reference_asset_from_selection(usd_context: omni.usd.UsdContext) -> str | None:
@@ -163,9 +167,11 @@ def read_asset_meters_per_unit(path: str) -> float:
         path: USD file path.
 
     Returns:
-        The authored unit scale; 1.0 when the file cannot be opened or authors none. The fallback is 1.0 rather than
-        USD's own 0.01 so that a file declaring nothing is taken to already be in stage units, which makes the
-        conversion a no-op instead of silently shrinking the asset a hundredfold.
+        The authored unit scale; 1.0 when the file cannot be opened, authors none, or authors one that is not a
+        positive finite number. The fallback is 1.0 rather than USD's own 0.01 so that a file declaring nothing is
+        taken to already be in stage units, which makes the conversion a no-op instead of silently shrinking the
+        asset a hundredfold. A palette entry only accepts a positive unit scale, so returning a broken one would make
+        the asset impossible to add, and every stroke that measures it fail.
     """
     layer = Sdf.Layer.FindOrOpen(path) if path else None
     if layer is None:
@@ -173,7 +179,13 @@ def read_asset_meters_per_unit(path: str) -> float:
     pseudo_root = layer.pseudoRoot
     if not pseudo_root.HasInfo(UsdGeom.Tokens.metersPerUnit):
         return 1.0
-    return float(pseudo_root.GetInfo(UsdGeom.Tokens.metersPerUnit))
+    meters_per_unit = float(pseudo_root.GetInfo(UsdGeom.Tokens.metersPerUnit))
+    if math.isfinite(meters_per_unit) and meters_per_unit > 0.0:
+        return meters_per_unit
+    if path not in _WARNED_UNIT_SCALES:
+        _WARNED_UNIT_SCALES.add(path)
+        carb.log_warn(f"{_LOG_PREFIX} '{path}' authors a metersPerUnit of {meters_per_unit}; using 1.0 instead")
+    return 1.0
 
 
 def read_asset_natural_extent(path: str) -> tuple[float, float, float]:
@@ -187,7 +199,8 @@ def read_asset_natural_extent(path: str) -> tuple[float, float, float]:
         path: USD file path.
 
     Returns:
-        The (x, y, z) extent, or zeros when the file is missing, unreadable, has no default prim, or bounds nothing.
+        The (x, y, z) extent, or zeros when the file is missing, unreadable, has no default prim, bounds nothing, or
+        bounds something of no finite size.
     """
     # Checked before opening: composing a path that is not there logs an error for a case that is simply "the asset is
     # gone", which the palette already reports elsewhere.
@@ -209,8 +222,12 @@ def read_asset_natural_extent(path: str) -> tuple[float, float, float]:
     aligned_range = bbox_cache.ComputeUntransformedBound(default_prim).ComputeAlignedRange()
     if aligned_range.IsEmpty():
         return (0.0, 0.0, 0.0)
-    size = aligned_range.GetSize()
-    return (float(size[0]), float(size[1]), float(size[2]))
+    size = tuple(float(value) for value in aligned_range.GetSize())
+    if not all(math.isfinite(value) for value in size):
+        # Absolute Size scales a placement by the reciprocal of this height, so an infinite one scales it to nothing.
+        carb.log_warn(f"{_LOG_PREFIX} '{path}' has no finite size; it is left unmeasured")
+        return (0.0, 0.0, 0.0)
+    return size
 
 
 def asset_crate_supported(path: str) -> bool:

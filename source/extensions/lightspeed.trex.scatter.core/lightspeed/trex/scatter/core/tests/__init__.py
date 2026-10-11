@@ -17,7 +17,7 @@
 
 from .e2e.test_commands_project import TestScatterCommandsOnProjectExample
 from .unit.test_assets import TestAssets
-from .unit.test_commands import TestScatterFloodCommand, TestScatterStrokeCommand
+from .unit.test_commands import TestScatterFloodCommand, TestScatterReapplyCommand, TestScatterStrokeCommand
 from .unit.test_controller import (
     TestControllerSelectionTurn,
     TestReapplyDriverRegistry,
@@ -103,6 +103,7 @@ __all__ = (
     "TestScatterBrushControllerSingleton",
     "TestScatterCommandsOnProjectExample",
     "TestScatterFloodCommand",
+    "TestScatterReapplyCommand",
     "TestScatterStrokeCommand",
     "TestScopeDragSession",
     "TestScopePivot",

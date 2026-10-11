@@ -31,6 +31,7 @@ from lightspeed.trex.scatter.core.placement import (
     author_placement_transforms,
     author_placements,
     generate_stamp,
+    remove_placements,
     transform_key,
 )
 from lightspeed.trex.scatter.core.reapply import (
@@ -891,6 +892,103 @@ class TestReapplyDriver(_ScatterStageTestCase):
         # Assert
         self.execute.assert_called_once()
         self.assertEqual(self.execute.call_args.args[0], "ScatterReapplyCommand")
+
+    async def test_undoing_the_stroke_during_an_edit_of_its_preview_executes_no_command(self):
+        # Arrange - the undo ends the preview, which finishes the edit, after the stroke's placements are gone
+        self.preview(self.grass)
+        self.brush.folds_into_preview.return_value = True
+        self.change_settings(size_min=40.0, size_max=40.0)
+        remove_placements(self.layer, self.grass)
+        self.brush.folds_into_preview.return_value = False
+
+        # Act
+        self.brush.subscribe_preview_changed.call_args.args[0]()
+
+        # Assert
+        self.execute.assert_not_called()
+
+    async def test_edit_finished_after_the_preview_ended_still_folds_the_edit_it_opened_on_the_preview(self):
+        # Arrange
+        self.preview(self.grass)
+        self.brush.folds_into_preview.return_value = True
+        self.change_settings(size_min=40.0, size_max=40.0)
+        self.brush.folds_into_preview.return_value = False
+
+        # Act
+        self.driver.edit_finished()
+
+        # Assert
+        self.execute.assert_not_called()
+
+    async def test_edit_finished_with_every_placement_removed_executes_no_command(self):
+        # Arrange
+        self.change_settings(size_min=40.0, size_max=40.0)
+        remove_placements(self.layer, self.grass)
+
+        # Act
+        self.driver.edit_finished()
+
+        # Assert
+        self.execute.assert_not_called()
+
+    async def test_edit_finished_with_a_removed_placement_commits_only_the_placements_left(self):
+        # Arrange
+        self.assertGreater(len(self.grass), 1, "the test needs a placement left once one is removed")
+        self.change_settings(size_min=40.0, size_max=40.0)
+        remove_placements(self.layer, self.grass[:1])
+
+        # Act
+        self.driver.edit_finished()
+
+        # Assert
+        kwargs = self.execute.call_args.kwargs
+        left = sorted(self.grass[1:])
+        self.assertEqual([transform.prim_path for transform in kwargs["after"]], left)
+        self.assertEqual([transform.prim_path for transform in kwargs["before"]], left)
+
+    async def test_edit_finished_tells_scope_subscribers_once_the_edit_is_closed(self):
+        # Arrange
+        self.change_settings(size_min=40.0, size_max=40.0)
+        callback = Mock()
+        subscription = self.driver.subscribe_scope_changed(callback)
+
+        # Act
+        self.driver.edit_finished()
+
+        # Assert
+        callback.assert_called_once_with(self.driver.scope)
+        self.assertIsNotNone(subscription)
+
+    async def test_edit_finished_with_no_edit_open_tells_scope_subscribers_nothing(self):
+        # Arrange
+        callback = Mock()
+        subscription = self.driver.subscribe_scope_changed(callback)
+
+        # Act
+        self.driver.edit_finished()
+
+        # Assert
+        callback.assert_not_called()
+        self.assertIsNotNone(subscription)
+
+    async def test_edit_finished_when_writing_the_deferred_edit_raises_still_ends_the_interaction(self):
+        # Arrange
+        end_interaction = self._stack.enter_context(
+            mock.patch.object(reapply_module, "end_interaction", wraps=reapply_module.end_interaction)
+        )
+        self._stack.enter_context(mock.patch.object(reapply_module, "LIVE_EDIT_SOFT_LIMIT", 0))
+        self.change_settings(size_min=40.0, size_max=40.0)
+        self._stack.enter_context(
+            mock.patch.object(reapply_module, "author_placement_transforms", side_effect=RuntimeError("write failed"))
+        )
+
+        # Act
+        with self.assertRaises(RuntimeError):
+            self.driver.edit_finished()
+
+        # Assert
+        end_interaction.assert_called_once()
+        self.assertFalse(self.driver.active)
 
     async def test_edit_finished_on_a_selection_executes_a_reapply_command_without_asking_to_fold(self):
         # Arrange

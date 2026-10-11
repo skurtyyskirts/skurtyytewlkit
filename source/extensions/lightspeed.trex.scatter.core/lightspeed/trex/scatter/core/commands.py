@@ -17,7 +17,13 @@
 
 from __future__ import annotations
 
-__all__ = ["ScatterFloodCommand", "ScatterReapplyCommand", "ScatterStrokeCommand", "ScatterStrokeKind"]
+__all__ = [
+    "ScatterFloodCommand",
+    "ScatterReapplyCommand",
+    "ScatterStrokeCommand",
+    "ScatterStrokeKind",
+    "clear_recorded_origins",
+]
 
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
@@ -27,6 +33,7 @@ import carb
 import omni.kit.commands
 from pxr import Sdf
 
+from .constants import SCATTER_ORIGIN_ATTR
 from .placement import (
     PlacementRecord,
     PlacementTransform,
@@ -205,6 +212,7 @@ class ScatterReapplyCommand(omni.kit.commands.Command):
         before: Sequence[Mapping[str, Any] | PlacementTransform],
         after: Sequence[Mapping[str, Any] | PlacementTransform],
         already_applied: bool = True,
+        unrecorded_origins: Sequence[str] | None = None,
     ):
         """Create the command.
 
@@ -214,12 +222,16 @@ class ScatterReapplyCommand(omni.kit.commands.Command):
             before: The transforms the placements had before the edit.
             after: The transforms the edit gave them.
             already_applied: True when the edit already happened live and the first ``do()`` must not repeat it.
+            unrecorded_origins: Placements that recorded no surface before the edit recorded one for them, whose
+                recorded surface ``undo()`` removes again. An empty origin in ``before`` means "leave the recorded one
+                alone", so it cannot say this itself.
         """
         self._context_name = context_name
         self._layer_identifier = layer_identifier
         self._before = _coerce_transforms(before)
         self._after = _coerce_transforms(after)
         self._skip_next_do = already_applied
+        self._unrecorded_origins = [str(path) for path in unrecorded_origins or []]
 
     def do(self) -> list[str]:
         """Author the edited transforms unless they were already authored live; returns the affected prim paths."""
@@ -229,15 +241,44 @@ class ScatterReapplyCommand(omni.kit.commands.Command):
         return self._author(self._after)
 
     def undo(self) -> None:
-        """Write the transforms the placements had before the edit back into the layer."""
-        self._author(self._before)
+        """Write the transforms the placements had before the edit back into the layer, surfaces included."""
+        self._author(self._before, self._unrecorded_origins)
 
-    def _author(self, transforms: Sequence[PlacementTransform]) -> list[str]:
-        """Author a set of transforms into the command's layer, or nothing when the layer is unavailable."""
+    def _author(self, transforms: Sequence[PlacementTransform], unrecorded_origins: Sequence[str] = ()) -> list[str]:
+        """Author a set of transforms into the command's layer, or nothing when the layer is unavailable.
+
+        Args:
+            transforms: The transforms to write.
+            unrecorded_origins: Placements whose recorded surface is removed once the transforms are written.
+
+        Returns:
+            The paths that were written.
+        """
         layer = _find_layer(self._layer_identifier)
         if layer is None:
             return []
-        return author_placement_transforms(layer, transforms)
+        written = author_placement_transforms(layer, transforms)
+        clear_recorded_origins(layer, unrecorded_origins)
+        return written
+
+
+def clear_recorded_origins(layer: Sdf.Layer, prim_paths: Sequence[str]) -> None:
+    """Remove the surface each placement recorded, so a placement that had none before an edit has none again.
+
+    Writing a placement's transform back cannot do this: ``author_placement_transforms`` reads an empty origin as
+    "leave the recorded one alone". Left behind, the surface a drag recorded would make the next settings change
+    recompose the placement where the drag had taken it, not where it stands.
+
+    Args:
+        layer: Layer holding the placements.
+        prim_paths: Placement prim paths; paths without a spec or without a recorded surface in ``layer`` are skipped.
+    """
+    with Sdf.ChangeBlock():
+        for path in prim_paths:
+            spec = layer.GetPrimAtPath(Sdf.Path(path))
+            attribute = None if spec is None else spec.attributes.get(SCATTER_ORIGIN_ATTR)
+            if attribute is not None:
+                spec.RemoveProperty(attribute)
 
 
 def _find_layer(identifier: str) -> Sdf.Layer | None:

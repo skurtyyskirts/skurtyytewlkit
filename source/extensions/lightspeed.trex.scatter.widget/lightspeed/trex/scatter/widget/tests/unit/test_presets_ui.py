@@ -193,6 +193,19 @@ class TestPresetsWidget(omni.kit.test.AsyncTestCase):
         self.assertEqual(widget.names_model.current_choice, "Pebbles")
         self.assertIsNone(prompt._window)
 
+    async def test_save_as_a_name_differing_only_in_case_keeps_one_preset_in_the_combo(self):
+        # Arrange
+        self._store_presets("Grass")
+        widget = await self._build_widget()
+
+        # Act
+        widget._save_as_named("grass")
+
+        # Assert
+        self.assertEqual(self.controller.preset_names(), ["Grass"])
+        self.assertEqual(widget.names_model.choices, ["Grass"])
+        self.assertEqual(self.controller.settings.preset_name, "Grass")
+
     async def test_save_as_prompt_accepted_hides_window_now_and_destroys_it_next_frame(self):
         # Arrange
         widget = await self._build_widget()

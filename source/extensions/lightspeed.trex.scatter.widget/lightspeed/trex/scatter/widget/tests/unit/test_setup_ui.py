@@ -26,6 +26,7 @@ import omni.kit.app
 import omni.kit.commands
 import omni.kit.test
 import omni.kit.undo
+import omni.usd
 from lightspeed.trex.scatter.core import controller as _controller_module
 from lightspeed.trex.scatter.core.controller import ScatterMode
 from lightspeed.trex.scatter.core.placement import PlacementRecord
@@ -397,9 +398,9 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         # Assert
         flood_mock.assert_called_once_with(_CONTEXT_NAME, self.pane._surface_cache)
 
-    async def test_click_flood_above_default_cap_asks_for_confirmation_before_flooding(self):
+    async def test_click_flood_that_reaches_the_prim_budget_asks_for_confirmation_before_flooding(self):
         # Arrange
-        self.controller.update_settings(flood_max_instances=1000)
+        self.controller.update_settings(flood_max_instances=1000, prim_budget=500)
 
         with (
             mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
@@ -410,11 +411,68 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
 
         # Assert
         dialog_class.assert_called_once()
+        self.assertIn("1000 prims", dialog_class.call_args.kwargs["message"])
+        flood_mock.assert_not_called()
+
+    async def test_click_flood_above_default_cap_within_the_prim_budget_floods_without_asking(self):
+        # Arrange
+        self.controller.update_settings(flood_max_instances=1000, prim_budget=10000)
+
+        with (
+            mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
+            mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class,
+        ):
+            # Act
+            self.pane._flood_button.call_clicked_fn()
+
+        # Assert
+        dialog_class.assert_not_called()
+        flood_mock.assert_called_once_with(_CONTEXT_NAME, self.pane._surface_cache)
+
+    async def test_click_flood_on_a_replicated_anchor_asks_for_confirmation_with_the_rendered_prims(self):
+        # Arrange - the default cap on an anchor shown by 40 instances renders 12000 prims, over the default budget
+        stage = _make_anchor_stage(40)
+        usd_context = SimpleNamespace(get_stage=lambda: stage)
+        cap = self.controller.settings.flood_max_instances
+        with mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context):
+            self.controller.update_settings(target_mode=TargetMode.ANCHOR, anchor_prototype_path=_ANCHOR_PROTOTYPE)
+
+        with (
+            mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
+            mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class,
+        ):
+            # Act
+            self.pane._flood_button.call_clicked_fn()
+
+        # Assert
+        dialog_class.assert_called_once()
+        self.assertIn(f"{cap * 40} prims", dialog_class.call_args.kwargs["message"])
+        flood_mock.assert_not_called()
+
+    async def test_click_flood_on_a_replicated_selection_asks_for_confirmation_with_the_rendered_prims(self):
+        # Arrange
+        stage = _make_anchor_stage(40)
+        usd_context = mock.MagicMock(name="usd_context")
+        usd_context.get_stage.return_value = stage
+        usd_context.get_selection.return_value.get_selected_prim_paths.return_value = [_ANCHOR_PROTOTYPE]
+        cap = self.controller.settings.flood_max_instances
+
+        with (
+            mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context),
+            mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
+            mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class,
+        ):
+            # Act
+            self.pane._flood_button.call_clicked_fn()
+
+        # Assert
+        dialog_class.assert_called_once()
+        self.assertIn(f"{cap * 40} prims", dialog_class.call_args.kwargs["message"])
         flood_mock.assert_not_called()
 
     async def test_confirm_flood_dialog_floods_with_pane_context_and_cache(self):
         # Arrange
-        self.controller.update_settings(flood_max_instances=1000)
+        self.controller.update_settings(flood_max_instances=1000, prim_budget=500)
 
         with (
             mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
@@ -532,6 +590,67 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         with mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context):
             # Act
             self.controller.update_settings(target_mode=TargetMode.ANCHOR, anchor_prototype_path=_ANCHOR_PROTOTYPE)
+
+        # Assert
+        self.assertEqual(self.pane._flood_estimate_label.text, f"Up to {cap * 3} prims")
+
+    async def test_flood_estimate_within_the_prim_budget_is_shown_plainly(self):
+        # Arrange
+        label = self.pane._flood_estimate_label
+
+        # Act
+        self.controller.update_settings(flood_max_instances=300, prim_budget=10000)
+
+        # Assert
+        self.assertEqual(label.name, "")
+
+    async def test_flood_estimate_that_reaches_the_prim_budget_is_shown_as_a_warning(self):
+        # Arrange
+        label = self.pane._flood_estimate_label
+
+        # Act
+        self.controller.update_settings(flood_max_instances=300, prim_budget=300)
+
+        # Assert
+        self.assertEqual(label.name, "Warning")
+
+    async def test_flood_estimate_at_the_alert_multiple_of_the_prim_budget_is_shown_as_an_error(self):
+        # Arrange
+        label = self.pane._flood_estimate_label
+
+        # Act
+        self.controller.update_settings(flood_max_instances=300, prim_budget=60)
+
+        # Assert
+        self.assertEqual(label.name, "PropertiesWidgetLabelWarning")
+
+    async def test_flood_estimate_on_a_replicated_anchor_is_judged_by_the_prims_it_renders(self):
+        # Arrange - 300 placements are within the budget, 300 on each of 40 instances are not
+        stage = _make_anchor_stage(40)
+        usd_context = SimpleNamespace(get_stage=lambda: stage)
+
+        with mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context):
+            # Act
+            self.controller.update_settings(target_mode=TargetMode.ANCHOR, anchor_prototype_path=_ANCHOR_PROTOTYPE)
+
+        # Assert
+        self.assertEqual(self.pane._flood_estimate_label.name, "Warning")
+
+    async def test_opening_a_project_counts_the_anchor_instances_again(self):
+        # Arrange - the anchor path is the same, but the project that just opened shows it on more instances
+        cap = self.controller.settings.flood_max_instances
+        one_instance = _make_anchor_stage(1)
+        with mock.patch.object(
+            _setup_ui_module.omni.usd, "get_context", return_value=SimpleNamespace(get_stage=lambda: one_instance)
+        ):
+            self.controller.update_settings(target_mode=TargetMode.ANCHOR, anchor_prototype_path=_ANCHOR_PROTOTYPE)
+        three_instances = _make_anchor_stage(3)
+
+        with mock.patch.object(
+            _setup_ui_module.omni.usd, "get_context", return_value=SimpleNamespace(get_stage=lambda: three_instances)
+        ):
+            # Act
+            self.pane._on_stage_event(SimpleNamespace(type=int(omni.usd.StageEventType.OPENED)))
 
         # Assert
         self.assertEqual(self.pane._flood_estimate_label.text, f"Up to {cap * 3} prims")

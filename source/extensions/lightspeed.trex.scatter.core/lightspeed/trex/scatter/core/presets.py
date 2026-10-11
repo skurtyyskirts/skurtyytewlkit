@@ -31,6 +31,14 @@ from .constants import PRESETS_DIR_SETTING, PRESETS_SUBDIRECTORY
 from .settings import ScatterBrushSettings
 
 _INVALID_NAME_CHARACTERS = frozenset('<>:"/\\|?*')
+# Device names Windows reserves in any case, even followed by an extension, so ``con.json`` or ``con.backup.json``
+# cannot be a preset file there.
+_RESERVED_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
+)
+# Longest preset name accepted: a longer one leaves little of the 260 characters a Windows path may hold for the
+# presets directory the file sits in.
+_MAX_NAME_LENGTH = 200
 
 
 def get_default_presets_directory() -> Path:
@@ -53,8 +61,12 @@ def _validate_preset_name(name: str) -> str:
     cleaned = name.strip()
     if not cleaned:
         raise ValueError("Preset name cannot be empty")
+    if len(cleaned) > _MAX_NAME_LENGTH:
+        raise ValueError(f"Preset name cannot be longer than {_MAX_NAME_LENGTH} characters")
     if cleaned.endswith("."):
         raise ValueError(f"Preset name '{cleaned}' cannot end with a period")
+    if cleaned.split(".", 1)[0].rstrip().upper() in _RESERVED_DEVICE_NAMES:
+        raise ValueError(f"Preset name '{cleaned}' is reserved by Windows for a device")
     invalid_characters = sorted(
         {character for character in cleaned if character in _INVALID_NAME_CHARACTERS or ord(character) < 32}
     )
@@ -68,8 +80,13 @@ class PresetStore:
     """Named brush presets stored as one JSON file per preset inside a directory.
 
     The directory is created lazily on the first save. Preset names are used verbatim as file stems, so names that
-    are empty, end with a period, or contain path separators or other characters that are invalid in file names are
-    rejected with ``ValueError``. The name recorded inside a file is always derived from the file name on load.
+    are empty, too long, end with a period, are reserved by Windows for a device, or contain path separators or other
+    characters that are invalid in file names are rejected with ``ValueError``. The name recorded inside a file is
+    always derived from the file name on load.
+
+    Two names that differ only in case name the same preset, and a stored preset keeps the spelling it was stored
+    under. On a case-insensitive filesystem they are the same file anyway, and the scatter container a preset paints
+    into is named from its lowercased name on every platform.
     """
 
     def __init__(self, directory: Path):
@@ -87,7 +104,7 @@ class PresetStore:
         return sorted(path.stem for path in self._directory.glob("*.json") if path.is_file())
 
     def exists(self, name: str) -> bool:
-        """Return whether a preset file with this name exists.
+        """Return whether a preset file with this name exists, ignoring case.
 
         Raises:
             ValueError: If the name is not a valid preset name.
@@ -119,6 +136,10 @@ class PresetStore:
     def save(self, name: str, settings: ScatterBrushSettings) -> Path:
         """Write the settings to ``<name>.json`` with ``preset_name`` set to the name and return the file path.
 
+        A stored preset whose name matches without regard to case is overwritten under its own spelling, which the
+        returned path carries. The file is written next to its destination first and then moved over it, so a write
+        that fails part way leaves the preset that was there intact.
+
         Raises:
             ValueError: If the name is not a valid preset name.
             OSError: If the file cannot be written.
@@ -127,23 +148,31 @@ class PresetStore:
         data = settings.to_json_dict()
         data["preset_name"] = path.stem
         self._directory.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temporary = path.with_name(f"{path.name}.tmp")
+        try:
+            temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
         return path
 
-    def rename(self, old: str, new: str) -> None:
-        """Move the preset file from one name to another.
+    def rename(self, old: str, new: str) -> Path:
+        """Move the preset file from one name to another and return its new path.
 
         Raises:
             ValueError: If either name is invalid, the source is missing, or a different preset already uses the new
                 name.
         """
         source = self._path_for(old)
-        destination = self._path_for(new)
+        destination = self._directory / f"{_validate_preset_name(new)}.json"
         if not source.is_file():
             raise ValueError(f"Preset '{old}' does not exist")
-        if destination.exists() and not destination.samefile(source):
+        existing = self._path_for(new)
+        if existing.exists() and not existing.samefile(source):
             raise ValueError(f"Preset '{new}' already exists")
         source.replace(destination)
+        return destination
 
     def clone(self, src: str, dst: str) -> None:
         """Copy a preset under a new name.
@@ -165,5 +194,13 @@ class PresetStore:
         self._path_for(name).unlink(missing_ok=True)
 
     def _path_for(self, name: str) -> Path:
-        """Return the file path for a validated preset name."""
-        return self._directory / f"{_validate_preset_name(name)}.json"
+        """Return the file path for a validated preset name, in the spelling of the stored preset it names.
+
+        An exact match wins, so presets that differ only in case on a case-sensitive filesystem each stay reachable.
+        """
+        cleaned = _validate_preset_name(name)
+        stored = self.list_names()
+        if cleaned not in stored:
+            folded = cleaned.casefold()
+            cleaned = next((candidate for candidate in stored if candidate.casefold() == folded), cleaned)
+        return self._directory / f"{cleaned}.json"

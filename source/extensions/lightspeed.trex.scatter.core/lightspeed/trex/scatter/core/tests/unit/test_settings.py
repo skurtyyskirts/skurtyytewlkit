@@ -217,6 +217,63 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(loaded.radius, 50.0)
 
+    async def test_load_from_carb_with_one_out_of_range_value_keeps_every_other_setting(self):
+        # Arrange
+        persisted = {"radius": -1, "density": 2.0, "preset_name": "Rocks"}
+        interface, _ = _make_settings_interface({constants_module.BRUSH_SETTINGS_PATH: json.dumps(persisted)})
+
+        # Act
+        loaded = settings_module.ScatterBrushSettings.load_from_carb(interface)
+
+        # Assert
+        self.assertEqual((loaded.radius, loaded.density, loaded.preset_name), (50.0, 2.0, "Rocks"))
+
+    async def test_load_from_carb_with_an_inverted_range_resets_only_that_range(self):
+        # Arrange - the model reports an inverted pair as a whole, without naming either end
+        persisted = {"size_min": 30.0, "size_max": 20.0, "radius": 80.0}
+        interface, _ = _make_settings_interface({constants_module.BRUSH_SETTINGS_PATH: json.dumps(persisted)})
+
+        # Act
+        loaded = settings_module.ScatterBrushSettings.load_from_carb(interface)
+
+        # Assert
+        self.assertEqual((loaded.size_min, loaded.size_max, loaded.radius), (10.0, 15.0, 80.0))
+
+    async def test_load_from_carb_with_a_dropped_end_that_inverts_its_range_resets_the_whole_range(self):
+        # Arrange - size_max is invalid on its own, and its default would sit below the persisted size_min
+        persisted = {"size_min": 30.0, "size_max": -1.0, "radius": 80.0}
+        interface, _ = _make_settings_interface({constants_module.BRUSH_SETTINGS_PATH: json.dumps(persisted)})
+
+        # Act
+        loaded = settings_module.ScatterBrushSettings.load_from_carb(interface)
+
+        # Assert
+        self.assertEqual((loaded.size_min, loaded.size_max, loaded.radius), (10.0, 15.0, 80.0))
+
+    async def test_load_from_carb_with_an_invalid_value_logs_the_setting_it_reset(self):
+        # Arrange
+        persisted = {"radius": -1, "density": 2.0}
+        interface, _ = _make_settings_interface({constants_module.BRUSH_SETTINGS_PATH: json.dumps(persisted)})
+
+        with mock.patch.object(settings_module.carb, "log_warn") as log_warn:
+            # Act
+            settings_module.ScatterBrushSettings.load_from_carb(interface)
+
+        # Assert
+        log_warn.assert_called_once()
+        self.assertIn("radius", log_warn.call_args.args[0])
+        self.assertNotIn("density", log_warn.call_args.args[0])
+
+    async def test_load_from_carb_with_a_non_object_value_returns_defaults(self):
+        # Arrange
+        interface, _ = _make_settings_interface({constants_module.BRUSH_SETTINGS_PATH: json.dumps([1, 2, 3])})
+
+        # Act
+        loaded = settings_module.ScatterBrushSettings.load_from_carb(interface)
+
+        # Assert
+        self.assertEqual(loaded, settings_module.ScatterBrushSettings())
+
     async def test_load_from_carb_with_missing_value_returns_defaults(self):
         # Arrange
         interface, _ = _make_settings_interface()
@@ -475,6 +532,38 @@ class TestAssetsCarbPersistence(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(loaded, [])
+
+    async def test_load_assets_from_carb_with_one_invalid_entry_keeps_the_valid_ones(self):
+        # Arrange - the palette is written back as soon as it changes, so dropping it whole would lose it for good
+        persisted = [
+            {"path": "C:/assets/rock.usd"},
+            {"weight": 1},
+            {"path": "C:/assets/grass.usd", "meters_per_unit": 0.0},
+            {"path": "C:/assets/pebble.usd", "weight": 2.0},
+        ]
+        interface, _ = _make_settings_interface({constants_module.ASSETS_SETTING_PATH: json.dumps(persisted)})
+
+        # Act
+        loaded = settings_module.load_assets_from_carb(interface)
+
+        # Assert
+        self.assertEqual([entry.path for entry in loaded], ["C:/assets/rock.usd", "C:/assets/pebble.usd"])
+
+    async def test_load_assets_from_carb_with_invalid_entries_logs_which_ones_were_dropped(self):
+        # Arrange
+        persisted = [{"path": "C:/assets/rock.usd"}, {"weight": 1}, {"path": "C:/assets/grass.usd", "weight": -1}]
+        interface, _ = _make_settings_interface({constants_module.ASSETS_SETTING_PATH: json.dumps(persisted)})
+
+        with mock.patch.object(settings_module.carb, "log_warn") as log_warn:
+            # Act
+            settings_module.load_assets_from_carb(interface)
+
+        # Assert
+        log_warn.assert_called_once()
+        message = log_warn.call_args.args[0]
+        self.assertIn("entry 1", message)
+        self.assertIn("C:/assets/grass.usd", message)
+        self.assertNotIn("C:/assets/rock.usd", message)
 
     async def test_load_assets_from_carb_with_missing_value_returns_empty_list(self):
         # Arrange

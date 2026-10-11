@@ -30,8 +30,15 @@ from lightspeed.trex.scatter.core.constants import (
     IS_REMIX_SCATTER_ATTR,
     SCATTER_ASSET_ATTR,
     SCATTER_BRUSH_ID_ATTR,
+    SCATTER_ORIGIN_ATTR,
 )
-from lightspeed.trex.scatter.core.placement import PlacementRecord, author_placements, remove_placements, snapshot_prims
+from lightspeed.trex.scatter.core.placement import (
+    PlacementRecord,
+    PlacementTransform,
+    author_placements,
+    remove_placements,
+    snapshot_prims,
+)
 from pxr import Gf, Sdf, Usd
 
 _PROTOTYPE_ROOT = "/RootNode/meshes/mesh_0123456789ABCDEF"
@@ -629,3 +636,89 @@ class TestScatterFloodCommand(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertIsNone(self._layer.GetPrimAtPath(shader_path))
+
+
+class TestScatterReapplyCommand(omni.kit.test.AsyncTestCase):
+    """An edit of placements that already exist, undone and redone as one step, surfaces included."""
+
+    async def setUp(self):
+        # The extension registers these commands on startup; register them here too so the test is self-contained,
+        # and restore that startup registration in tearDown so later tests in the same process still find them.
+        self._commands_were_registered = omni.kit.commands.get_command_class("ScatterStroke") is not None
+        self._registered = omni.kit.commands.register_all_commands_in_module(_commands)
+        omni.kit.undo.clear_stack()
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._asset = _write_asset(self._temp_dir, "cube.usda")
+        self._stage = _new_stage_with_prototype()
+        self._layer = self._stage.GetRootLayer()
+        self._record = _make_record("s_000000000001", self._asset, translate=(1.0, 2.0, 3.0))
+        author_placements(self._layer, [self._record])
+
+    async def tearDown(self):
+        omni.kit.undo.clear_stack()
+        omni.kit.commands.unregister_module_commands(self._registered)
+        if self._commands_were_registered:
+            omni.kit.commands.register_all_commands_in_module(_commands)
+        self._stage = None
+        self._layer = None
+        self._temp_dir.cleanup()
+
+    def _transform(self, translate: tuple[float, float, float], origin: tuple[float, ...] = ()) -> PlacementTransform:
+        """The placement's transform at ``translate``, recording ``origin`` as its surface unless it is empty."""
+        return PlacementTransform(
+            prim_path=self._record.prim_path,
+            translate=translate,
+            rotate_xyz=self._record.rotate_xyz,
+            scale=self._record.scale,
+            origin=origin,
+        )
+
+    def _execute_move(self, unrecorded_origins: list[str] | None = None) -> None:
+        """Move the placement, which recorded no surface, and record one for it, as a drag of the gizmo does."""
+        omni.kit.commands.execute(
+            "ScatterReapplyCommand",
+            context_name="",
+            layer_identifier=self._layer.identifier,
+            before=[self._transform((1.0, 2.0, 3.0))],
+            after=[self._transform((31.0, 2.0, 3.0), origin=(31.0, 2.0, 0.0, 0.0, 0.0, 1.0))],
+            already_applied=False,
+            unrecorded_origins=unrecorded_origins,
+        )
+
+    def _recorded_origin(self):
+        """Return the surface the placement records, or None when it records none."""
+        attribute = self._layer.GetPrimAtPath(self._record.prim_path).attributes.get(SCATTER_ORIGIN_ATTR)
+        return None if attribute is None else attribute.default
+
+    async def test_undo_of_an_edit_of_a_placement_that_recorded_no_surface_removes_the_one_it_recorded(self):
+        # Arrange
+        self._execute_move(unrecorded_origins=[self._record.prim_path])
+
+        # Act
+        omni.kit.undo.undo()
+
+        # Assert
+        self.assertIsNone(self._recorded_origin())
+        spec = self._layer.GetPrimAtPath(self._record.prim_path)
+        self.assertEqual(spec.attributes["xformOp:translate"].default, Gf.Vec3d(1.0, 2.0, 3.0))
+
+    async def test_undo_of_an_edit_without_unrecorded_origins_leaves_the_recorded_surface_alone(self):
+        # Arrange - a settings edit never records a surface, so its undo must not take one away
+        self._execute_move()
+
+        # Act
+        omni.kit.undo.undo()
+
+        # Assert
+        self.assertEqual(tuple(self._recorded_origin()), (31.0, 2.0, 0.0, 0.0, 0.0, 1.0))
+
+    async def test_redo_of_an_edit_of_a_placement_that_recorded_no_surface_records_it_again(self):
+        # Arrange
+        self._execute_move(unrecorded_origins=[self._record.prim_path])
+        omni.kit.undo.undo()
+
+        # Act
+        omni.kit.undo.redo()
+
+        # Assert
+        self.assertEqual(tuple(self._recorded_origin()), (31.0, 2.0, 0.0, 0.0, 0.0, 1.0))

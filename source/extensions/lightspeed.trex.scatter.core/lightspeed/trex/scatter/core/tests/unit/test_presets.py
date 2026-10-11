@@ -228,6 +228,110 @@ class TestPresetStore(omni.kit.test.AsyncTestCase):
                 with self.assertRaises(ValueError):
                     self.store.save(name, settings)
 
+    async def test_save_with_a_name_windows_reserves_for_a_device_raises_value_error(self):
+        for name in ("CON", "con", "Nul", "aux", "PRN", "COM1", "com9", "LPT1", "lpt9", "con.backup", "NUL .old"):
+            with self.subTest(title=f"name={name!r}"):
+                # Arrange
+                settings = ScatterBrushSettings()
+
+                # Act / Assert
+                with self.assertRaises(ValueError):
+                    self.store.save(name, settings)
+
+    async def test_save_with_a_name_that_only_starts_like_a_device_name_is_accepted(self):
+        for name in ("Console", "COM10", "Auxiliary", "nul_rocks"):
+            with self.subTest(title=f"name={name!r}"):
+                # Arrange
+                settings = ScatterBrushSettings()
+
+                # Act
+                path = self.store.save(name, settings)
+
+                # Assert
+                self.assertTrue(path.is_file())
+
+    async def test_save_with_a_name_over_the_length_limit_raises_value_error(self):
+        # Arrange
+        name = "a" * 201
+
+        # Act / Assert
+        with self.assertRaises(ValueError):
+            self.store.save(name, ScatterBrushSettings())
+
+    async def test_save_leaves_no_temporary_file_beside_the_preset(self):
+        # Arrange
+        settings = ScatterBrushSettings(radius=77.0)
+
+        # Act
+        self.store.save("Grass", settings)
+
+        # Assert
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["Grass.json"])
+
+    async def test_save_when_the_write_fails_keeps_the_preset_that_was_there(self):
+        # Arrange
+        self.store.save("Grass", ScatterBrushSettings(radius=77.0))
+
+        with mock.patch.object(presets_module.Path, "replace", side_effect=OSError("disk full")):
+            # Act
+            with self.assertRaises(OSError):
+                self.store.save("Grass", ScatterBrushSettings(radius=12.0))
+
+        # Assert
+        self.assertEqual(self.store.load("Grass").radius, 77.0)
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["Grass.json"])
+
+    async def test_save_with_a_name_differing_only_in_case_overwrites_the_stored_preset(self):
+        # Arrange
+        self.store.save("Grass", ScatterBrushSettings(radius=77.0))
+
+        # Act
+        path = self.store.save("grass", ScatterBrushSettings(radius=12.0))
+
+        # Assert - compared by name, since a Windows path compares equal whatever its case
+        self.assertEqual(path.name, "Grass.json")
+        self.assertEqual(self.store.list_names(), ["Grass"])
+        self.assertEqual(self.store.load("Grass").radius, 12.0)
+
+    async def test_load_with_a_name_differing_only_in_case_names_the_preset_as_it_is_stored(self):
+        # Arrange
+        self.store.save("Grass", ScatterBrushSettings())
+
+        # Act
+        loaded = self.store.load("GRASS")
+
+        # Assert
+        self.assertEqual(loaded.preset_name, "Grass")
+
+    async def test_clone_onto_a_name_differing_only_in_case_from_another_preset_raises_value_error(self):
+        # Arrange
+        self.store.save("Rocks", ScatterBrushSettings())
+        self.store.save("Grass", ScatterBrushSettings())
+
+        # Act / Assert
+        with self.assertRaises(ValueError):
+            self.store.clone("Rocks", "grass")
+
+    async def test_rename_onto_a_name_differing_only_in_case_from_another_preset_raises_value_error(self):
+        # Arrange
+        self.store.save("Rocks", ScatterBrushSettings())
+        self.store.save("Grass", ScatterBrushSettings())
+
+        # Act / Assert
+        with self.assertRaises(ValueError):
+            self.store.rename("Rocks", "GRASS")
+
+    async def test_rename_returns_the_path_the_preset_now_has(self):
+        # Arrange
+        self.store.save("Old", ScatterBrushSettings())
+
+        # Act
+        path = self.store.rename("Old", " New ")
+
+        # Assert
+        self.assertEqual(path.name, "New.json")
+        self.assertTrue(path.is_file())
+
     async def test_save_with_invalid_name_does_not_create_files(self):
         # Arrange
         settings = ScatterBrushSettings()

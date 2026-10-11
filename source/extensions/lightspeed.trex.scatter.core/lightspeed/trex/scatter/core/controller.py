@@ -98,6 +98,15 @@ def _input_display_name(input_name: str) -> str:
     return input_name.removeprefix("inputs:")
 
 
+def _asset_signature(path: str) -> tuple[bool, str]:
+    """Return what has to change before an asset that failed to resolve is worth reading again.
+
+    A missing file can come back, and an asset ingested again with new content records a new ingestion hash. While
+    neither has happened, reading the file again fails the way it did the last time.
+    """
+    return OmniUrl(path).exists, asset_source_hash(path)
+
+
 def _with_ranges_ordered(current: dict, updates: dict) -> dict:
     """Merge ``updates`` into ``current``, moving the untouched end of an inverted low/high pair out of the way.
 
@@ -159,6 +168,10 @@ class ScatterBrushController:
         self._stroke_index = 0
         # Paths already reported as disagreeing with their file, so a stroke does not repeat the warning.
         self._up_axis_warned: set[str] = set()
+        # Per palette path, the signature of the asset when its textures or its measurement last failed to resolve,
+        # so a stroke does not read a file again that would fail the same way.
+        self._unresolved_textures: dict[str, tuple[bool, str]] = {}
+        self._unmeasured: dict[str, tuple[bool, str]] = {}
         self._picker_factory: Callable[[object, MeshSurfaceCache], SurfacePicker] | None = None
 
         # The turn the viewport gizmo and the Scatter window's turn fields have between them put on one patch,
@@ -303,6 +316,10 @@ class ScatterBrushController:
         Entries restored from carb never went through ``add_asset``, so this is what fills them in. Call it when the
         palette is displayed or before a flood, never from the ``assets`` properties, which run on every UI refresh.
 
+        An entry whose file could not be resolved at all is only tried again once the file appears or is re-ingested,
+        and only an entry whose texture set actually changed counts as changed. This runs on every stroke, and a
+        change is persisted and broadcast to the window and the live-edit driver.
+
         Returns:
             Whether any entry changed.
         """
@@ -311,7 +328,17 @@ class ScatterBrushController:
             texture_set = entry.textures
             if texture_set is not None and texture_set.source_hash == asset_source_hash(entry.path):
                 continue
-            entry.textures = resolve_asset_texture_set(entry.path, entry.texture_source)
+            signature = _asset_signature(entry.path)
+            if texture_set is None and self._unresolved_textures.get(entry.path) == signature:
+                continue
+            resolved = resolve_asset_texture_set(entry.path, entry.texture_source)
+            if resolved is None:
+                self._unresolved_textures[entry.path] = signature
+            else:
+                self._unresolved_textures.pop(entry.path, None)
+            if resolved == texture_set:
+                continue
+            entry.textures = resolved
             changed = True
         if changed:
             self._assets_changed()
@@ -324,6 +351,9 @@ class ScatterBrushController:
         measurement the brush cannot turn a target height into a scale, so an unmeasured asset falls back to its own
         size instead of being placed at the height the user asked for.
 
+        An entry that could not be measured is only measured again once its file appears or is re-ingested, because
+        this runs on every stroke and an attempt can open the whole asset.
+
         Returns:
             Whether any entry changed.
         """
@@ -331,12 +361,17 @@ class ScatterBrushController:
         for entry in self._assets:
             if entry.natural_extent != (0.0, 0.0, 0.0):
                 continue
+            signature = _asset_signature(entry.path)
+            if self._unmeasured.get(entry.path) == signature:
+                continue
             extent = read_asset_natural_extent(entry.path)
             if extent == (0.0, 0.0, 0.0):
-                # Left unmeasured rather than recorded as measured-and-empty, so the next call retries once the file
-                # is readable again. Staying silent is deliberate: this runs on every stroke, and an asset that is
-                # simply gone is already reported by the palette.
+                # Left unmeasured rather than recorded as measured-and-empty, so it is measured again once the file
+                # changes. Staying silent is deliberate: this runs on every stroke, and an asset that is simply gone
+                # is already reported by the palette.
+                self._unmeasured[entry.path] = signature
                 continue
+            self._unmeasured.pop(entry.path, None)
             entry.meters_per_unit = read_asset_meters_per_unit(entry.path)
             entry.natural_extent = extent
             changed = True
@@ -399,29 +434,34 @@ class ScatterBrushController:
     def save_preset(self, name: str | None = None) -> bool:
         """Store the current settings as a preset, under ``name`` or the current preset name.
 
-        A new name becomes the current ``preset_name`` once the file is written. Returns False and posts an error when
-        the name is invalid or the file cannot be written.
+        The name the file is stored under becomes the current ``preset_name`` once it is written. That is the spelling
+        of a stored preset the name matches without regard to case, so saving "grass" over "Grass" keeps one preset
+        rather than listing both. Returns False and posts an error when the name is invalid or the file cannot be
+        written.
         """
         preset_name = name or self._settings.preset_name
         updated = self._settings.model_copy(update={"preset_name": preset_name})
         try:
-            self._presets.save(preset_name, updated)
+            stored_name = self._presets.save(preset_name, updated).stem
         except (ValueError, OSError) as exc:
             self.post_status(f"Cannot save preset '{preset_name}': {exc}", is_error=True)
             return False
-        if preset_name != self._settings.preset_name:
-            self._set_settings(updated)
+        if stored_name != self._settings.preset_name:
+            self._set_settings(updated.model_copy(update={"preset_name": stored_name}))
         return True
 
     def rename_preset(self, old: str, new: str) -> bool:
-        """Rename a stored preset, following the current ``preset_name`` when it matches."""
+        """Rename a stored preset, following the current ``preset_name`` when it names the same preset.
+
+        Preset names are matched without regard to case, the way the store matches them to their files.
+        """
         try:
-            self._presets.rename(old, new)
+            stored_name = self._presets.rename(old, new).stem
         except (ValueError, OSError) as exc:
             self.post_status(f"Cannot rename preset '{old}': {exc}", is_error=True)
             return False
-        if self._settings.preset_name == old:
-            self._set_settings(self._settings.model_copy(update={"preset_name": new}))
+        if self._settings.preset_name.casefold() == old.strip().casefold():
+            self._set_settings(self._settings.model_copy(update={"preset_name": stored_name}))
         return True
 
     def clone_preset(self, src: str, dst: str) -> bool:

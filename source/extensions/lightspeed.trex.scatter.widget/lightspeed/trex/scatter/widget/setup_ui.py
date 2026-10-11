@@ -31,6 +31,7 @@ from lightspeed.trex.scatter.core import (
     EraseScope,
     Falloff,
     MeshSurfaceCache,
+    PrimBudgetStatus,
     ReapplyScope,
     ScaleMode,
     ScatterBrushSettings,
@@ -40,6 +41,8 @@ from lightspeed.trex.scatter.core import (
     get_reapply_driver,
     get_scatter_brush_controller,
     instance_count,
+    prim_budget_status,
+    selected_prototypes,
     turn_matrix,
     validated_anchor_prototype,
 )
@@ -85,8 +88,13 @@ _BASE_ROTATION_TOOLTIP = (
 _TURN_LIMIT = 360.0
 _STATUS_STYLE = "PropertiesPaneSectionTreeItem"
 _STATUS_ERROR_STYLE = "PropertiesPaneSectionTreeItemError"
-# Floods above the default cap can take a while to author and render, so they ask for confirmation first.
-_FLOOD_CONFIRM_THRESHOLD = ScatterBrushSettings.model_fields["flood_max_instances"].default
+# Label names that colour the flood estimate the way the viewport stroke counter is coloured: plain within the prim
+# budget, the warning colour from the budget upward, and the error colour from the alert multiple of it upward.
+_BUDGET_LABEL_NAMES = {
+    PrimBudgetStatus.OK: "",
+    PrimBudgetStatus.WARNING: "Warning",
+    PrimBudgetStatus.ALERT: "PropertiesWidgetLabelWarning",
+}
 
 
 def _enum_labels(members: tuple[Enum, ...]) -> list[str]:
@@ -189,6 +197,14 @@ class ScatterPane(_WorkspaceWidget):
         self._status_message_sub = self._controller.subscribe_status_message(self._on_status_message)
         self._scope_changed_sub = self._reapply_driver.subscribe_scope_changed(self._on_scope_changed)
         self._selection_turn_sub = self._controller.subscribe_selection_turn_changed(self._on_selection_turn_changed)
+        usd_context = omni.usd.get_context(context_name)
+        self._stage_event_sub = (
+            None
+            if usd_context is None
+            else usd_context.get_stage_event_stream().create_subscription_to_pop(
+                self._on_stage_event, name="ScatterPane"
+            )
+        )
 
     def __create_ui(self):
         settings = self._controller.settings
@@ -520,7 +536,9 @@ class ScatterPane(_WorkspaceWidget):
                         identifier="scatter_flood_estimate",
                         tooltip=(
                             "Most prims one flood adds: the flood cap, multiplied in Anchor mode by the number of "
-                            "instances that show the anchor prototype."
+                            "instances that show the anchor prototype.\n\n"
+                            "It is highlighted once it reaches the prim budget, and a flood that reaches the budget "
+                            "asks before it runs."
                         ),
                     )
                 budget_tooltip = (
@@ -861,21 +879,58 @@ class ScatterPane(_WorkspaceWidget):
         self._status_label.style_type_name_override = _STATUS_ERROR_STYLE if is_error else _STATUS_STYLE
 
     def _on_flood_clicked(self):
-        """Flood the default targets, after a confirmation when the cap exceeds the default."""
-        cap = self._controller.settings.flood_max_instances
+        """Flood the default targets, after a confirmation when the prims the flood can render reach the prim budget.
+
+        The figure is rendered prims rather than placements: a placement under a prototype renders once for every
+        instance of it, so a cap that looks small can render far more than the budget. The confirmation only says
+        what the flood costs; accepting it always runs the flood.
+        """
+        settings = self._controller.settings
+        cap = settings.flood_max_instances
+        instances = self._flood_instance_count()
+        rendered = cap * instances
         flood = functools.partial(self._controller.flood, self._context_name, self._surface_cache)
-        if cap <= _FLOOD_CONFIRM_THRESHOLD:
+        if prim_budget_status(rendered, settings.prim_budget) == PrimBudgetStatus.OK:
             flood()
             return
+        replicated = (
+            f": up to {cap} placements, each shown by {instances} instances of its prototype" if instances > 1 else ""
+        )
         _TrexMessageDialog(
             message=(
-                f"Flooding can create up to {cap} placements, which may take a while to author and to render.\n\n"
+                f"This flood can render up to {rendered} prims{replicated}. That reaches the prim budget of "
+                f"{settings.prim_budget}, so it may take a while to author and to render.\n\n"
                 "Continue with the flood?"
             ),
             title="Flood Surfaces",
             ok_label="Flood",
             ok_handler=flood,
         )
+
+    def _flood_instance_count(self) -> int:
+        """Return how many times each placement of a flood renders: once per instance of the prototype it fills.
+
+        In Anchor mode that is the anchor's count, kept as the anchor changes. Otherwise the flood fills the selected
+        prototypes, and the one with the most instances is what a placement can cost at most.
+        """
+        if self._controller.settings.target_mode == TargetMode.ANCHOR:
+            return max(1, self._anchor_instance_count)
+        usd_context = omni.usd.get_context(self._context_name)
+        stage = None if usd_context is None else usd_context.get_stage()
+        if stage is None:
+            return 1
+        return max([1, *(instance_count(stage, prototype) for prototype in selected_prototypes(usd_context))])
+
+    def _on_stage_event(self, event):
+        """Count the anchor's instances again once a project opens or closes, so the flood estimate is about it.
+
+        Args:
+            event: Stage event of the pane's USD context.
+        """
+        if event.type not in (int(omni.usd.StageEventType.OPENED), int(omni.usd.StageEventType.CLOSED)):
+            return
+        if self.window_visible:
+            self.__refresh_derived(self._controller.settings, force_instance_warning=True)
 
     def _on_reroll_clicked(self):
         """Replace the seed with a fresh 31-bit value."""
@@ -910,6 +965,7 @@ class ScatterPane(_WorkspaceWidget):
         self._status_message_sub = None
         self._scope_changed_sub = None
         self._selection_turn_sub = None
+        self._stage_event_sub = None
         self._paint_sub = None
         self._erase_sub = None
         self._field_subs.clear()
@@ -986,7 +1042,9 @@ class ScatterPane(_WorkspaceWidget):
             prims = settings.flood_max_instances * self._anchor_instance_count
             self._flood_estimate_label.text = f"Up to {prims} prims"
         else:
-            self._flood_estimate_label.text = f"Up to {settings.flood_max_instances} prims per instance"
+            prims = settings.flood_max_instances
+            self._flood_estimate_label.text = f"Up to {prims} prims per instance"
+        self._flood_estimate_label.name = _BUDGET_LABEL_NAMES[prim_budget_status(prims, settings.prim_budget)]
 
     def __refresh_instance_warning(self, settings: ScatterBrushSettings, force: bool):
         # Counting instances walks /RootNode/instances, so only redo it when the anchor inputs change.

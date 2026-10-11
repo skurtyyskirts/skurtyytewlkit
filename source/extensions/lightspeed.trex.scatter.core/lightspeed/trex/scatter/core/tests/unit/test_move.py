@@ -28,7 +28,7 @@ from lightspeed.trex.scatter.core.constants import (
 )
 from lightspeed.trex.scatter.core.move import MoveOutcome, ScopeDragSession, move_scope, prepare_move, scope_pivot
 from lightspeed.trex.scatter.core.sampling import turn_matrix, turn_to_degrees
-from lightspeed.trex.scatter.core.placement import PlacementTransform, author_placement_transforms
+from lightspeed.trex.scatter.core.placement import PlacementTransform, author_placement_transforms, remove_placements
 from lightspeed.trex.scatter.core.reapply import reapply_transforms
 from lightspeed.trex.scatter.core.sampling import twist_degrees
 from lightspeed.trex.scatter.core.targets import build_prototype_target
@@ -750,3 +750,134 @@ class TestScopeDragSession(_MoveTestCase):
         self.execute.assert_not_called()
         self.brush.folds_into_preview.assert_called_once_with("", self.layer.identifier, _scope_of(self.grass))
         self.assertTrue(all(abs(dx - 30.0) < 1e-6 and abs(dy - 40.0) < 1e-6 for dx, dy in self.offsets_from(before)))
+
+    async def test_commit_after_the_preview_ended_mid_drag_still_folds_the_drag_it_opened_on_the_preview(self):
+        # Arrange - undoing the stroke ends its preview while the drag is still open
+        self.brush.folds_into_preview.return_value = True
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+        self.brush.folds_into_preview.return_value = False
+
+        # Act
+        session.commit()
+
+        # Assert
+        self.execute.assert_not_called()
+
+    async def test_commit_of_a_drag_whose_placements_were_all_removed_executes_no_command(self):
+        # Arrange
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+        remove_placements(self.layer, self.grass)
+
+        # Act
+        session.commit()
+
+        # Assert
+        self.execute.assert_not_called()
+
+    async def test_commit_of_a_drag_with_a_removed_placement_commits_only_the_placements_left(self):
+        # Arrange
+        self.assertGreater(len(self.grass), 1, "the test needs a placement left once one is removed")
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+        remove_placements(self.layer, self.grass[:1])
+
+        # Act
+        session.commit()
+
+        # Assert
+        kwargs = self.execute.call_args.kwargs
+        self.assertEqual([transform.prim_path for transform in kwargs["after"]], self.grass[1:])
+        self.assertEqual([transform.prim_path for transform in kwargs["before"]], self.grass[1:])
+
+    async def test_begin_with_a_drag_still_open_commits_that_drag(self):
+        # Arrange - a drag whose end never arrived, because the gizmo was hidden in the middle of it
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Act
+        session.begin(_scope_of(self.grass), conform=True)
+
+        # Assert
+        self.execute.assert_called_once()
+        self.assertEqual(self.execute.call_args.args[0], "ScatterReapplyCommand")
+
+    async def test_begin_with_a_drag_still_open_ends_the_interaction_of_that_drag(self):
+        # Arrange
+        self._stack.enter_context(mock.patch.object(move_module, "begin_interaction", side_effect=["first", "second"]))
+        end_interaction = self._stack.enter_context(mock.patch.object(move_module, "end_interaction"))
+        session = self.open_drag()
+
+        # Act
+        session.begin(_scope_of(self.grass), conform=True)
+
+        # Assert
+        end_interaction.assert_called_once_with("first")
+        self.assertTrue(session.active)
+
+    async def test_commit_when_writing_the_last_step_raises_still_ends_the_interaction(self):
+        # Arrange
+        end_interaction = self._stack.enter_context(
+            mock.patch.object(move_module, "end_interaction", wraps=move_module.end_interaction)
+        )
+        session = self.open_drag(soft_limit=len(self.grass) - 1)
+        session.update(_translate(30.0, 40.0, 0.0))
+        self._stack.enter_context(
+            mock.patch.object(move_module, "author_placement_transforms", side_effect=RuntimeError("write failed"))
+        )
+
+        # Act
+        with self.assertRaises(RuntimeError):
+            session.commit()
+
+        # Assert
+        end_interaction.assert_called_once()
+        self.assertFalse(session.active)
+
+    async def test_cancel_when_writing_the_start_back_raises_still_ends_the_interaction(self):
+        # Arrange
+        end_interaction = self._stack.enter_context(
+            mock.patch.object(move_module, "end_interaction", wraps=move_module.end_interaction)
+        )
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+        self._stack.enter_context(
+            mock.patch.object(move_module, "author_placement_transforms", side_effect=RuntimeError("write failed"))
+        )
+
+        # Act
+        with self.assertRaises(RuntimeError):
+            session.cancel()
+
+        # Assert
+        end_interaction.assert_called_once()
+        self.assertFalse(session.active)
+
+    async def test_cancel_of_a_drag_on_a_placement_that_recorded_no_surface_leaves_it_recording_none(self):
+        # Arrange - painted before the brush recorded surfaces; the drag records one for it at every step
+        legacy = self.grass[0]
+        spec = self.layer.GetPrimAtPath(Sdf.Path(legacy))
+        spec.RemoveProperty(spec.attributes[SCATTER_ORIGIN_ATTR])
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Act
+        session.cancel()
+
+        # Assert
+        self.assertIsNone(self.attribute(legacy, SCATTER_ORIGIN_ATTR))
+
+    async def test_commit_of_a_drag_on_a_placement_without_a_surface_tells_the_undo_to_remove_its_new_one(self):
+        # Arrange
+        legacy = self.grass[0]
+        spec = self.layer.GetPrimAtPath(Sdf.Path(legacy))
+        spec.RemoveProperty(spec.attributes[SCATTER_ORIGIN_ATTR])
+        session = self.open_drag()
+        session.update(_translate(30.0, 40.0, 0.0))
+
+        # Act
+        session.commit()
+
+        # Assert
+        self.assertEqual(self.execute.call_args.kwargs["unrecorded_origins"], [legacy])

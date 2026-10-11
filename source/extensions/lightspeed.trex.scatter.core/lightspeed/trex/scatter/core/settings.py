@@ -50,6 +50,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from .constants import ASSETS_SETTING_PATH, BRUSH_SETTINGS_PATH, DEFAULT_PRESET_NAME
 
+_LOG_PREFIX = "[lightspeed.trex.scatter.core]"
+
 
 class Falloff(StrEnum):
     """Acceptance curve applied to samples as a function of normalized distance from the brush center."""
@@ -364,15 +366,43 @@ class ScatterBrushSettings(BaseModel):
 
     @classmethod
     def load_from_carb(cls, settings: carb.settings.ISettings | None = None) -> ScatterBrushSettings:
+        """Read the persisted brush settings, keeping every valid one when some of them are not.
+
+        A value that fails validation is dropped on its own and takes its default, so one bad field cannot throw
+        away every other setting the user had. Defaults are only used throughout when the persisted value is not a
+        JSON object, or when what is left still fails validation.
+
+        Args:
+            settings: Settings interface to read from; the application's when omitted.
+
+        Returns:
+            The persisted settings, with defaults in place of whatever was missing or invalid.
+        """
         settings = settings or carb.settings.get_settings()
         raw = settings.get(BRUSH_SETTINGS_PATH)
         if not raw or not isinstance(raw, str):
             return cls()
         try:
-            return cls.from_json_dict(json.loads(raw))
-        except (ValueError, TypeError, ValidationError) as exc:
-            carb.log_warn(f"[lightspeed.trex.scatter.core] Ignoring invalid persisted brush settings: {exc}")
+            data = json.loads(raw)
+        except ValueError as exc:
+            carb.log_warn(f"{_LOG_PREFIX} Ignoring invalid persisted brush settings: {exc}")
             return cls()
+        if not isinstance(data, dict):
+            carb.log_warn(f"{_LOG_PREFIX} Ignoring persisted brush settings that are not a JSON object")
+            return cls()
+        try:
+            return cls.from_json_dict(data)
+        except ValidationError as exc:
+            dropped = _failing_fields(exc, data)
+        try:
+            recovered = cls.from_json_dict({name: value for name, value in data.items() if name not in dropped})
+        except ValidationError as exc:
+            carb.log_warn(f"{_LOG_PREFIX} Ignoring invalid persisted brush settings: {exc}")
+            return cls()
+        carb.log_warn(
+            f"{_LOG_PREFIX} Reset invalid persisted brush settings to their defaults: {', '.join(sorted(dropped))}"
+        )
+        return recovered
 
 
 def prim_budget_status(rendered_prims: int, budget: int) -> PrimBudgetStatus:
@@ -401,13 +431,69 @@ def save_assets_to_carb(assets: Sequence[ScatterAssetEntry], settings: carb.sett
 
 
 def load_assets_from_carb(settings: carb.settings.ISettings | None = None) -> list[ScatterAssetEntry]:
+    """Read the persisted brush palette, keeping every valid entry when some of them are not.
+
+    The palette is written back whenever it changes, so dropping it whole for one bad entry would lose every other
+    asset for good.
+
+    Args:
+        settings: Settings interface to read from; the application's when omitted.
+
+    Returns:
+        The valid entries in palette order; empty when nothing is persisted or the value is not a JSON list.
+    """
     settings = settings or carb.settings.get_settings()
     raw = settings.get(ASSETS_SETTING_PATH)
     if not raw or not isinstance(raw, str):
         return []
     try:
         data = json.loads(raw)
-        return [ScatterAssetEntry.model_validate(entry) for entry in data]
-    except (ValueError, TypeError, ValidationError) as exc:
-        carb.log_warn(f"[lightspeed.trex.scatter.core] Ignoring invalid persisted brush assets: {exc}")
+    except ValueError as exc:
+        carb.log_warn(f"{_LOG_PREFIX} Ignoring invalid persisted brush assets: {exc}")
         return []
+    if not isinstance(data, list):
+        carb.log_warn(f"{_LOG_PREFIX} Ignoring persisted brush assets that are not a JSON list")
+        return []
+    assets: list[ScatterAssetEntry] = []
+    dropped: list[str] = []
+    for index, entry in enumerate(data):
+        try:
+            assets.append(ScatterAssetEntry.model_validate(entry))
+        except ValidationError:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            dropped.append(f"'{path}'" if path else f"entry {index}")
+    if dropped:
+        carb.log_warn(f"{_LOG_PREFIX} Dropped invalid persisted brush assets: {', '.join(dropped)}")
+    return assets
+
+
+def _failing_fields(exc: ValidationError, data: Mapping[str, Any]) -> set[str]:
+    """Return the persisted settings fields to drop so that the ones left validate.
+
+    A field outside its own bounds is named in the error's location. A low/high pair that is out of order is only
+    reported once every field has passed on its own, and then by the model as a whole with no location, so the pairs
+    are checked here over the values that are kept and the defaults of the ones that are not; both ends of a pair
+    out of order are dropped.
+
+    Args:
+        exc: The error validating the persisted settings.
+        data: The persisted settings.
+
+    Returns:
+        The names of the fields to drop.
+    """
+    failing = {str(error["loc"][0]) for error in exc.errors() if error.get("loc")}
+    kept = ScatterBrushSettings().model_dump()
+    kept.update((name, value) for name, value in data.items() if name not in failing)
+    for low_name, high_name in RANGE_PAIRS:
+        if _out_of_order(kept[low_name], kept[high_name]):
+            failing.update((low_name, high_name))
+    return failing
+
+
+def _out_of_order(low: Any, high: Any) -> bool:
+    """Whether two persisted ends of a low/high pair are out of order, or cannot be compared at all."""
+    try:
+        return float(low) > float(high)
+    except (TypeError, ValueError):
+        return True

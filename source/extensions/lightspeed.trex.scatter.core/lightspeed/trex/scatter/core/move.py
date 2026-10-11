@@ -29,10 +29,18 @@ import omni.usd
 from omni.flux.utils.common.interactive_usd_notices import begin_interaction, end_interaction
 from pxr import Gf, Sdf, Usd
 
+from .commands import clear_recorded_origins
 from .constants import SCATTER_ORIGIN_ATTR, SCATTER_TURN_ATTR
 from .controller import get_scatter_brush_controller
 from .placement import PlacementTransform, author_placement_transforms
-from .reapply import ReapplyScope, is_hand_edited, read_placement_origin, read_placement_turn, read_placement_yaw
+from .reapply import (
+    ReapplyScope,
+    drop_removed_placements,
+    is_hand_edited,
+    read_placement_origin,
+    read_placement_turn,
+    read_placement_yaw,
+)
 from .settings import LIVE_EDIT_SOFT_LIMIT
 from .sampling import (
     ParentSpaceOrigin,
@@ -214,6 +222,16 @@ class PreparedMove:
     def start(self) -> list[PlacementTransform]:
         """The placements as they stood when the drag opened, in scope order."""
         return [placement.current for entry in self._entries for placement in entry.placements]
+
+    @property
+    def unrecorded_origins(self) -> list[str]:
+        """Paths of the placements that recorded no surface when the drag opened, which any step records one for."""
+        return [
+            placement.current.prim_path
+            for entry in self._entries
+            for placement in entry.placements
+            if placement.recovered
+        ]
 
     def apply(
         self, delta: Gf.Matrix4d, cache: MeshSurfaceCache, conform: bool = True
@@ -550,6 +568,9 @@ class ScopeDragSession:
     The viewport gizmo and the Scatter window's turn fields are two ways of doing the same thing, so they share this
     rather than each keeping their own idea of where a drag started.
 
+    A drag defers USD notices to the rest of the application while it is open, so every way out of it ends that
+    interaction, an exception while committing included, and opening a drag first commits one whose end never came.
+
     Use from the main loop only; it is not thread-safe.
     """
 
@@ -566,7 +587,9 @@ class ScopeDragSession:
         self._prepared: PreparedMove | None = None
         self._start: list[PlacementTransform] = []
         self._moved: list[PlacementTransform] = []
+        self._unrecorded_origins: list[str] = []
         self._conform = True
+        self._folds = False
         self._interaction_token = None
         # For a patch too large to follow every step: the delta the drag has reached, applied when it ends.
         self._deferred = False
@@ -580,6 +603,9 @@ class ScopeDragSession:
     def begin(self, scope: ReapplyScope, conform: bool) -> bool:
         """Take the patch as it stands, so every update is measured from there rather than from the last one.
 
+        A drag that is still open is committed first: it is the user's move, and replacing it would leave its
+        interaction open for the rest of the session.
+
         Args:
             scope: Placements the drag is allowed to touch, and nothing else.
             conform: Whether the brush is set to conform to the surface.
@@ -587,6 +613,7 @@ class ScopeDragSession:
         Returns:
             Whether a drag was opened; there is nothing to open with no stage or an empty scope.
         """
+        self.commit()
         stage = self._stage()
         if stage is None or scope.is_empty:
             return False
@@ -595,9 +622,13 @@ class ScopeDragSession:
         self._layer = stage.GetEditTarget().GetLayer()
         self._prepared = prepare_move(stage, self._layer, scope, self._cache)
         self._start = self._prepared.start
+        self._unrecorded_origins = self._prepared.unrecorded_origins
         self._moved = []
         self._deferred = len(self._start) > LIVE_EDIT_SOFT_LIMIT
         self._pending_delta = None
+        # Decided now rather than when the drag ends: undoing the stroke ends its preview, and a drag of it that only
+        # found out then would commit an undo step for placements the undo has just taken away.
+        self._folds = self._folds_into_preview()
         self._interaction_token = begin_interaction(stage)
         return True
 
@@ -616,37 +647,64 @@ class ScopeDragSession:
         return outcome
 
     def commit(self) -> None:
-        """Commit the drag as one undoable command; does nothing when no drag is open."""
-        if self._pending_delta is not None and self._prepared is not None and self._interaction_token is not None:
-            self._moved, _outcome = self._prepared.apply(self._pending_delta, self._cache, self._conform)
-            author_placement_transforms(self._layer, self._moved)
-        self._pending_delta = None
+        """Commit the drag as one undoable command; does nothing when no drag is open.
+
+        Only the placements the layer still holds are committed, and nothing at all when none are left: the stroke
+        they belong to can be undone, or they can be deleted, while the drag is open.
+        """
         token, self._interaction_token = self._interaction_token, None
-        if token is not None:
+        if token is None:
+            return
+        layer, start, moved = self._layer, self._start, self._moved
+        unrecorded, folds = self._unrecorded_origins, self._folds
+        try:
+            if self._pending_delta is not None and self._prepared is not None:
+                moved, _outcome = self._prepared.apply(self._pending_delta, self._cache, self._conform)
+                author_placement_transforms(layer, moved)
+        finally:
             end_interaction(token)
-        if self._moved and not self._folds_into_preview():
-            omni.kit.commands.execute(
-                "ScatterReapplyCommand",
-                context_name=self._usd_context_name,
-                layer_identifier=self._layer.identifier,
-                before=self._start,
-                after=self._moved,
-                already_applied=True,
-            )
-        self._prepared = None
-        self._start = []
-        self._moved = []
+            self._close()
+        if folds:
+            return
+        after = drop_removed_placements(layer, moved)
+        if not after:
+            return
+        remaining = {transform.prim_path for transform in after}
+        omni.kit.commands.execute(
+            "ScatterReapplyCommand",
+            context_name=self._usd_context_name,
+            layer_identifier=layer.identifier,
+            before=[transform for transform in start if transform.prim_path in remaining],
+            after=after,
+            already_applied=True,
+            unrecorded_origins=[path for path in unrecorded if path in remaining],
+        )
 
     def cancel(self) -> None:
         """Put the patch back as it was and close the drag without committing anything."""
-        self._pending_delta = None
-        if self._interaction_token is not None and self._start:
-            author_placement_transforms(self._layer, self._start)
+        token, self._interaction_token = self._interaction_token, None
+        if token is None:
+            return
+        try:
+            if self._start:
+                author_placement_transforms(self._layer, self._start)
+                # Writing the start back leaves alone a surface the drag recorded for a placement that had none.
+                clear_recorded_origins(self._layer, self._unrecorded_origins)
+        finally:
+            end_interaction(token)
+            self._close()
+
+    def _close(self) -> None:
+        """Forget the drag that was open, once its interaction has ended."""
+        self._prepared = None
+        self._start = []
         self._moved = []
-        self.commit()
+        self._unrecorded_origins = []
+        self._pending_delta = None
+        self._folds = False
 
     def _folds_into_preview(self) -> bool:
-        """Whether the drag moved the stroke the brush is previewing, which keeps it instead of an undo step."""
+        """Whether the drag being opened moves the stroke the brush is previewing, so it adds no undo step."""
         return get_scatter_brush_controller().folds_into_preview(
             self._usd_context_name, self._layer.identifier, self._scope
         )

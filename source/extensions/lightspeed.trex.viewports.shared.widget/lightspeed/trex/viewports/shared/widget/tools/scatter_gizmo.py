@@ -180,13 +180,21 @@ class ScatterGizmoTool:
         return self._driver.previewing
 
     def refresh(self) -> None:
-        """Take the live-edit scope again and show the gizmo on it when a drag would have somewhere to land."""
+        """Take the live-edit scope again and show the gizmo on it when a drag would have somewhere to land.
+
+        While a drag or a live edit is open the scope and the pivot are left as they are. The driver reports every
+        step of an edit, and finding the pivot reads every placement of the patch, so following each step would cost
+        a read of the whole patch per step; the driver reports once more when the edit ends, and the gizmo moves to
+        where the patch then stands. A drag that is still open when the gizmo has to hide is committed first, because
+        a hidden manipulator never reports the end of the drag it was given.
+        """
         if self._manipulator is None:
             return
         stage = self._stage()
+        editing = self._dragging or self._driver.active
         if stage is None:
             self._scope = ReapplyScope()
-        else:
+        elif not editing:
             # Resolved again rather than read as it stands: the selection can change before the driver has heard.
             self._driver.refresh_scope()
             self._scope = self._driver.scope
@@ -199,27 +207,42 @@ class ScatterGizmoTool:
             and self._controller.mode == ScatterMode.OFF
             and (self._is_active_fn is None or self._is_active_fn())
         )
-        if showing:
-            pivot = scope_pivot(stage, stage.GetEditTarget().GetLayer(), self._scope)
-            showing = pivot is not None
-            if showing:
-                self._pivot = pivot
-                self._model.set_operation(operation)
-                self._model.set_floats(self._model.get_item("translate"), [pivot[0], pivot[1], pivot[2]])
-        self._manipulator.enabled = showing
+        if not showing:
+            self._finish_drag()
+            self._manipulator.enabled = False
+            return
+        self._model.set_operation(operation)
+        if editing:
+            return
+        pivot = scope_pivot(stage, stage.GetEditTarget().GetLayer(), self._scope)
+        if pivot is None:
+            self._manipulator.enabled = False
+            return
+        self._pivot = pivot
+        self._model.set_floats(self._model.get_item("translate"), [pivot[0], pivot[1], pivot[2]])
+        self._manipulator.enabled = True
 
     def begin_drag(self, rotating: bool = False) -> None:
         """Take the patch as it stands, so every step of the drag is measured from there rather than from the last.
+
+        A drag whose end never arrived is committed first, so a gesture that begins twice cannot leave the live-edit
+        driver held, or a notice interaction open, for the rest of the session.
 
         Args:
             rotating: Whether the drag is of a ring. On the preview a ring drag sets the base rotation instead.
         """
         if rotating and self.previewing:
+            self._session.commit()
+            holding = self._base_at_start is not None
             settings = self._controller.settings
             self._base_at_start = tuple(float(getattr(settings, name)) for name in _BASE_ROTATION_FIELDS)
-            # One edit for the whole drag, however many settings changes it makes on the way.
-            self._driver.hold()
+            if not holding:
+                # One edit for the whole drag, however many settings changes it makes on the way.
+                self._driver.hold()
             return
+        if self._base_at_start is not None:
+            self._base_at_start = None
+            self._driver.release()
         if self._session.begin(self._scope, self._conform):
             self._turn_at_start = turn_matrix(self._controller.selection_turn(self._scope))
 
@@ -233,25 +256,33 @@ class ScatterGizmoTool:
 
     def end_drag(self) -> None:
         """Commit the drag as one undoable move and put the gizmo back on the patch where it now sits."""
-        if self._base_at_start is not None:
-            self._base_at_start = None
-            self._driver.release()
-            self.refresh()
-            return
-        self._session.commit()
+        self._finish_drag()
         self.refresh()
 
     def cancel_drag(self) -> None:
-        """Put the patch back as it was and close the drag without committing anything."""
+        """Put the patch back as it was and close the drag without committing anything.
+
+        The turn readout is only rewound when a drag was open: with none, the turn it shows is that of the last drag
+        that was committed, and rewinding it would put the readout back to before that drag.
+        """
         if self._base_at_start is not None:
             start, self._base_at_start = self._base_at_start, None
             self._controller.update_settings(**dict(zip(_BASE_ROTATION_FIELDS, start)))
             self._driver.release()
             self.refresh()
             return
-        self._session.cancel()
-        self._controller.set_selection_turn(self._scope, turn_to_degrees(self._turn_at_start))
+        if self._session.active:
+            self._session.cancel()
+            self._controller.set_selection_turn(self._scope, turn_to_degrees(self._turn_at_start))
         self.refresh()
+
+    def _finish_drag(self) -> None:
+        """Commit whatever drag is open, a ring drag on the preview or a move of the patch, without refreshing."""
+        if self._base_at_start is not None:
+            self._base_at_start = None
+            self._driver.release()
+            return
+        self._session.commit()
 
     def _spin_preview(self, delta: Gf.Matrix4d) -> None:
         """Set the base rotation to where a ring drag of ``delta`` from its start takes it.
@@ -299,6 +330,11 @@ class ScatterGizmoTool:
     def _conform(self) -> bool:
         """Whether the brush is set to conform to the surface, which decides if a slide may re-aim the patch."""
         return self._controller.settings.conform_to_surface
+
+    @property
+    def _dragging(self) -> bool:
+        """Whether a drag of the gizmo is open: a ring drag on the preview, or a move of the patch."""
+        return self._base_at_start is not None or self._session.active
 
     def _stage(self) -> Usd.Stage | None:
         """Return the stage of the gizmo's USD context, or None when there is none."""

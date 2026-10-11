@@ -25,6 +25,7 @@ __all__ = [
     "ScopeEntry",
     "changed_reappliable_fields",
     "changed_recompose_assets",
+    "drop_removed_placements",
     "is_hand_edited",
     "prepare_reapply",
     "read_placement_origin",
@@ -512,6 +513,23 @@ def reapply_transforms(
     return prepared.before, after, outcome
 
 
+def drop_removed_placements(layer: Sdf.Layer, transforms: Sequence[PlacementTransform]) -> list[PlacementTransform]:
+    """Return the transforms whose placement ``layer`` still holds a spec for, in the order given.
+
+    An edit can outlive the placements it opened on: undoing the stroke they belong to, or deleting them, takes them
+    out of the layer while a slider or the gizmo is still being dragged. An undo step for them would rewrite prims
+    that are gone, and executing one from inside that undo would also clear the redo that brings them back.
+
+    Args:
+        layer: Layer the edit was authored in.
+        transforms: Transforms the edit wrote or would write back.
+
+    Returns:
+        The transforms of the placements that are still there.
+    """
+    return [transform for transform in transforms if layer.GetPrimAtPath(Sdf.Path(transform.prim_path)) is not None]
+
+
 class ReapplyDriver:
     """Applies re-appliable settings changes to painted scatter, live, as one undo step per edit.
 
@@ -555,6 +573,8 @@ class ReapplyDriver:
         self._interaction_token = None
         self._prepared: PreparedReapply | None = None
         self._after: list[PlacementTransform] = []
+        # Whether the open edit belongs to the stroke being previewed, decided when the edit opened.
+        self._folds = False
         self._warned_foreign_layer = False
         self._holds = 0
 
@@ -643,26 +663,32 @@ class ReapplyDriver:
         """Commit the open edit; does nothing when no edit is open or something holds it open.
 
         An edit of the preview is left in the layer as part of the stroke it belongs to. Any other edit becomes one
-        undoable command. Called by whatever drove the edit when it stops, so that a slider or gizmo drag is a single
-        undo step.
+        undoable command, of the placements the layer still holds. Called by whatever drove the edit when it stops,
+        so that a slider or gizmo drag is a single undo step.
+
+        Whether an edit belongs to the preview is the answer from when it opened. Undoing the stroke ends the preview
+        and finishes the edit, and asking only then would commit an undo step for the placements that undo removed.
         """
         if self._interaction_token is None or self._holds:
             return
-        if self._scope.placement_count > LIVE_EDIT_SOFT_LIMIT:
-            self._apply()
-        before = [] if self._prepared is None else self._prepared.before
-        after = self._after
-        folded = self._previewing and self._controller.folds_into_preview(
-            self._usd_context_name, self._layer.identifier, self._scope
-        )
-        self._close()
+        try:
+            if self._scope.placement_count > LIVE_EDIT_SOFT_LIMIT:
+                self._apply()
+            before = [] if self._prepared is None else self._prepared.before
+            after = drop_removed_placements(self._layer, self._after)
+            folded = self._folds
+        finally:
+            # Closed whatever happened above: an interaction that is never ended keeps the stage's USD notices from
+            # every listener that defers to it, for the rest of the session.
+            self._close()
         if not after or folded:
             return
+        remaining = {transform.prim_path for transform in after}
         omni.kit.commands.execute(
             "ScatterReapplyCommand",
             context_name=self._usd_context_name,
             layer_identifier=self._layer.identifier,
-            before=before,
+            before=[transform for transform in before if transform.prim_path in remaining],
             after=after,
             already_applied=True,
         )
@@ -751,6 +777,9 @@ class ReapplyDriver:
             stage, self._layer, self._scope, self._controller.settings, self._controller.assets, self._cache
         )
         self._after = []
+        self._folds = self._previewing and self._controller.folds_into_preview(
+            self._usd_context_name, self._layer.identifier, self._scope
+        )
         self._warned_foreign_layer = False
         self._interaction_token = begin_interaction(stage)
         return True
@@ -777,13 +806,20 @@ class ReapplyDriver:
         return None if usd_context is None else usd_context.get_stage()
 
     def _close(self) -> None:
-        """End the notice interaction and forget the open edit."""
+        """End the notice interaction, forget the open edit and tell subscribers the scope stands where it was left.
+
+        Subscribers that would re-read every placement of the scope, such as the gizmo finding its pivot, skip that
+        while an edit is open rather than paying for it at every drag step, so this is when they catch up.
+        """
         token = self._interaction_token
         self._interaction_token = None
         self._prepared = None
         self._after = []
-        if token is not None:
-            end_interaction(token)
+        self._folds = False
+        if token is None:
+            return
+        end_interaction(token)
+        self.__on_scope_changed(self._scope)
 
 
 class _AssetResolver:

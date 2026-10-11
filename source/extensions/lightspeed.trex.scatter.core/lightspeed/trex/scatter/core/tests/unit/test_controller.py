@@ -628,6 +628,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
     async def test_save_preset_without_name_saves_current_settings_under_preset_name(self):
         # Arrange
         self.controller.update_settings(preset_name="Grass")
+        self.preset_store.save.return_value = Path("presets/Grass.json")
 
         # Act
         result = self.controller.save_preset()
@@ -639,6 +640,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
     async def test_save_preset_with_name_updates_preset_name_and_saves(self):
         # Arrange
         callback = self._subscribe(self.controller.subscribe_settings_changed)
+        self.preset_store.save.return_value = Path("presets/Rocks.json")
 
         # Act
         result = self.controller.save_preset("Rocks")
@@ -648,6 +650,17 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual(self.controller.settings.preset_name, "Rocks")
         self.preset_store.save.assert_called_once_with("Rocks", self.controller.settings)
         callback.assert_called_once()
+
+    async def test_save_preset_under_a_name_stored_in_another_case_adopts_the_stored_spelling(self):
+        # Arrange - the store wrote over "Grass.json", so the combo must not list "grass" beside it
+        self.preset_store.save.return_value = Path("presets/Grass.json")
+
+        # Act
+        result = self.controller.save_preset("grass")
+
+        # Assert
+        self.assertTrue(result)
+        self.assertEqual(self.controller.settings.preset_name, "Grass")
 
     async def test_save_preset_when_store_raises_returns_false_and_posts_status(self):
         # Arrange
@@ -676,9 +689,21 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
     async def test_rename_preset_of_current_preset_updates_preset_name(self):
         # Arrange
         self.controller.update_settings(preset_name="Old")
+        self.preset_store.rename.return_value = Path("presets/New.json")
 
         # Act
         self.controller.rename_preset("Old", "New")
+
+        # Assert
+        self.assertEqual(self.controller.settings.preset_name, "New")
+
+    async def test_rename_preset_of_current_preset_named_in_another_case_updates_preset_name(self):
+        # Arrange - the store matches "old" to the stored "Old", which is the current preset
+        self.controller.update_settings(preset_name="Old")
+        self.preset_store.rename.return_value = Path("presets/New.json")
+
+        # Act
+        self.controller.rename_preset("old", "New")
 
         # Assert
         self.assertEqual(self.controller.settings.preset_name, "New")
@@ -983,6 +1008,82 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertFalse(changed)
         resolve.assert_not_called()
+
+    async def test_ensure_asset_textures_with_an_unresolvable_asset_reports_no_change(self):
+        # Arrange - every stroke asks, and a change is persisted and broadcast to the window and the live edit
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=None):
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        callback = self._subscribe(self.controller.subscribe_assets_changed)
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=None):
+            # Act
+            changed = self.controller.ensure_asset_textures()
+
+        # Assert
+        self.assertFalse(changed)
+        callback.assert_not_called()
+
+    async def test_ensure_asset_textures_does_not_resolve_an_unchanged_failure_again(self):
+        # Arrange
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=None):
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+            self.controller.ensure_asset_textures()
+
+        with mock.patch.object(controller_module, "resolve_asset_texture_set") as resolve:
+            # Act
+            self.controller.ensure_asset_textures()
+
+        # Assert
+        resolve.assert_not_called()
+
+    async def test_ensure_asset_textures_resolves_a_failed_asset_again_once_it_was_re_ingested(self):
+        # Arrange
+        with mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=None):
+            self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+            self.controller.ensure_asset_textures()
+        texture_set = ScatterTextureSet(source_hash="new")
+
+        with (
+            mock.patch.object(controller_module, "asset_source_hash", return_value="new"),
+            mock.patch.object(controller_module, "resolve_asset_texture_set", return_value=texture_set),
+        ):
+            # Act
+            changed = self.controller.ensure_asset_textures()
+
+        # Assert
+        self.assertTrue(changed)
+        self.assertEqual(self.controller.assets[0].textures, texture_set)
+
+    async def test_ensure_asset_measurements_does_not_measure_an_unchanged_failure_again(self):
+        # Arrange - measuring opens the whole asset, and every stroke asks
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        with mock.patch.object(controller_module, "read_asset_natural_extent", return_value=(0.0, 0.0, 0.0)):
+            self.controller.ensure_asset_measurements()
+
+        with mock.patch.object(controller_module, "read_asset_natural_extent") as read_size:
+            # Act
+            self.controller.ensure_asset_measurements()
+
+        # Assert
+        read_size.assert_not_called()
+
+    async def test_ensure_asset_measurements_measures_a_failed_asset_again_once_it_was_re_ingested(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        with mock.patch.object(controller_module, "read_asset_natural_extent", return_value=(0.0, 0.0, 0.0)):
+            self.controller.ensure_asset_measurements()
+
+        with (
+            mock.patch.object(controller_module, "asset_source_hash", return_value="new"),
+            mock.patch.object(controller_module, "read_asset_meters_per_unit", return_value=1.0),
+            mock.patch.object(controller_module, "read_asset_natural_extent", return_value=(4.0, 5.0, 6.0)),
+        ):
+            # Act
+            changed = self.controller.ensure_asset_measurements()
+
+        # Assert
+        self.assertTrue(changed)
+        self.assertEqual(self.controller.assets[0].natural_extent, (4.0, 5.0, 6.0))
 
     async def test_set_asset_texture_source_re_resolves_with_the_picked_texture(self):
         # Arrange

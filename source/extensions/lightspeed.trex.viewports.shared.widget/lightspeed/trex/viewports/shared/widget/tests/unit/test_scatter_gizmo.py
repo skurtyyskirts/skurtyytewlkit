@@ -326,6 +326,75 @@ class TestScatterGizmoTool(_ScatterGizmoTestCase):
         self.assertEqual(self._positions(), before)
         self._execute.assert_not_called()
 
+    async def test_hiding_the_gizmo_in_the_middle_of_a_drag_commits_the_drag(self):
+        # Arrange - arming the brush hides the gizmo, and a hidden manipulator never reports the end of its drag
+        self._select([str(_CONTAINER)])
+        self._tool.begin_drag()
+        self._tool.update_drag(Gf.Matrix4d().SetTranslate(Gf.Vec3d(40.0, 0.0, 0.0)))
+        self._execute.reset_mock()
+
+        # Act
+        self._controller.set_mode(ScatterMode.PAINT)
+
+        # Assert
+        self._execute.assert_called_once()
+        self.assertEqual(self._execute.call_args.args[0], "ScatterReapplyCommand")
+        self.assertFalse(self._tool._session.active)
+
+    async def test_a_drag_that_begins_again_without_ending_commits_the_first_drag(self):
+        # Arrange
+        self._select([str(_CONTAINER)])
+        self._tool.begin_drag()
+        self._tool.update_drag(Gf.Matrix4d().SetTranslate(Gf.Vec3d(40.0, 0.0, 0.0)))
+        self._execute.reset_mock()
+
+        # Act
+        self._tool.begin_drag()
+
+        # Assert
+        self._execute.assert_called_once()
+        self.assertTrue(self._tool._session.active)
+
+    async def test_cancelling_with_no_drag_open_leaves_the_turn_of_the_last_drag_alone(self):
+        # Arrange - the stage closing and the gizmo being destroyed both cancel whether or not a drag is open
+        self._select([str(_CONTAINER)])
+        self._tool.begin_drag()
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.ZAxis(), 30.0)))
+        self._tool.end_drag()
+        turned = self._controller.selection_turn(self._tool.scope)
+
+        # Act
+        self._tool.cancel_drag()
+
+        # Assert
+        self.assertEqual(self._controller.selection_turn(self._tool.scope), turned)
+        self.assertAlmostEqual(turned[2], 30.0, places=4)
+
+    async def test_a_live_edit_step_leaves_the_gizmo_where_it_was_until_the_edit_ends(self):
+        # Arrange
+        self._select([str(_CONTAINER)])
+        pivot = Gf.Vec3d(self._tool.pivot)
+
+        with mock.patch.object(scatter_gizmo_module, "scope_pivot", wraps=scatter_gizmo_module.scope_pivot) as find:
+            # Act - the Scatter window reports every step of a slider drag the same way
+            self._controller.update_settings(vertical_offset=25.0)
+
+        # Assert
+        find.assert_not_called()
+        self.assertEqual(self._tool.pivot, pivot)
+
+    async def test_finishing_a_live_edit_puts_the_gizmo_on_the_patch_where_it_now_stands(self):
+        # Arrange
+        self._select([str(_CONTAINER)])
+        pivot = Gf.Vec3d(self._tool.pivot)
+        self._controller.update_settings(vertical_offset=25.0)
+
+        # Act - what the Scatter window does when the slider is let go
+        self._tool._driver.edit_finished()
+
+        # Assert
+        self.assertAlmostEqual(self._tool.pivot[2] - pivot[2], 25.0, places=4)
+
     async def test_the_factory_builds_a_gizmo_for_the_viewport_it_is_given(self):
         # Arrange
         viewport_api = mock.MagicMock(name="viewport_api")
@@ -548,6 +617,55 @@ class TestScatterGizmoOnThePreview(_ScatterGizmoTestCase):
         self.assertEqual(self._controller.settings.base_rotation_x, 0.0)
         for new, old in zip(self._rotations(), before):
             self.assertTrue(all(abs(a - b) < 1e-4 for a, b in zip(new, old)), f"{new} != {old}")
+
+    async def test_hiding_the_gizmo_in_the_middle_of_a_ring_drag_finishes_the_live_edit(self):
+        # Arrange
+        self._tool.begin_drag(rotating=True)
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 30.0)))
+
+        # Act
+        self._controller.set_mode(ScatterMode.PAINT)
+
+        # Assert
+        self.assertFalse(self._tool._driver.active)
+
+    async def test_a_ring_drag_that_begins_again_without_ending_is_finished_by_one_end(self):
+        # Arrange - a gesture that reports its start twice must not hold the live edit open for good
+        self._tool.begin_drag(rotating=True)
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 30.0)))
+        self._tool.begin_drag(rotating=True)
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 10.0)))
+
+        # Act
+        self._tool.end_drag()
+
+        # Assert
+        self.assertFalse(self._tool._driver.active)
+
+    async def test_a_ring_drag_that_begins_again_without_ending_turns_on_from_where_the_first_left_off(self):
+        # Arrange
+        self._tool.begin_drag(rotating=True)
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 30.0)))
+        self._tool.begin_drag(rotating=True)
+
+        # Act
+        self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 10.0)))
+
+        # Assert
+        self.assertAlmostEqual(self._controller.settings.base_rotation_x, 40.0, places=6)
+        self._tool.end_drag()
+
+    async def test_a_ring_drag_step_does_not_find_the_pivot_again(self):
+        # Arrange
+        self._tool.begin_drag(rotating=True)
+
+        with mock.patch.object(scatter_gizmo_module, "scope_pivot", wraps=scatter_gizmo_module.scope_pivot) as find:
+            # Act
+            self._tool.update_drag(Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), 30.0)))
+
+        # Assert - finding the pivot reads every placement of the stroke, so a step must not pay for it
+        find.assert_not_called()
+        self._tool.end_drag()
 
     async def test_sliding_the_preview_moves_it_without_an_undo_step(self):
         # Arrange
