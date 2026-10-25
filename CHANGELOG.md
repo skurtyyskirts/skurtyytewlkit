@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Created 1.6.1-0 build
+- Added RTX Remix 1.6 release notes
+- REMIX-6265: Excluded invalid ComfyUI selections and cancelled timed-out prompts before the next ComfyUI job starts. Added a persistent 60-minute timeout (0 for no limit), Timed Out labels with the error color, Retry, and queue resume while active work continues. Added a job graph Stop action that stops a running job and its ComfyUI prompt, with a Stopped label and Retry. Disabled the Stage Manager AI Tools action when the workflow has no Selected Texture or Selected Mesh input. A ComfyUI workflow with only Constant inputs creates one job, texture inputs must match the mesh input scope, and All Textures expands mesh workflows without a mesh input to the whole stage. Texture workflows with a mesh input apply textures to the materials under that mesh. Documented AI Tools workflow types, input getters, the job timeout, and the job queue.
+
+### Changed
+
+- Set the development version to 1.7.0-dev
+- Excluded internal CI from future GitHub mirror commits while preserving previously exported history and GitHub workflows.
+- Added contributor names to the community PR entries in the RTX Remix 1.6 release notes
+- Updated Packman to 8.7.0 with its Python 3.12 bootstrap, including the fix for failed `copyPath` renames reporting success.
+
+### Fixed
+
+- Made `tools/ci/scripts/notify_remix_target_dep_bot.sh` use a bash 3.2-compatible channel de-duplication so its test suite passes with the default macOS `/bin/bash` (associative arrays require bash 4.0+).
+- Constrained the docs build to the `pydantic` version in `deps/pip_flux.toml` because `pydantic` 2.14 broke `autodoc` for parametrized generic models
+- Fixed an intermittent test hang: the first USD call in a test could deadlock with the MDL preload, which made `lss-e2e-tests-windows-a2s` lose 5 minutes per job and sometimes time out.
+- Fixed a race in the Job Queue widget delete tests: on slow CI runners, the delete prompt opened after the test failed, and the open modal prompt blocked the clicks of all later tests.
+- Kept the merge request note token out of the curl command line in the missing-tests comment job, so process monitoring on the CI runners no longer records it.
+- Fixed documentation publishing with Packman 8 by updating the documentation tool's package lookup API.
+- REMIX-6095: Fixed vector attributes in the Properties panels, including MDL `float2` parameters, raising `TypeError` and showing wrong defaults, and fixed resetting a vector to restore the wrong channel default. Updated HdRemix and material definitions to `ext-e62bf4b-main` for texture transforms.
+
+### Removed
+
+## [1.6.1-0]
+
+### Added
+
+- Created 1.6.0 build
+
+### Changed
+
+- REMIX-6108: install-runtime.md changed to reflect new runtime folder structure.
+- Renamed DLSS 3D-Guided Neural Generation controls to DLSS 3D-Guided Neural Rendering while preserving availability gating for older material-group names.
+- REMIX-5618: Updated the Curve Editor with channel multiselection, key insertion and deletion, numeric editing, tangent and axis framing controls, grouped undo/redo, and shared Curve, Gradient, and texture-preview windows with synchronized previews.
+- Update hdremix and omni_core_materials to `ext-5a7eec8-main`
+- Update remix_runtime to `remix-1.6.1`
+
+### Fixed
+
+- Corrected the Toolkit release version from 1.6.0 to 1.6.0-0.
+- REMIX-4585: Centralized property copy/paste for ordinary and logical rows, preserving displayed defaults, visible textures, legacy particle companions, hidden editable settings, and distinct linked XYZ components, with one synchronous paste undo action that restores prior logical-property opinions.
+- Fix model-facing description of agent skill shims. Includes minor metadata fix toward spec adhesion.
+
+### Removed
+
+## [1.6.0-0]
+
+### Added
+
 - Created 1.5.2-0 build
 - Added RTX Remix 1.5 final release notes
 - REMIX-5246: Added spotlight cone wireframe visualization for DiskLight and SphereLight when `shaping:cone:angle` is authored, with tunable threshold / subdivisions / outer + inner colors under the viewport Display dropdown ▸ Custom Manipulators ▸ Light Manipulator; the visual cone and intensity-arrow lengths update together based on the display threshold
@@ -107,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moved the Toolkit REST routes from six `.service` extensions into `lightspeed.trex.service.core` without changing the REST API or MCP tools, and fixed hot-reloading `lightspeed.trex.service.core` failing to restart and doubling its OpenAPI tags
 - Update Remix target dependencies: hdremix and omni_core_materials to `ext-f337894-main`
 
+- Migrated toolkit ZIP packaging and publishing to Lightspeed uploader, with dependency discovery selecting Remix remotes from the DXVK source branch.
+- Enabled Auto Mask by default, removed the experimental label from DLSS 3D-Guided Neural Generation controls, and preserved material-group availability gating for current and older names.
+- Changed the internal feature freeze and release process to tag `main` directly from one release MR instead of cutting `release/X.Y.x` branches, and added filtered internal skill wrappers so agents detect internal commands.
+- Update hdremix and omni_core_materials to `ext-c22d0c6-main` (`remix-1.6.0` tag)
+- Update remix_runtime to `remix-1.6.0`
+
 ### Removed
 
 - Removed the unstable custom numeric expression controller from bounded drag widgets, along with object properties E2E coverage for the retired expression overlay, while preserving deferred property refreshes and native drag hard-bound clamping.
@@ -196,6 +251,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - REMIX-6099: Fixed numeric property drags to preview live while preserving multi-selection behavior, one undoable change on release, and original authored state on cancellation.
 - REMIX-6232: Fixed ingestion jobs that never started after the Pydantic 2.13.5 and FastAPI 0.142.2 upgrade. `OmniUrl` fields failed JSON serialization, and FastAPI rejected schema update requests that had no `Content-Type` header.
 - Clarified the remove-layer and mute-layer MCP tool descriptions: they act on the whole layer and are not a substitute for deleting prims (NVBug 6713667).
+- Matched scheduled Remix dependency bot failure notifications to the formatted Slack pipeline messages.
+- Fixed the Material Properties panel and ComfyUI job queue using the captured material for a replacement mesh whose materials are bound on GeomSubsets; select a subset to edit its material.
+- Fixed the RTX Remix modding agent skill making multi-target writes (e.g. "replace all the textures") without first confirming the resolved set with the user (NVBug 6713631).
+- Fixed dependency downloads failing in GitHub checkouts
 
 ## [1.5.2-0]
 

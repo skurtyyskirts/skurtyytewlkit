@@ -18,9 +18,16 @@ The TREX Material Properties widget adapts the USD material property widget for 
 `SetupUI` wraps `omni.flux.properties_pane.materials.usd.widget`, whose dependency on `omni.flux.material_api` establishes
 MDL initialization before this widget starts. Material selection can resolve MDL assets without initializing Neuray.
 
-The **DLSS 3D-Guided Neural Generation [Experimental]** material group is shown only when the active Remix runtime
-reports feature support. Legacy DLSS Neural Rendering group names remain recognized for older materials.
+The **DLSS 3D-Guided Neural Rendering** material group is shown only when the active Remix runtime
+reports feature support. Older Neural Generation, experimental, and legacy DLSS Neural Rendering group names remain
+recognized for older materials.
 
 The material action menu builds on opening and shows a loading entry until ready. Each open reads the current selection.
 Selection changes, dismissal, hiding, and destruction cancel pending menu work.
 Material labels and MDL paths remain available before the menu opens.
+
+## Usage
+
+See [Texture Transform](../../../../docs/howto/learning-materials.md#texture-transform) for material controls and
+[Updating Capture Material Definitions](../../../../docs/howto/learning-materials.md#updating-capture-material-definitions)
+when an older capture does not expose newly added properties.

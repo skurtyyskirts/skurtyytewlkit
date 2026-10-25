@@ -24,9 +24,14 @@ import omni.kit.test
 from omni.flux.property_widget_builder.model.usd.item_delegates import (
     file_texture_picker as _file_texture_picker_module,
 )
-from omni.flux.property_widget_builder.model.usd.item_delegates.file_texture_picker import FileTexturePicker
+from omni.flux.property_widget_builder.model.usd.item_delegates.file_texture_picker import (
+    FileTexturePicker,
+    TexturePreviewEditor,
+)
 from omni.flux.property_widget_builder.model.usd.item_model.attr_value import UsdAttributeValueModel
 from PIL import Image
+
+__all__ = ["TestFileTexturePicker", "TestTexturePreviewEditor"]
 
 _OPEN_FILE_PICKER_TARGET = "omni.flux.property_widget_builder.delegates.string_value.file_picker._open_file_picker"
 
@@ -220,44 +225,6 @@ class TestFileTexturePicker(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual("C:/Project/textures/albedo.dds", fallback_path)
 
-    async def test_open_explorer_uses_parent_folder_for_files(self):
-        # Arrange
-        picker = FileTexturePicker()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            texture_path = Path(temp_dir) / "texture.png"
-            texture_path.write_text("", encoding="utf-8")
-
-            with patch.object(_file_texture_picker_module.os, "startfile") as startfile_mock:
-                # Act
-                picker._open_explorer(0, str(texture_path))
-
-        # Assert
-        startfile_mock.assert_called_once_with(texture_path.parent)
-
-    async def test_open_explorer_ignores_non_left_mouse_button(self):
-        # Arrange
-        picker = FileTexturePicker()
-
-        # Act
-        with patch.object(_file_texture_picker_module.os, "startfile") as startfile_mock:
-            picker._open_explorer(1, "C:/Project/texture.png")
-
-        # Assert
-        startfile_mock.assert_not_called()
-
-    async def test_get_resolution_reads_image_dimensions(self):
-        # Arrange
-        with tempfile.TemporaryDirectory() as temp_dir:
-            texture_path = Path(temp_dir) / "texture.png"
-            Image.new("RGBA", (8, 4)).save(texture_path)
-
-            # Act
-            resolution = FileTexturePicker._get_resolution(str(texture_path))
-
-        # Assert
-        self.assertEqual((8, 4), resolution)
-
     async def test_field_begin_blocks_value_model_writes(self):
         # Arrange
         picker = FileTexturePicker()
@@ -282,7 +249,8 @@ class TestFileTexturePicker(omni.kit.test.AsyncTestCase):
         value_model.block_set_value.assert_called_once_with(False)
         value_model.set_value.assert_called_once_with("textures/albedo.dds")
 
-    async def test_field_changed_validates_cached_value(self):
+    async def test_field_changed_validates_cached_value_without_blocking_writes(self):
+        """Validate refreshed texture fields without starting a manual editing interval."""
         # Arrange
         picker = FileTexturePicker()
         widget = MagicMock()
@@ -294,7 +262,7 @@ class TestFileTexturePicker(omni.kit.test.AsyncTestCase):
             picker._on_field_changed(widget, value_model, 0, MagicMock())
 
         # Assert
-        value_model.block_set_value.assert_called_once_with(True)
+        value_model.block_set_value.assert_not_called()
         is_field_path_valid_mock.assert_called_once_with("textures/albedo.dds", widget, value_model, 0)
 
     async def test_set_field_writes_relative_normalized_path_when_selection_is_valid(self):
@@ -339,3 +307,41 @@ class TestFileTexturePicker(omni.kit.test.AsyncTestCase):
         # Assert
         value_model.block_set_value.assert_called_once_with(False)
         set_field_mock.assert_not_called()
+
+
+class TestTexturePreviewEditor(omni.kit.test.AsyncTestCase):
+    """Exercise preview file helpers without constructing a native editor."""
+
+    async def test_open_explorer_uses_parent_folder_for_files(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as temp_dir:
+            texture_path = Path(temp_dir) / "texture.png"
+            texture_path.write_text("", encoding="utf-8")
+
+            with patch.object(_file_texture_picker_module.os, "startfile") as startfile_mock:
+                # Act
+                TexturePreviewEditor._open_explorer(0, str(texture_path))
+
+        # Assert
+        startfile_mock.assert_called_once_with(texture_path.parent)
+
+    async def test_open_explorer_ignores_non_left_mouse_button(self):
+        # Arrange
+        with patch.object(_file_texture_picker_module.os, "startfile") as startfile_mock:
+            # Act
+            TexturePreviewEditor._open_explorer(1, "C:/Project/texture.png")
+
+        # Assert
+        startfile_mock.assert_not_called()
+
+    async def test_get_resolution_reads_image_dimensions(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as temp_dir:
+            texture_path = Path(temp_dir) / "texture.png"
+            Image.new("RGBA", (8, 4)).save(texture_path)
+
+            # Act
+            resolution = TexturePreviewEditor._get_resolution(str(texture_path))
+
+        # Assert
+        self.assertEqual((8, 4), resolution)

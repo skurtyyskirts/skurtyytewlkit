@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added the scatter brush toolbar icon and docked the Scatter window next to the Editor in the StageCraft layout (hidden in the other layouts)
 - Added a `cube_textured` ingested asset and its texture set to the example project so the scatter brush's texture assignment can be tested end to end
 
+## [1.30.5]
+### Added
+- Added a `cube_subsets.usda` ingested test asset whose mesh binds its materials through GeomSubsets only.
+
 ## [1.30.4]
 ### Changed
 - Limited the Stage Manager Categories tab top bar to Search and Additional Filters.

@@ -29,14 +29,13 @@ import omni.kit.commands
 import omni.kit.undo
 import omni.usd
 from omni.flux.property_widget_builder.widget import ItemValueModel as _ItemValueModel
-from omni.flux.property_widget_builder.widget import Serializable as _Serializable
 from omni.flux.utils.common import path_utils as _path_utils
 from omni.flux.utils.common.interactive_usd_notices import defer_usd_notices as _defer_usd_notices
 from omni.kit.app import get_app
 from omni.kit.usd_undo import UsdLayerUndo
-from pxr import Gf, Sdf, Usd
+from pxr import Sdf, Usd
 
-from ..mapping import GF_TO_PYTHON_TYPE, MULTICHANNEL_BUILDER_TABLE, VEC_TYPES, VecType
+from ..mapping import GF_TO_PYTHON_TYPE, MULTICHANNEL_BUILDER_TABLE
 from ..utils import get_default_attribute_value as _get_default_attribute_value
 from ..utils import get_item_attributes as _get_item_attributes
 from ..utils import get_metadata as _get_metadata
@@ -85,12 +84,10 @@ def _undo_group_added_since(undo_stack_size: int) -> None:
             pass
 
 
-class UsdAttributeBase(_Serializable, abc.ABC):
+class UsdAttributeBase(abc.ABC):
     """
     The model mixin to watch USD attribute paths.
     """
-
-    _is_virtual = False
 
     def __init__(
         self,
@@ -127,7 +124,7 @@ class UsdAttributeBase(_Serializable, abc.ABC):
         self._tooltip_channel_name = tooltip_channel_name
 
         if not value_type_name:
-            value_type_name = self._get_type_name(self.metadata)
+            value_type_name = _get_type_name(self.metadata)
         self._value_type_name: Sdf.ValueTypeName = value_type_name
         self._convert_type = GF_TO_PYTHON_TYPE.get(self._value_type_name)
 
@@ -149,33 +146,6 @@ class UsdAttributeBase(_Serializable, abc.ABC):
     def destroy(self) -> None:
         """Cancel pending previews and restore their specs before item teardown."""
         self.cancel_property_edit_interaction()
-
-    def register_serializer_hooks(self, serializer):
-        super().register_serializer_hooks(serializer)
-
-        @serializer.register_serialize_hook(lambda x: isinstance(x, VEC_TYPES), key="Gf.Vec*")
-        def serialize_vec(value: VecType) -> dict[str, str | list[float]]:
-            return {"type": value.__class__.__name__, "value": list(value)}
-
-        @serializer.register_deserialize_hook(lambda x: isinstance(x, VEC_TYPES), key="Gf.Vec*")
-        def deserialize_vec(value: dict[str, str | list[float]]) -> VecType:
-            return getattr(Gf, value["type"])(*value["value"])
-
-        @serializer.register_serialize_hook(Sdf.AssetPath)
-        def serialize_asset_path(value: Sdf.AssetPath) -> str:
-            # Always emit the authored path. The hook is intentionally not a strict
-            # mirror of deserialize_asset_path: serialize captures what USD was given
-            # at the source (relative, absolute, or unresolved-pending-ingest), and
-            # deserialize re-anchors that string against the destination's edit target.
-            # Using value.resolvedPath here would drop paths whose target isn't on disk
-            # yet — the original bug this hook is fixing.
-            return value.path.replace("\\", "/")
-
-        @serializer.register_deserialize_hook(Sdf.AssetPath)
-        def deserialize_asset_path(value: str) -> str:
-            return omni.client.normalize_url(
-                omni.usd.make_path_relative_to_current_edit_target(value, stage=self.stage)
-            ).replace("\\", "/")
 
     @property
     def context_name(self):
@@ -257,17 +227,13 @@ class UsdAttributeBase(_Serializable, abc.ABC):
     def get_default_reset_value(self) -> Any | None:
         """Get the default value that reset will restore."""
         for attribute in self.attributes or []:
-            if not attribute and not self._is_virtual:
+            if not attribute and not self.is_virtual:
                 continue
             default_value = self._get_default_value(attribute)
             if default_value is None:
                 continue
             return default_value
         return None
-
-    @staticmethod
-    def _get_type_name(metadata):
-        return _get_type_name(metadata)
 
     @abc.abstractmethod
     def reset_default_value(self):
@@ -351,7 +317,7 @@ class UsdAttributeBase(_Serializable, abc.ABC):
 
                 if attr.IsValid():
                     value = self._get_attribute_value(attr)
-                elif self._is_virtual:
+                elif self.is_virtual:
                     value = self._get_default_value(attr)
                 else:
                     continue
@@ -387,6 +353,7 @@ class UsdAttributeBase(_Serializable, abc.ABC):
 
     def _refresh_linked_value_models(self) -> None:
         """Refresh value models that share speculative edit state with this model."""
+        return
 
     def refresh(self):
         if self._ignore_refresh:
@@ -483,7 +450,7 @@ class UsdAttributeBase(_Serializable, abc.ABC):
                         attr = prim.GetAttribute(attribute_path.name)
                         if attr.IsValid():
                             current_value = self._get_attribute_value(attr)
-                        elif self._is_virtual:
+                        elif self.is_virtual:
                             current_value = self._get_default_value(attr)
                         else:
                             continue
@@ -673,7 +640,8 @@ class UsdAttributeBase(_Serializable, abc.ABC):
             self._is_batch_editing = False
 
     def _refresh_after_cancel_property_edit(self) -> None:
-        pass
+        """Allow subclasses to refresh display models after canceled editing."""
+        return
 
     def cancel_property_edit_interaction(self) -> None:
         """Cancel editing and retry any retained preview restorations before notifying listeners."""
@@ -795,20 +763,6 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
                 model.refresh()
         return succeeded
 
-    def begin_paste(self):
-        """Refresh ``self._value`` from USD before this channel's deserialize.
-
-        ``Item.apply_serialized_data`` interleaves begin_paste/deserialize per channel,
-        so by the time we're called the previous channel has already committed its
-        write to USD. Re-reading here gives us the up-to-date full vector, ensuring
-        the subsequent ``_write_value_to_usd`` (which writes the whole ``self._value``)
-        doesn't clobber a sibling channel that was written earlier in the same paste
-        tick. Single-channel models don't need the refresh, so ``begin_paste``
-        skips the call entirely via the ``_is_multichannel`` guard.
-        """
-        if self._is_multichannel:
-            self._read_value_from_usd()
-
     def get_value(self):
         """Get the value for serialization and external consumption."""
         if self._value is None:
@@ -893,7 +847,7 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
     def reset_default_value(self):
         """Reset the model's value back to the USD default"""
         self.block_set_value(False)  # be sure that we set the value
-        for index, attribute in enumerate(self.attributes):
+        for attribute in self.attributes:
             if not attribute:
                 continue
             default_value = self._get_default_value(attribute)
@@ -901,7 +855,7 @@ class UsdAttributeValueModel(UsdAttributeBase, _ItemValueModel):
                 continue
             # If the item is subscriptable, get the right value
             if self._is_multichannel:
-                self.set_value(default_value[index])
+                self.set_value(default_value[self._channel_index])
             else:
                 if self._value_type_name == Sdf.ValueTypeNames.Asset:
                     default_value = default_value.path
@@ -1046,14 +1000,12 @@ class VirtualUsdAttributeValueModel(UsdAttributeValueModel):
         if not value_type_name:
             raise ValueError("value_type_name is required for virtual attribute value models")
         self._metadata = metadata or {Sdf.PrimSpec.TypeNameKey: str(value_type_name)}
-        is_multichannel = MULTICHANNEL_BUILDER_TABLE.get(value_type_name, False)
-        if is_multichannel and default_value is not None:
-            default_value = default_value[channel_index]
 
         super().__init__(
             context_name,
             attribute_paths,
             channel_index,
+            default_value=default_value,
             read_only=read_only,
             value_type_name=value_type_name,
             tooltip_display_name=tooltip_display_name,
@@ -1061,12 +1013,10 @@ class VirtualUsdAttributeValueModel(UsdAttributeValueModel):
             related_override_paths=related_override_paths,
         )
 
-        # Set _default_value AFTER super().__init__() to avoid being overwritten by the parent class
-        self._default_value = default_value
-
     def _get_default_value(self, attr):
         # Since the attribute does not exist, we need to retrieve the stored value.
-        return self._default_value
+        # Hand out a copy: the cached value is edited in place per channel and must never alter the default.
+        return _safe_deepcopy(self._default_value)
 
     def _schedule_preview(self) -> None:
         """Preview virtual values only when creation has a known property-only mutation."""
@@ -1080,8 +1030,11 @@ class VirtualUsdAttributeValueModel(UsdAttributeValueModel):
 
     def get_value(self):
         """Get the value for serialization and external consumption."""
-        if self._value is None and self._is_virtual:
-            return self._default_value  # not set yet...
+        if self._value is None and self.is_virtual:
+            # Not set yet. The default stays the full vector so every other code path can read and compare it.
+            if self._is_multichannel and self._default_value is not None:
+                return self._default_value[self._channel_index]
+            return _safe_deepcopy(self._default_value)
         return super().get_value()
 
     def get_attributes_raw_value(self, element_current_idx: int) -> Any | None:

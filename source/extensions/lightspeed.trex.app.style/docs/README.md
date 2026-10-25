@@ -8,6 +8,7 @@ draws with.
 - Fill the default `ui.Style` dictionary (`style.default`) at import time with the Toolkit palette and the named
   styles of its widgets, including the viewport toolbar button images such as `Button.Image::teleport` and
   `Button.Image::scatter_brush` with their `:hovered` and `:checked` states
+- Own the normal Curve Editor channel colors and their selected-label variants
 - Restyle the Kit viewport menubar and toolbar shades (`update_viewport_menu_style`) and the popup message dialog
   (`override_dialog_get_style`) so stock Kit widgets match the Toolkit
 - Apply the ImGui-level overrides the `omni.ui` style cannot express (window shadow colour)
@@ -16,7 +17,10 @@ draws with.
 
 - Does not ship icons, fonts or images; those live in `lightspeed.trex.app.resources` and are resolved through
   `omni.flux.utils.widget.resources` (`get_icons`, `get_fonts`, `get_image`)
-- Does not create widgets or windows; extensions reference the style names defined here when they build their UI
+- Does not create widgets or windows; extensions reference the style names defined here when they build their UI.
+  Widget extensions own layout, selection behavior, and data editing; the
+  [Curve Editor](../../omni.flux.curve_editor.widget/docs/README.md#channel-styling) owns channel label selection
+  states, and nickname editing and other reusable Flux controls belong to their widget extensions
 - Does not own styles that a single widget uses; those stay next to the widget that draws them
 
 ## Architecture
@@ -39,6 +43,22 @@ menubar and toolbar read; it runs at import and can be called again after the me
 - `style` — the `ui.Style` singleton whose `default` dictionary carries the Toolkit styles
 - `update_viewport_menu_style` — viewport menubar and toolbar shade overrides
 - `override_dialog_get_style` — message dialog style override
+
+## Curve Channel Palette
+
+`trex_style.py` defines normal `Label::<name>` colors and selected-label overrides in `0xAABBGGRR` byte order.
+
+| Style name | Channels | Selected label |
+| --- | --- | --- |
+| `CurveEditorChannelX` | Size and velocity X | Pale coral (`#FFD4CC`) |
+| `CurveEditorChannelY` | Size and velocity Y | Light lime (`#C8EDAA`) |
+| `CurveEditorChannelZ` | Velocity Z | Light blue (`#CEDFFF`) |
+| `CurveEditorRotationMinimum` | Minimum rotation speed | Normal color |
+| `CurveEditorRotationMaximum` | Maximum rotation speed | Normal color |
+
+The [particle panel](../../lightspeed.trex.properties_pane.particle.widget/docs/README.md) assigns these semantic
+names; the [USD layout adapter](../../omni.flux.property_widget_builder.model.usd/docs/README.md#curve-layout-styling)
+resolves their normal colors when constructing property controls.
 
 ## Usage
 

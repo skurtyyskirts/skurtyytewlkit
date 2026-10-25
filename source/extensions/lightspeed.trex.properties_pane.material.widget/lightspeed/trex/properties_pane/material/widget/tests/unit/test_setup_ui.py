@@ -25,6 +25,8 @@ from lightspeed.trex.properties_pane.material.widget.setup_ui import SetupUI
 from omni.kit.test import AsyncTestCase
 
 _MODULE = "lightspeed.trex.properties_pane.material.widget.setup_ui"
+_DLSS_RELEASE_GROUP_NAME = "DLSS 3D-Guided Neural Rendering"
+_DLSS_GENERATION_GROUP_NAME = "DLSS 3D-Guided Neural Generation"
 
 
 def _make_group(name: str, hidden: bool = False):
@@ -64,17 +66,28 @@ class TestSetupUI(AsyncTestCase):
         legacy_group = _make_group("DLSS Neural Rendering")
         legacy_experimental_group = _make_group("DLSS Neural Rendering [Experimental]")
         experimental_group = _make_group("DLSS 3D-Guided Neural Generation [Experimental]")
+        generation_group = _make_group(_DLSS_GENERATION_GROUP_NAME)
+        release_group = _make_group(_DLSS_RELEASE_GROUP_NAME)
         unrelated_group = _make_group("Base Material")
 
         # Act
         setup._update_dlss_neural_rendering_group_visibility(
-            [legacy_group, legacy_experimental_group, experimental_group, unrelated_group]
+            [
+                legacy_group,
+                legacy_experimental_group,
+                experimental_group,
+                generation_group,
+                release_group,
+                unrelated_group,
+            ]
         )
 
         # Assert
         self.assertTrue(legacy_group.hidden)
         self.assertTrue(legacy_experimental_group.hidden)
         self.assertTrue(experimental_group.hidden)
+        self.assertTrue(generation_group.hidden)
+        self.assertTrue(release_group.hidden)
         self.assertFalse(unrelated_group.hidden)
         settings.get.assert_called_once_with(_setup_ui.SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE)
 
@@ -85,12 +98,16 @@ class TestSetupUI(AsyncTestCase):
         setup = SetupUI.__new__(SetupUI)
         setup._settings = settings
         group = _make_group("DLSS 3D-Guided Neural Generation [Experimental]", hidden=True)
+        generation_group = _make_group(_DLSS_GENERATION_GROUP_NAME, hidden=True)
+        release_group = _make_group(_DLSS_RELEASE_GROUP_NAME, hidden=True)
 
         # Act
-        setup._update_dlss_neural_rendering_group_visibility([group])
+        setup._update_dlss_neural_rendering_group_visibility([group, generation_group, release_group])
 
         # Assert
         self.assertFalse(group.hidden)
+        self.assertFalse(generation_group.hidden)
+        self.assertFalse(release_group.hidden)
         settings.get.assert_called_once_with(_setup_ui.SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE)
 
     def test_on_dlss_neural_rendering_availability_changed_updates_current_model(self):

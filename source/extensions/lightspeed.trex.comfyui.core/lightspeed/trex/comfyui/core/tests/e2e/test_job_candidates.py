@@ -21,8 +21,9 @@ import tempfile
 from unittest.mock import AsyncMock, patch
 
 import omni.usd
+from omni.flux.utils.tests.context_managers import get_test_data_path
 from omni.kit.test import AsyncTestCase
-from pxr import Sdf, UsdShade
+from pxr import Sdf, UsdGeom, UsdShade
 
 from ...api import ComfyUIAPI
 from ...core import ComfyUICore
@@ -37,6 +38,7 @@ from .test_job_apply import (
     _make_capture_usda,
     _make_project_usda,
     _material_path,
+    _texture_output,
     _workflow_request,
 )
 
@@ -178,6 +180,80 @@ class TestComfyUIJobCandidatesE2E(AsyncTestCase):
                 target = next(job for job in graph.jobs if job.apply_binding).apply_binding.target
                 self.assertEqual([owner.owner_prim_path for owner in target.reference_targets], [_OWNER_A])
 
+    def _reference_subset_cube(self) -> Workflow:
+        """Reference the subset-bound cube under the first owner and return a texture-output workflow.
+
+        Returns:
+            Workflow whose texture output reads the selection's materials.
+        """
+        owner = self._stage.GetPrimAtPath(_OWNER_A)
+        # Captures author the default binding strength, so subset bindings win over the captured material
+        UsdShade.MaterialBindingAPI.SetMaterialBindingStrength(
+            UsdShade.MaterialBindingAPI(owner).GetDirectBindingRel(), UsdShade.Tokens.weakerThanDescendants
+        )
+        owner.GetReferences().AddReference(
+            get_test_data_path(
+                "usd/project_example/ingested_assets/output/good/cube_subsets.usda", "lightspeed.trex.app.resources"
+            ).path
+        )
+        UsdShade.Shader(self._stage.GetPrimAtPath(f"{_OWNER_A}/Looks/SubsetMaterialA/Shader")).CreateInput(
+            "diffuse_texture", Sdf.ValueTypeNames.Asset
+        ).Set(Sdf.AssetPath("./textures/other_albedo.png"))
+        return Workflow(
+            name="Texture generation",
+            api=self._core.workflow.api,
+            inputs=self._core.workflow.inputs,
+            output_specs=[_texture_output("2", "albedo", OutputApplyBehavior.REPLACE, 0)],
+        )
+
+    async def _submit_textures(self, workflow: Workflow, prim_path: str) -> list[pathlib.Path]:
+        """Prepare a submission for one selected prim and return the textures it sends.
+
+        Args:
+            workflow: Workflow to submit.
+            prim_path: Selected prim path.
+
+        Returns:
+            Resolved texture paths bound to the submitted requests.
+        """
+        self._core.set_workflow(workflow)
+        submission = await self._core.prepare_submission([prim_path])
+        return [
+            pathlib.Path(binding.source).resolve()
+            for graph in submission.graphs
+            for binding in _workflow_request(graph).input_bindings
+            if binding.remix_type == RemixType.TEXTURE_FILE_PATH
+        ]
+
+    async def test_selected_mesh_with_subset_materials_skips_inherited_captured_texture(self):
+        """A mesh whose faces are all bound through GeomSubsets never sends its inherited captured texture."""
+        texture_workflow = self._reference_subset_cube()
+        mesh_workflow = self._core.workflow
+
+        # Texture outputs read the selection's materials, mesh outputs read the selected mesh's own material
+        for workflow, expected in (
+            (texture_workflow, [self._temp_path / "textures" / "other_albedo.png"]),
+            (mesh_workflow, []),
+        ):
+            with self.subTest(workflow=workflow.name):
+                self.assertEqual(await self._submit_textures(workflow, f"{_OWNER_A}/SubsetCube"), expected)
+
+    async def test_selected_mesh_with_partial_subset_coverage_keeps_fallback_texture(self):
+        """Faces outside every GeomSubset still render the mesh's own binding, so its texture is sent."""
+        texture_workflow = self._reference_subset_cube()
+        mesh_workflow = self._core.workflow
+        mesh = self._stage.GetPrimAtPath(f"{_OWNER_A}/SubsetCube")
+        UsdShade.MaterialBindingAPI(mesh).SetMaterialBindSubsetsFamilyType(UsdGeom.Tokens.nonOverlapping)
+        UsdGeom.Subset(self._stage.GetPrimAtPath(f"{_OWNER_A}/SubsetCube/SubsetB")).GetIndicesAttr().Set([6, 7, 8])
+
+        captured_texture = self._temp_path / "textures" / "source_albedo.png"
+        for workflow, expected in (
+            (texture_workflow, [captured_texture, self._temp_path / "textures" / "other_albedo.png"]),
+            (mesh_workflow, [captured_texture]),
+        ):
+            with self.subTest(workflow=workflow.name):
+                self.assertCountEqual(await self._submit_textures(workflow, f"{_OWNER_A}/SubsetCube"), expected)
+
     async def test_texture_only_mesh_output_deduplicates_owner_references(self):
         """One owner with two source references receives one generated model."""
         shutil.copy2(self._temp_path / "model.usda", self._temp_path / "second_model.usda")
@@ -232,4 +308,52 @@ class TestComfyUIJobCandidatesE2E(AsyncTestCase):
         self.assertEqual(
             [pathlib.Path(binding.source).resolve() for binding in _workflow_request(graph).input_bindings],
             [self._temp_path / "textures" / "source_albedo.png"],
+        )
+
+    async def test_mesh_input_texture_output_uses_reference_and_replaces_owner_materials(self):
+        """A Selected Mesh input reads each owner's reference, and the texture output replaces the owners' materials."""
+        self._core.set_workflow(
+            Workflow(
+                name="Mesh to texture",
+                api={"3": {"class_type": "RTXRemixImportMeshNode", "inputs": {"mesh_file_path": ""}}},
+                inputs=[
+                    WorkflowInput(
+                        port_id="3.inputs.mesh_file_path",
+                        label="Mesh",
+                        native_type=pathlib.Path,
+                        default_value=pathlib.Path(),
+                        value=SelectedMeshResolver(context_name=""),
+                        remix_type=RemixType.MESH_FILE_PATH,
+                    )
+                ],
+                output_specs=[
+                    WorkflowOutput(
+                        node_id="2",
+                        remix_type=RemixType.TEXTURE_FILE_PATH,
+                        texture_type="albedo",
+                        apply_behavior=OutputApplyBehavior.REPLACE,
+                    )
+                ],
+            )
+        )
+
+        submission = await self._core.prepare_submission([_OWNER_A, _OWNER_B])
+
+        # Both owners reference the same model, so they share one request and one texture Apply.
+        self.assertEqual(len(submission.graphs), 1)
+        graph = submission.graphs[0]
+        self.assertIsNone(graph.jobs[0].skip_reason)
+        self.assertEqual(
+            [pathlib.Path(binding.source).resolve() for binding in _workflow_request(graph).input_bindings],
+            [self._temp_path / "model.usda"],
+        )
+        target = next(job for job in graph.jobs if job.apply_binding).apply_binding.target
+        # Apply targets the material that each mesh under the owner binds, as a texture workflow does.
+        bound_materials = (
+            UsdShade.MaterialBindingAPI(self._stage.GetPrimAtPath(f"{owner}/Quad")).ComputeBoundMaterial()[0]
+            for owner in (_OWNER_A, _OWNER_B)
+        )
+        self.assertEqual(
+            set(target.texture_targets),
+            {("2", f"{material.GetPath()}/Shader.inputs:diffuse_texture") for material in bound_materials},
         )

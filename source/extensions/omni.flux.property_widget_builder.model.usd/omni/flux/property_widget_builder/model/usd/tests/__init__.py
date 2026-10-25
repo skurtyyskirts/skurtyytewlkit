@@ -15,49 +15,51 @@
 * limitations under the License.
 """
 
-from .unit.test_clipboard_roundtrip import TestClipboardRoundtrip
+from omni.flux.property_widget_builder.model.usd.tests.e2e.test_virtual_attribute_defaults import (
+    TestVirtualAttributeDefaults,
+)
+
 from .unit.test_bounds_adapter import TestBoundsAdapter
 from .unit.test_conditional_visibility_orchestrator import TestConditionalVisibilityOrchestrator
+from .unit.test_curve import TestCurveFieldEditor, TestPanelToEditorLayout
 from .unit.test_usd_edit_lifecycle import (
     TestCurvePrimvarModelInteractiveNotices,
-    TestCurvePrimvarModelMixedFirstEdit,
     TestUSDModelInteractiveNotices,
     TestUsdAttributeValueModelEditBatching,
     TestVirtualAttributeWrites,
 )
 from .unit.test_expression_evaluator import TestExpressionEvaluator
 from .unit.test_field_builder_bounds import TestFieldBuilderBounds
-from .unit.test_file_texture_picker import TestFileTexturePicker
+from .unit.test_file_texture_picker import TestFileTexturePicker, TestTexturePreviewEditor
 from .unit.test_gradient_direct_writes import TestGradientDirectWrites
 from .unit.test_listener import TestUSDListener
 from .unit.test_logical_groups import TestLogicalGroups
-from .unit.test_multichannel_paste import TestMultichannelPaste
 from .unit.test_property_group_expansion import TestPropertyGroupExpansionMixin
 from .unit.test_relationship_item import TestUSDRelationshipItem
 from .unit.test_relationship_utils import TestRelationshipUtils
 from .unit.test_relationship_value_model import TestUsdRelationshipValueModel
+from .unit.test_row_values import TestRowValues
 from .unit.test_setup_ui import TestUSDPropertyWidget
 from .unit.test_usd_attribute_item_bounds import TestUSDAttributeItemBounds
 from .unit.test_usd_attribute_xform_item import TestUSDAttributeXformItem
 from .unit.test_value_tooltips import TestUSDAttributeChannelTooltips, TestUSDAttributeValueTooltips
 
-from .e2e.test_curve_editor_popup import TestCurveEditorPopupLifecycle
+from .e2e.test_clipboard import TestRowClipboard
+from .e2e.test_curve_editor_popup import TestCurveEditorPopupLifecycle, TestCurvePrimvarModelMixedFirstEdit
 from .e2e.test_delegate_alignment import TestDelegateAlignment
 from .e2e.test_drag import TestUSDDragField
 from .e2e.test_numeric_drag_preview import TestNumericDragPreview
 from .e2e.test_gradient_command import (
     TestGradientEditorUndo,
     TestSetDataPrimvarsCommand,
-    TestUsdGradientWidgetDragLifecycle,
     TestUsdGradientWidgetLifecycle,
-    TestUsdGradientWidgetMixedFirstEdit,
 )
 
 __all__ = [
     "TestBoundsAdapter",
-    "TestClipboardRoundtrip",
     "TestConditionalVisibilityOrchestrator",
     "TestCurveEditorPopupLifecycle",
+    "TestCurveFieldEditor",
     "TestCurvePrimvarModelInteractiveNotices",
     "TestCurvePrimvarModelMixedFirstEdit",
     "TestDelegateAlignment",
@@ -67,11 +69,14 @@ __all__ = [
     "TestGradientDirectWrites",
     "TestGradientEditorUndo",
     "TestLogicalGroups",
-    "TestMultichannelPaste",
     "TestNumericDragPreview",
+    "TestPanelToEditorLayout",
     "TestPropertyGroupExpansionMixin",
     "TestRelationshipUtils",
+    "TestRowClipboard",
+    "TestRowValues",
     "TestSetDataPrimvarsCommand",
+    "TestTexturePreviewEditor",
     "TestUSDAttributeChannelTooltips",
     "TestUSDAttributeItemBounds",
     "TestUSDAttributeValueTooltips",
@@ -82,9 +87,8 @@ __all__ = [
     "TestUSDPropertyWidget",
     "TestUSDRelationshipItem",
     "TestUsdAttributeValueModelEditBatching",
-    "TestUsdGradientWidgetDragLifecycle",
     "TestUsdGradientWidgetLifecycle",
-    "TestUsdGradientWidgetMixedFirstEdit",
     "TestUsdRelationshipValueModel",
+    "TestVirtualAttributeDefaults",
     "TestVirtualAttributeWrites",
 ]

@@ -15,10 +15,13 @@
 * limitations under the License.
 """
 
+import omni.kit.clipboard
 import omni.kit.test
+import omni.kit.undo
 import omni.ui as ui
 import omni.usd
-from lightspeed.common.constants import PARTICLE_SCHEMA_NAME
+from carb.input import KeyboardInput
+from lightspeed.common.constants import PARTICLE_PRIMVAR_PREFIX, PARTICLE_SCHEMA_NAME
 from lightspeed.common.constants import PROPERTIES_NAMES_COLUMN_WIDTH
 from lightspeed.trex.properties_pane.particle.widget import ParticleSystemPropertyWidget
 from lightspeed.trex.properties_pane.particle.widget.legacy_support_helper import (
@@ -27,6 +30,8 @@ from lightspeed.trex.properties_pane.particle.widget.legacy_support_helper impor
 from omni.kit import ui_test
 from omni.flux.property_widget_builder.model.usd.logical_group_constants import SCALAR_CURVE_LOGICAL_SUFFIXES
 from pxr import Gf, Sdf
+
+_MIN_COLOR_ATTRIBUTE = "primvars:particle:minColor"
 
 
 class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
@@ -38,11 +43,97 @@ class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
         self._context.get_selection().set_selected_prim_paths([str(self._prim.GetPath())], False)
 
     async def tearDown(self):
+        """Close the fixture stage after selection changes close native editors."""
         if self._context:
             await self._context.close_stage_async()
         self._context = None
         self._stage = None
         self._prim = None
+
+    async def test_copy_paste_particle_rows_transfers_declared_legacy_companions(self):
+        """Verify selected particle rows transfer their declared companions without changing unrelated values."""
+        self.addCleanup(omni.kit.clipboard.copy, omni.kit.clipboard.paste() or "")
+        self.addCleanup(omni.kit.undo.clear_stack)
+        expected_companions = {
+            "Particle Size": (
+                "minSpawnSize",
+                "minTargetSize",
+                "maxSpawnSize",
+                "maxTargetSize",
+            ),
+            "Rotation Speed": (
+                "minSpawnRotationSpeed",
+                "minTargetRotationSpeed",
+                "maxSpawnRotationSpeed",
+                "maxTargetRotationSpeed",
+            ),
+            "Min Color Values": ("minSpawnColor", "minTargetColor"),
+            "Max Color Values": ("maxSpawnColor", "maxTargetColor"),
+            "Velocity": (),
+        }
+        target = self._create_particle_prim("/Target")
+        attribute_names = [
+            f"{PARTICLE_PRIMVAR_PREFIX}{name}" for companions in expected_companions.values() for name in companions
+        ]
+        for index, name in enumerate(attribute_names):
+            source_attribute = self._prim.GetAttribute(name)
+            value_type = type(source_attribute.Get())
+            source_attribute.Set(value_type((index + 1) / 16))
+            target.GetAttribute(name).Set(value_type(0))
+        for suffix, source_value, target_value in (
+            ("times", [0.0, 1.0], [0.0, 0.5]),
+            ("values", [2.0, 4.0], [6.0, 8.0]),
+        ):
+            name = f"{PARTICLE_PRIMVAR_PREFIX}maxVelocity:x:{suffix}"
+            attribute_names.append(name)
+            self._prim.GetAttribute(name).Set(source_value)
+            target.GetAttribute(name).Set(target_value)
+        self._prim.GetAttribute(f"{PARTICLE_PRIMVAR_PREFIX}spawnRatePerSecond").Set(99.0)
+        target.GetAttribute(f"{PARTICLE_PRIMVAR_PREFIX}spawnRatePerSecond").Set(31.0)
+        source_values = {name: self._prim.GetAttribute(name).Get() for name in attribute_names}
+        window, widget = await self._setup_particle_widget()
+        try:
+            # Copy and paste the same rows so legacy companions travel with their visible controls.
+            for prim, action in ((self._prim, "Copy Selected"), (target, "Paste Selected")):
+                widget.refresh([str(prim.GetPath())])
+                await ui_test.human_delay()
+                widget.collapse_all_groups()
+                await ui_test.human_delay()
+                spawn_group = await ui_test.find_with_retry(f"{window.title}//Frame/**/Label[*].text=='Spawn'")
+                await spawn_group.click()
+                await ui_test.human_delay()
+                items = widget.property_model.get_all_items(include_hidden=True)
+                async with ui_test.KeyDownScope(KeyboardInput.LEFT_CONTROL):
+                    for label, companions in expected_companions.items():
+                        with self.subTest(title=f"{action}: {label}"):
+                            matching_items = [
+                                item
+                                for item in items
+                                if "".join(model.get_value_as_string() for model in item.name_models) == label
+                            ]
+                            self.assertEqual(len(matching_items), 1)
+                            self.assertCountEqual(
+                                matching_items[0].logical_group_extra_attribute_names,
+                                [f"{PARTICLE_PRIMVAR_PREFIX}{name}" for name in companions],
+                            )
+                            row_label = await ui_test.find_with_retry(
+                                f"{window.title}//Frame/**/Label[*].text=='{label}'"
+                            )
+                            await row_label.click()
+                            await ui_test.human_delay()
+                await ui_test.human_delay()
+                # Opening the menu on a selected row preserves the five-row selection.
+                await row_label.click(right_click=True)
+                await ui_test.human_delay()
+                await ui_test.menu.select_context_menu(action, offset=ui_test.Vec2(10, 10))
+                await ui_test.human_delay()
+
+            self.assertEqual({name: target.GetAttribute(name).Get() for name in attribute_names}, source_values)
+            self.assertEqual({name: self._prim.GetAttribute(name).Get() for name in attribute_names}, source_values)
+            self.assertEqual(target.GetAttribute(f"{PARTICLE_PRIMVAR_PREFIX}spawnRatePerSecond").Get(), 31.0)
+        finally:
+            widget.destroy()
+            window.destroy()
 
     def _create_particle_prim(self, prim_path):
         prim = self._stage.DefinePrim(prim_path, "Mesh")
@@ -134,34 +225,21 @@ class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
             expected_values,
         )
 
-    async def _click_particle_size_button(self, widget):
-        action_window = ui.Window("Legacy Silent Upgrade Action Button", height=100, width=360)
-        action_widgets = []
-        try:
-            size_item = next(
-                item
-                for item in widget.property_model.get_all_items(include_hidden=True)
-                if "".join(model.get_value_as_string() for model in item.name_models) == "Particle Size"
-            )
-            widget._property_delegate.resolve_claims(widget.property_model)
-            size_builder = widget._property_delegate.get_widget_builder(size_item)
-            with action_window.frame:
-                with ui.VStack(height=0):
-                    ui.Spacer(height=ui.Pixel(12))
-                    with ui.HStack(height=ui.Pixel(32)):
-                        ui.Spacer(width=ui.Pixel(12))
-                        action_widgets.extend(size_builder(size_item))
-                        ui.Spacer(width=ui.Pixel(12))
-                    ui.Spacer(height=ui.Pixel(12))
-            await ui_test.human_delay(human_delay_speed=3)
-            size_button = ui_test.find(f"{action_window.title}//Frame/**/Button[*].text=='Particle Size'")
-            self.assertIsNotNone(size_button, "Expected Particle Size button to be visible.")
-            await size_button.click()
-            await ui_test.human_delay(human_delay_speed=5)
-        finally:
-            action_window.destroy()
+    async def _click_particle_size_button(self, window: ui.Window) -> None:
+        """Open the size editor from the real pane, expanding its group when needed."""
+        size_button_path = f"{window.title}//Frame/**/Button[*].text=='Particle Size'"
+        if ui_test.find(size_button_path) is None:
+            spawn_group = ui_test.find(f"{window.title}//Frame/**/Label[*].text=='Spawn'")
+            self.assertIsNotNone(spawn_group, "Expected the particle Spawn group to be visible.")
+            await spawn_group.click()
+            await ui_test.human_delay()
+        size_button = ui_test.find(size_button_path)
+        self.assertIsNotNone(size_button, "Expected Particle Size button to be visible.")
+        await size_button.click()
+        await ui_test.human_delay(human_delay_speed=5)
 
     async def test_particle_size_button_silently_upgrades_all_size_channels(self):
+        """Seed all legacy size channels through the rendered particle editor control."""
         self._author_size_legacy_values(self._prim)
         for animated_attr_name in (
             "primvars:particle:minSize:x",
@@ -181,7 +259,7 @@ class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
             self.assertNotIn("Minimum Spawn Size", visible_item_names)
             self.assertNotIn("Maximum Target Size", visible_item_names)
 
-            await self._click_particle_size_button(widget)
+            await self._click_particle_size_button(window)
 
             self._assert_curve_seeded(
                 self._prim,
@@ -194,10 +272,17 @@ class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
             )
             self.assertIsNone(ui_test.find("Upgrade Legacy Particle Attributes//Frame/**/Button[*]"))
         finally:
-            widget.destroy()
-            window.destroy()
+            try:
+                self._context.get_selection().set_selected_prim_paths([], False)
+                await self._context.selection_changed_async()
+                await ui_test.human_delay(1)
+            finally:
+                widget.destroy()
+                window.destroy()
+                await ui_test.human_delay()
 
     async def test_particle_size_button_silently_upgrades_multi_select_size_channels(self):
+        """Seed each selected particle through the rendered size editor control."""
         other_prim = self._create_particle_prim("/OtherParticle")
         self._author_size_legacy_values(self._prim)
         self._author_size_legacy_values(
@@ -228,7 +313,7 @@ class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
         window, widget = await self._setup_particle_widget([self._prim, other_prim])
 
         try:
-            await self._click_particle_size_button(widget)
+            await self._click_particle_size_button(window)
 
             self._assert_curve_seeded(
                 self._prim,
@@ -249,21 +334,14 @@ class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
                 },
             )
         finally:
-            widget.destroy()
-            window.destroy()
-
-    async def test_legacy_gradient_seed_authors_single_selected_particle_color(self):
-        self._author_min_color_legacy_values(self._prim)
-        self._assert_gradient_schema_ready(self._prim, "primvars:particle:minColor")
-
-        result = seed_current_animated_attrs_from_legacy("primvars:particle:minColor", "", [str(self._prim.GetPath())])
-
-        self.assertTrue(result)
-        self._assert_gradient_seeded(
-            self._prim,
-            "primvars:particle:minColor",
-            [[1.0, 0.5, 0.25, 1.0], [0.0, 0.25, 0.5, 0.75]],
-        )
+            try:
+                self._context.get_selection().set_selected_prim_paths([], False)
+                await self._context.selection_changed_async()
+                await ui_test.human_delay(1)
+            finally:
+                widget.destroy()
+                window.destroy()
+                await ui_test.human_delay()
 
     async def test_legacy_gradient_seed_authors_multi_selected_particle_colors(self):
         other_prim = self._create_particle_prim("/OtherParticle")
@@ -273,21 +351,21 @@ class TestLegacySilentUpgrade(omni.kit.test.AsyncTestCase):
             spawn=Gf.Vec4f(0.1, 0.2, 0.3, 1.0),
             target=Gf.Vec4f(0.7, 0.8, 0.9, 0.5),
         )
-        self._assert_gradient_schema_ready(self._prim, "primvars:particle:minColor")
-        self._assert_gradient_schema_ready(other_prim, "primvars:particle:minColor")
+        self._assert_gradient_schema_ready(self._prim, _MIN_COLOR_ATTRIBUTE)
+        self._assert_gradient_schema_ready(other_prim, _MIN_COLOR_ATTRIBUTE)
 
         result = seed_current_animated_attrs_from_legacy(
-            "primvars:particle:minColor", "", [str(self._prim.GetPath()), str(other_prim.GetPath())]
+            _MIN_COLOR_ATTRIBUTE, "", [str(self._prim.GetPath()), str(other_prim.GetPath())]
         )
 
         self.assertTrue(result)
         self._assert_gradient_seeded(
             self._prim,
-            "primvars:particle:minColor",
+            _MIN_COLOR_ATTRIBUTE,
             [[1.0, 0.5, 0.25, 1.0], [0.0, 0.25, 0.5, 0.75]],
         )
         self._assert_gradient_seeded(
             other_prim,
-            "primvars:particle:minColor",
+            _MIN_COLOR_ATTRIBUTE,
             [[0.1, 0.2, 0.3, 1.0], [0.7, 0.8, 0.9, 0.5]],
         )
