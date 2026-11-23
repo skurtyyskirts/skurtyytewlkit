@@ -24,10 +24,48 @@ Curve editing and channel selection belong to [the curve editor](../../omni.flux
 existing commands. `USDListener` routes USD changes back to the model. The delegate builds the corresponding controls.
 `USDModel` also supplies logical-group rows, `USDDelegate` claims them through field builders, and
 `USDPropertyWidget` connects the tree to layer notices. Models own USD synchronization and undoable authoring.
+Whole-color properties convert to their matching Gf vector type; numeric vector channels retain scalar conversion.
 
 You can show custom names for attributes. For example here, `translateY` is just `Y`:
 
 ![alt text](../data/images/preview.png)
+
+### Light and Emissive Drag Speeds
+
+All named light controls use shared field configurations in
+[the light field builders](../omni/flux/property_widget_builder/model/usd/field_builders/lights.py). Light intensity,
+radius, and material emissive intensity use these defaults for fine adjustments:
+
+| Field | Drag speed | Soft maximum |
+| --- | ---: | ---: |
+| Distant-light intensity | `0.1` | `65000` |
+| Other light intensity | `0.5` | `65000` |
+| Light radius | `0.1` | `65000` |
+| Material emissive intensity | `0.1` | `65504` |
+
+Tune light bounds and steps in `_DEFAULT_LIGHT_FIELD_CONFIG`; add type-specific step overrides in `_LIGHT_FIELD_OVERRIDES`,
+using the existing `LightTypes` enum as the key. Light types are resolved from the prim through
+[`omni.flux.utils.common.lights.get_light_type()`](../../omni.flux.utils.common/docs/README.md#architecture), including
+derived and versioned light schemas. A light field configuration with an explicit `step` enables metadata
+and type-specific step overrides. Omitting `step` preserves automatic range-derived speed and ignores step metadata
+and type-specific overrides, as used by color temperature, exposure, shaping, and volumetric radiance scale.
+
+For intensity and radius, explicit `ui:step` metadata overrides the light-type or shared default. Without a metadata
+override, a row containing multiple light types uses the largest applicable step, independent of selection order.
+For example, distant and sphere lights share an intensity step of `0.5` when edited together. The Toolkit definitions
+control editor sensitivity; light creation defaults remain separate.
+
+These speeds do not scale with the current value. They control dragging without snapping typed values to a step grid.
+Large drag adjustments take longer; direct numeric entry remains available. Soft maxima do not clamp typed input,
+while hard bounds still apply.
+
+One registration loop routes every configured light control through the factory, giving each row a fresh
+`FloatDragFieldGroup`. All light bounds come from the field configurations; intensity and radius retain their hard
+minimum of `0` and soft maximum of `65000`.
+
+Each emissive field receives a fresh `USDFloatDragField`, so one material's metadata cannot change another row's bounds
+or speed. Explicit material `ui:step` metadata overrides the default `0.1`; material bounds retain their existing
+precedence.
 
 ### Numeric Drag Preview
 
@@ -56,7 +94,7 @@ existing immediate-write behavior.
 
 ## Floating Property Editors
 
-Curve, Gradient, and texture-preview controls use the shared
+Color, Curve, Gradient, and texture-preview controls use the shared
 [`FieldPopupWindow` lifecycle](../../omni.flux.property_widget_builder.delegates/docs/README.md#floating-property-editors).
 
 `CurveFieldEditor` owns a per-opening model and session; standalone `PropertyPrimvarCurveModel` keeps
@@ -130,9 +168,38 @@ before control construction; existing controls do not observe live theme changes
 See the [Curve Editor styling contract](../../omni.flux.curve_editor.widget/docs/README.md#channel-styling) for direct
 editor consumers and selected-label styling.
 
+## Color Edit Sessions
+
+`begin_batch_edit()` coalesces color and numeric previews without adding Undo entries. `end_batch_edit()` restores
+the pre-gesture layer specs and authors the final value through the existing property commands in one synchronous
+Undo group. Ending an inactive batch does nothing. No Undo group remains open across frames.
+Field controls also pair `begin_edit()` and `end_edit()` around the session so `USDModel` can defer application
+listeners until editing finishes while authored USD values remain live.
+
+If a write fails, the model rolls back the current batch, restores displayed values, and preserves completed edit
+sessions. Locked target layers are rejected before a write command runs. Color fields use one preview batch per
+drag or typed edit, committing at mouse release or end-edit. New virtual attributes and custom creation callbacks wait
+until commit. Opening the picker creates no undo entry.
+Undo while the popup is idle restores the previous gesture and allows another edit in the same popup.
+During an active edit, the shared USD listener suppresses application refreshes. Undo/Redo and external writes
+are not isolated from preview writes: Undo may capture an uncommitted preview, and restoring the preview can replace
+an external write to the same attribute made during the gesture.
+Row removal cancels unfinished previews through the existing property-edit cancellation path. Normal popup dismissal
+commits focused input. The row widgets and open picker own the color field; model subscriptions hold it weakly.
+Closing the picker releases its subscriptions and native preview resources.
+Idle picker controls synchronize with refreshed USD values without creating an edit.
+
+Virtual color attributes retain their `create_callback(attribute, value)` creation hook. Release or end-edit runs
+that hook in the synchronous commit group, together with the final color write. Callback setup commands and the
+committed color undo and redo as one operation; previews do not run the hook or hold an undo group across frames.
+Creation callbacks must author their setup through Kit commands.
+
 ## Row-Owned Property State
 
 USD property rows can represent one authored USD attribute or a logical group of companion attributes. The delegate asks each row for owned value models, owned attributes, row state, reset, and override deletion.
+
+`value_type_name` exposes an ordinary attribute's declared USD type for clipboard matching, including virtual rows
+before authoring. Relationships, metadata, and logical rows return `None` and retain identity matching.
 
 - Normal scalar rows use their own value models and USD attributes.
 - Grouped rows, such as particle gradients, use suffix-based logical group definitions so `:times` and `:values` are handled as one row.
@@ -153,15 +220,38 @@ deriving completeness from reset/delete ownership, which can omit missing attrib
 value per declared attribute, check cardinality, then use `ChangeProperty(prev=None)` in canonical attribute and target
 order with USD notices deferred. Explicit undo restores prior edit-layer opinions, including inherited values without
 leaving overrides. Unchanged animated values are skipped; legacy companions retain their always-author behavior.
-The setter creates no editor, display models, or undo group. Clipboard paste or another caller owns grouping. Reported
+The setter returns edit outcomes in declared backing-property order and creates no editor, display models, or undo
+group. Clipboard paste or another caller owns grouping. Reported
 command failure stops further writes; previously successful writes can remain applied until undone. Grouped editors
 continue using `SetDataPrimvars` and their existing preview lifecycle.
 
+Ordinary USD row writes scope existing setters with `UsdAttributeBase.raise_on_write_failure()`, so synchronous failures
+raise after the model's refresh and rollback handling. Direct editor writes and callbacks running after that scope retain
+their existing failure and undo policies.
+
 Ordinary setters retain metadata, virtual creation, transform, bounds, and callback policies. USD dropdowns receive
-labels without automatic numeric conversion; integer-backed setters translate labels to USD indices. Native typed
-dropdowns retain their typed inputs. Clipboard-only model serialization, deserialization, and paste hooks are removed.
+labels without automatic numeric conversion; integer-backed setters translate labels to USD indices. The dropdown
+setter rejects values outside its declared choices. Native typed dropdowns retain their typed inputs.
+Clipboard-only model serialization, deserialization, and paste hooks are removed.
 Texture-field change notifications validate the displayed path without blocking writes; manual begin/end editing owns
 that blocking interval, so a programmatic refresh cannot prevent the following paste.
+
+### Texture Path Context
+
+Clipboard copy preserves source texture locations using the asset-path helper in
+[Common Utilities](../../omni.flux.utils.common/docs/README.md#asset-path-context).
+The clipboard helper passes an anchored source location to existing callbacks as a string. The asset value model owns
+destination formatting, validation, and authoring through the normal command path. Relative input from existing
+callbacks is anchored to the current edit target before destination formatting. The model follows
+`/persistent/app/material/dragDropMaterialPath` using each attribute's actual receiving layer, including session-layer
+definitions. Relative policy produces a layer-relative path when possible; absolute policy, anonymous receiving
+layers, and paths that cannot be made relative retain the absolute source location. This preserves texture identity
+after saving and reopening the stage.
+
+Accepted edits return an `EditResult` with the applied path. Rejections explain the authored path, receiving layer,
+and attempted location. Empty references allow clearing; unchanged references and generic assets bypass the
+readability check. Ordinary field edits and clipboard edits share this path. Clipboard operations transfer
+references, not texture files.
 
 ## Usage
 
@@ -198,6 +288,15 @@ with ui.Frame():
 ```
 
 ## Testing
+
+USD-backed color-picker tests cover live scene authoring, Undo/Redo, virtual attribute creation, rollback and
+interrupted edits. Generic parsing, normalized controls, selector synchronization and display rounding are tested
+once in the delegates picker E2E suite, without this USD model dependency. Shared floating-window tests cover host
+placement and chrome behavior.
+
+Clipboard tests exercise real USD models through the clipboard helper and menus, verifying stored values, validation
+and clamp feedback, Details dialogs, and undo. The property-widget context-menu tests cover generic menu availability,
+tooltips, and unmatched-property feedback.
 
 The Curve editor named-context workflow reuses one USD context for the Kit process lifetime. Each run opens a fresh
 stage and closes it during teardown, preserving stage isolation. Keep the native context alive because queued

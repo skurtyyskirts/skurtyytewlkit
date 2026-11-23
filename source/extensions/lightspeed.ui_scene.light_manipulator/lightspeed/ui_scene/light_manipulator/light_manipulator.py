@@ -340,6 +340,9 @@ class AbstractLightManipulator(sc.Manipulator):
         self._is_dragging = False
         self._shaping_authored_cache: bool | None = None
         self._cone_xform: sc.Transform | None = None
+        self._cone_lines: list[sc.Line] = []
+        self._cone_arcs: list[sc.Arc] = []
+        self._intensity_arrows: _HoverArrows | None = None
         self._cone_visible = True
         self._cone_threshold = CONE_THRESHOLD_DEFAULT
         self._cone_sides = CONE_SIDES_DEFAULT
@@ -353,10 +356,17 @@ class AbstractLightManipulator(sc.Manipulator):
             self.destroy()
 
     def destroy(self) -> None:
-        self._revoke_interaction_end_subscription()
-        self._cone_refresh_deferred = False
-        self._cone_xform = None
-        self._shaping_authored_cache = None
+        try:
+            self._revoke_interaction_end_subscription()
+        finally:
+            self._cone_refresh_deferred = False
+            self._cone_xform = None
+            self._cone_lines.clear()
+            self._cone_arcs.clear()
+            self._intensity_arrows = None
+            self._shaping_authored_cache = None
+            if self.model:
+                self.model.destroy()
 
     def _revoke_interaction_end_subscription(self):
         if self._interaction_end_subscription is None:
@@ -475,7 +485,7 @@ class AbstractLightManipulator(sc.Manipulator):
         persistent_head: bool = False,
         interactive: bool = True,
     ):
-        hover_arrows = _HoverArrows()
+        hover_arrows = self._intensity_arrows = _HoverArrows()
         arrow = hover_arrows.define(point1, point2)
         if persistent_head:
             arrow_head = hover_arrows.arrows_group[-1]
@@ -656,6 +666,8 @@ class AbstractLightManipulator(sc.Manipulator):
         the same near rim with a narrower far rim.
         """
         self._cone_xform = None
+        self._cone_lines.clear()
+        self._cone_arcs.clear()
         # `_compute_cone_length_units` is the single gate — returns 0 unless cone-visible,
         # spotlight-capable, shaping authored in (0°, 90°), and non-zero on-axis illuminance.
         length_units = self._compute_cone_length_units()
@@ -693,7 +705,7 @@ class AbstractLightManipulator(sc.Manipulator):
         self.build_cone_xform()
         with self._cone_xform:
             if base_radius > 1e-6:
-                sc.Arc(base_radius, axis=2, begin=-math.pi, end=math.pi, **outer_arc_style)
+                self._cone_arcs.append(sc.Arc(base_radius, axis=2, begin=-math.pi, end=math.pi, **outer_arc_style))
             self._draw_disk_source_frustum(
                 outer_half, base_radius, length_units, self._cone_sides, outer_style, outer_arc_style
             )
@@ -702,8 +714,8 @@ class AbstractLightManipulator(sc.Manipulator):
                     inner_half, base_radius, length_units, self._cone_sides, inner_style, inner_arc_style
                 )
 
-    @staticmethod
     def _draw_disk_source_frustum(
+        self,
         half_angle: float,
         base_radius: float,
         length_units: float,
@@ -719,9 +731,9 @@ class AbstractLightManipulator(sc.Manipulator):
             sin_phi = math.sin(phi)
             near = (base_radius * cos_phi, base_radius * sin_phi, 0.0)
             far = (far_radius * cos_phi, far_radius * sin_phi, -length_units)
-            sc.Line(near, far, **line_style)
+            self._cone_lines.append(sc.Line(near, far, **line_style))
         with sc.Transform(sc.Matrix44.get_translation_matrix(0.0, 0.0, -length_units)):
-            sc.Arc(far_radius, axis=2, begin=-math.pi, end=math.pi, **arc_style)
+            self._cone_arcs.append(sc.Arc(far_radius, axis=2, begin=-math.pi, end=math.pi, **arc_style))
 
     def _build(self):
         self._shape_xform = sc.Transform()
@@ -743,6 +755,7 @@ class AbstractLightManipulator(sc.Manipulator):
 
     def on_build(self):
         """Called when the model is changed"""
+        self._intensity_arrows = None
         model = self.model
         if not model:
             return
@@ -842,7 +855,7 @@ class RectLightManipulator(AbstractLightManipulator):
 
         if self.show_intensity_controls:
             # create hover arrows in the z-axis to indicate the intensity
-            hover_arrows = _HoverArrows()
+            hover_arrows = self._intensity_arrows = _HoverArrows()
             hover_arrows.define((h, h, 0), (h, h, z))
             hover_arrows.define((-h, -h, 0), (-h, -h, z))
             hover_arrows.define((h, -h, 0), (h, -h, z))
@@ -973,7 +986,7 @@ class DiskLightManipulator(AbstractLightManipulator):
 
         if self.show_intensity_controls:
             # create hover arrows in the z-axis to indicate the intensity
-            hover_arrows = _HoverArrows()
+            hover_arrows = self._intensity_arrows = _HoverArrows()
             hover_arrows.define((r, 0, 0), (r, 0, z))
             hover_arrows.define((-r, 0, 0), (-r, 0, z))
             hover_arrows.define((0, -r, 0), (0, -r, z))
@@ -1154,7 +1167,7 @@ class IntensityMixinFor3DManipulators:
         }
         arrow_attr_map = {0: "intensity", 1: "intensity", 2: "intensity"}
         # create hover arrows in the z-axis to indicate the intensity
-        hover_arrows = _HoverArrows()
+        hover_arrows = self._intensity_arrows = _HoverArrows()
         hover_gesture = sc.HoverGesture(
             on_began_fn=lambda _sender: hover_arrows.show(), on_ended_fn=lambda _sender: hover_arrows.hide()
         )

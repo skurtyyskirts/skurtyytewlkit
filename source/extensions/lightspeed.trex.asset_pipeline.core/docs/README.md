@@ -83,6 +83,15 @@ jobs, and persistence or Apply integration.
 - `SaveTextureMetadataHandler` and `SaveMeshMetadataHandler` are the default
   Apply/Revert boundary each builder binds to its terminal job. A consumer
   overrides either through the builder's `handler_type` parameter.
+- `AssetReplaceApplyHandler` replaces mesh references and restores them on Revert.
+  `AssetReplaceApplyTarget` stores the project, edit layer, and `ReferenceTarget` records.
+  Both use the reference operations in `jobs/reference_apply.py`, which ComfyUI also uses.
+  Generated markers store paths relative to their author layer and resolve against that layer after a project move.
+  Queued Apply and Revert still require the original project and edit-layer paths. A project move blocks those jobs.
+  `CreateReferenceOwnerSpecCommand` in `commands.py` creates a missing owner spec so Undo removes it.
+- `get_block_reason()` in `jobs/reference_apply.py` makes `ApplyStageWatcher` watch the USD context of every
+  stage target it checks. When that context opens or closes a project, the watcher refreshes Apply and Revert
+  availability, and on open it reconciles the pending jobs so automatic Apply runs once the project is back.
 - The `metadata` module exposes `capture_metadata_receipt()`,
   `write_metadata_for_paths()`, `revert_metadata()`, and
   `write_input_sidecars()`, the utility both default handlers and a
@@ -98,6 +107,14 @@ jobs, and persistence or Apply integration.
 The extension exposes two processing pipelines. The texture pipeline converts
 standalone or discovered textures. The mesh pipeline consumes the processed
 texture result and authors the final model.
+`MeshOptimizationRequest.skip_operations` defaults to `()`. Import `MetaStepOperation` from `pipeline.enums` to select optional operations of `MetaStep`:
+- `SCALE_NORMALIZATION` preserves geometry scale while the pipeline writes meter units.
+- `ROOT_WRAPPING` omits the `XForms` and `ReferenceTarget` wrappers and preserves the source hierarchy and default prim.
+  The caller must supply a valid default prim for Apply. Unit normalization still needs root Xforms with scale operations.
+
+Requests and prepare results from earlier versions decode with no operation skips.
+Metadata hashes the final file bytes and does not require wrapper names.
+
 `TextureTypes.SKYBOX` converts `.exr`, `.hdr`, or SDR sources to linear BC6H DDS with full mips and the `.s.rtex.dds` suffix.
 The standalone texture graph creates no material. Skybox uses the converted suffix map but has no material input.
 Every texture type accepts OpenEXR, identified by its file header. `StandardizeLinearTexturesStep` owns all input
@@ -333,6 +350,8 @@ the product-specific Apply/Revert actions.
 The exclusive lease prevents parallel jobs from sharing mutable USD state. It
 also prevents ingestion from replacing the interactive stage in the app's
 default context.
+Each ingestion context uses a private timeline, so ingestion does not change
+project time bounds.
 
 Steps open, save, and close stages only through
 `RemixAssetPipelineContext.open_stage()`, `save_stage()`, and `close_stage()`.

@@ -33,12 +33,13 @@ from lightspeed.trex.comfyui.core.job import ComfyUIJob
 from lightspeed.trex.comfyui.core.models import ComfyUIWorkflowRequest, Workflow, WorkflowInput, WorkflowOutput
 from lightspeed.trex.comfyui.core.preset import Preset
 from lightspeed.trex.comfyui.core.resolvers import ConstantResolver, ResolverConfigurationError
-from ...display_adapter import ComfyUIDisplayAdapter
-from ...workflow.items import InputItemGroup, OutputItemGroup
-from ...workflow.widget import WorkflowSetupWidget
 from omni import usd
 from omni.flux.job_queue.widget.display_adapter_base import JobAction
 from omni.kit.test import AsyncTestCase
+
+from ...display_adapter import ComfyUIDisplayAdapter
+from ...workflow.items import InputItemGroup, OutputItemGroup
+from ...workflow.widget import WorkflowSetupWidget
 
 
 def _make_input(
@@ -124,11 +125,13 @@ def _make_core(workflow=None):
     return core
 
 
-def _make_bare_widget(core=None) -> WorkflowSetupWidget:
+def _make_bare_widget(core=None, context=None, dispatcher=None) -> WorkflowSetupWidget:
     """Create a workflow widget without constructing its UI tree.
 
     Args:
         core: Mocked core bound to the widget, or a default running core when omitted.
+        context: Mocked USD context, or a default mock when omitted.
+        dispatcher: Mocked event dispatcher, or a default mock when omitted.
 
     Returns:
         The workflow widget configured for the texturecraft context.
@@ -139,7 +142,11 @@ def _make_bare_widget(core=None) -> WorkflowSetupWidget:
             return_value=core or _make_core(),
         ),
         patch("lightspeed.trex.comfyui.widget.workflow.widget.subscribe_comfyui_event", return_value=MagicMock()),
-        patch("lightspeed.trex.comfyui.widget.workflow.widget.usd.get_context", return_value=MagicMock()),
+        patch("lightspeed.trex.comfyui.widget.workflow.widget.usd.get_context", return_value=context or MagicMock()),
+        patch(
+            "lightspeed.trex.comfyui.widget.workflow.widget.get_eventdispatcher",
+            return_value=dispatcher or MagicMock(),
+        ),
         patch.object(WorkflowSetupWidget, "_build_ui"),
         patch.object(WorkflowSetupWidget, "_on_workflow_changed"),
     ):
@@ -213,38 +220,46 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
             "Open a project to select materials for new ComfyUI jobs. Existing queued jobs can continue.",
         )
 
-    async def test_closed_stage_refreshes_submission_availability(self) -> None:
-        """A fully closed project refreshes Run from the core submission requirement."""
+    async def test_stage_closed_refreshes_submission_availability(self) -> None:
+        """Observe stage close and refresh Run once when it fires."""
         # Arrange
-        core = _make_core(_make_workflow())
-        core.get_submission_block_reason.return_value = (
-            "Open a project to select materials for new ComfyUI jobs. Existing queued jobs can continue."
-        )
-        widget = _make_bare_widget(core)
-        widget._submit_button = MagicMock()
+        widget, callbacks = self._make_widget_with_stage_callbacks()
 
-        # Act
-        widget._on_stage_event(MagicMock(type=int(usd.StageEventType.CLOSED)))
+        with patch.object(widget, "_update_submit_button_state") as update_submit_button_state:
+            # Act
+            callbacks[usd.StageEventType.CLOSED](None)
 
         # Assert
-        self.assertFalse(widget._submit_button.enabled)
-        self.assertEqual(
-            widget._submit_button.tooltip,
-            "Open a project to select materials for new ComfyUI jobs. Existing queued jobs can continue.",
-        )
+        self.assertEqual(set(callbacks), {usd.StageEventType.CLOSED, usd.StageEventType.OPENED})
+        update_submit_button_state.assert_called_once_with()
 
-    async def test_opened_stage_refreshes_submission_availability(self) -> None:
-        """A fully opened project refreshes Run from the current live stage."""
+    async def test_stage_opened_refreshes_submission_availability(self) -> None:
+        """Observe stage open and refresh Run once when it fires."""
         # Arrange
-        core = _make_core(_make_workflow())
-        widget = _make_bare_widget(core)
-        widget._submit_button = MagicMock()
+        widget, callbacks = self._make_widget_with_stage_callbacks()
 
-        # Act
-        widget._on_stage_event(MagicMock(type=int(usd.StageEventType.OPENED)))
+        with patch.object(widget, "_update_submit_button_state") as update_submit_button_state:
+            # Act
+            callbacks[usd.StageEventType.OPENED](None)
 
         # Assert
-        self.assertTrue(widget._submit_button.enabled)
+        self.assertEqual(set(callbacks), {usd.StageEventType.CLOSED, usd.StageEventType.OPENED})
+        update_submit_button_state.assert_called_once_with()
+
+    def _make_widget_with_stage_callbacks(self):
+        """Create a bare widget and its stage observers indexed by stage event type.
+
+        Returns:
+            tuple: The widget and its registered callbacks.
+        """
+        context = MagicMock()
+        context.stage_event_name.side_effect = lambda event_type: event_type
+        dispatcher = MagicMock()
+        widget = _make_bare_widget(_make_core(_make_workflow()), context=context, dispatcher=dispatcher)
+        callbacks = {
+            call.kwargs["event_name"]: call.kwargs["on_event"] for call in dispatcher.observe_event.call_args_list
+        }
+        return widget, callbacks
 
     async def test_edit_preserves_saved_job_snapshot_missing_from_server_catalog(self):
         """Queue Edit keeps the persisted workflow until the user explicitly selects another one."""
@@ -844,60 +859,20 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
         # Arrange
         core = _make_core(_make_workflow())
         widget = _make_bare_widget(core)
-        owner_coroutine = MagicMock()
         prepare_task = MagicMock()
 
         # Act
-        with (
-            patch.object(
-                widget,
-                "_prepare_and_submit",
-                new=MagicMock(return_value=owner_coroutine),
-            ),
-            patch(
-                "lightspeed.trex.comfyui.widget.workflow.widget.asyncio.ensure_future",
-                return_value=prepare_task,
-            ) as ensure_future,
-        ):
+        with patch.object(widget._submissions, "start", return_value=prepare_task) as start:
             widget._on_submit_clicked()
 
         # Assert
-        ensure_future.assert_called_once_with(owner_coroutine)
-        prepare_task.set_name.assert_called_once_with("ComfyUIWorkflowSubmission")
-        self.assertIs(widget._submit_task, prepare_task)
-
-    async def test_queue_submission_routes_through_core(self):
-        """Prepared submissions are passed unchanged to the owning core."""
-        # Arrange
-        submission = ComfyUISubmission((MagicMock(),), 0)
-        core = _make_core(_make_workflow())
-        core.submit_prepared_submission = AsyncMock(return_value=ComfyUISubmissionResult(1, 0))
-        widget = _make_bare_widget(core)
-
-        # Act
-        await widget._submit_prepared_submission(submission)
-
-        # Assert
-        core.submit_prepared_submission.assert_awaited_once_with(submission)
-
-    async def test_queue_submission_preserves_all_material_graphs(self):
-        """Every prepared material graph is submitted in its resolved order."""
-        # Arrange
-        submission = ComfyUISubmission((MagicMock(), MagicMock()), 0)
-        core = _make_core(_make_workflow())
-        core.submit_prepared_submission = AsyncMock(return_value=ComfyUISubmissionResult(2, 0))
-        widget = _make_bare_widget(core)
-
-        # Act
-        await widget._submit_prepared_submission(submission)
-
-        # Assert
-        core.submit_prepared_submission.assert_awaited_once_with(submission)
+        start.assert_called_once_with(None, widget._prepare_and_submit, name="ComfyUIWorkflowSubmission")
+        prepare_task.add_done_callback.assert_called_once()
 
     async def test_queue_submission_failure_reports_recovery(self):
         """A failed queue submission reports recovery guidance and logs the error."""
         # Arrange
-        submission = ComfyUISubmission((MagicMock(),), 0)
+        submission = ComfyUISubmission((MagicMock(),), ())
         error = RuntimeError("queue unavailable")
         core = _make_core(_make_workflow())
         core.submit_prepared_submission = AsyncMock(side_effect=error)
@@ -907,11 +882,13 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
         with (
             patch("lightspeed.trex.comfyui.widget.workflow.widget._TrexMessageDialog") as dialog,
             patch("lightspeed.trex.comfyui.widget.workflow.widget.carb.log_error") as log_error,
+            patch("lightspeed.trex.comfyui.widget.workflow.widget.get_job_result_notifier") as get_notifier,
         ):
             await widget._submit_prepared_submission(submission)
 
         # Assert
         core.submit_prepared_submission.assert_awaited_once_with(submission)
+        get_notifier.return_value.register_graphs.assert_called_once_with(submission.graphs)
         self.assertEqual(
             dialog.call_args.args,
             (
@@ -920,6 +897,21 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
             ),
         )
         log_error.assert_called_once_with(f"Failed to submit ComfyUI jobs: {error}")
+
+    async def test_queue_submission_cancellation_still_registers_graph_results(self):
+        """Submission cancellation preserves result registration for accepted graphs."""
+        # Arrange
+        submission = ComfyUISubmission((MagicMock(),), ())
+        core = _make_core(_make_workflow())
+        core.submit_prepared_submission = AsyncMock(side_effect=asyncio.CancelledError())
+        widget = _make_bare_widget(core)
+        with patch("lightspeed.trex.comfyui.widget.workflow.widget.get_job_result_notifier") as get_notifier:
+            # Act
+            with self.assertRaises(asyncio.CancelledError):
+                await widget._submit_prepared_submission(submission)
+
+        # Assert
+        get_notifier.return_value.register_graphs.assert_called_once_with(submission.graphs)
 
     async def test_prepare_failure_reports_recovery_without_technical_details(self):
         """A preparation failure gives recovery guidance while retaining technical details in the log."""
@@ -968,29 +960,10 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
         log_error.assert_called_once_with(f"Invalid ComfyUI workflow input: {error}")
         widget._submit_prepared_submission.assert_not_awaited()
 
-    async def test_prepared_jobs_without_skips_submit_exact_graph(self):
-        """A fully resolvable prepared graph is queued without an extra confirmation."""
-        # Arrange
-        submission = ComfyUISubmission((MagicMock(),), 0)
-        core = _make_core(_make_workflow())
-        core.prepare_submission = AsyncMock(return_value=submission)
-        widget = _make_bare_widget(core)
-        widget._submit_prepared_submission = AsyncMock()
-
-        # Act
-        with (
-            patch("lightspeed.trex.comfyui.widget.workflow.widget._TrexMessageDialog") as dialog,
-        ):
-            await widget._prepare_and_submit()
-
-        # Assert
-        widget._submit_prepared_submission.assert_awaited_once_with(submission)
-        dialog.assert_not_called()
-
     async def test_queue_submission_all_failures_reports_exact_counts(self):
         """An entirely failed batch can be retried without duplicating queued work."""
         # Arrange
-        submission = ComfyUISubmission((MagicMock(),), 0)
+        submission = ComfyUISubmission((MagicMock(),), ())
         core = _make_core(_make_workflow())
         core.submit_prepared_submission = AsyncMock(return_value=ComfyUISubmissionResult(0, 1))
         widget = _make_bare_widget(core)
@@ -998,6 +971,7 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
         # Act
         with (
             patch("lightspeed.trex.comfyui.widget.workflow.widget._TrexMessageDialog") as dialog,
+            patch("lightspeed.trex.comfyui.widget.workflow.widget.get_job_result_notifier"),
         ):
             await widget._submit_prepared_submission(submission)
 
@@ -1009,34 +983,6 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
             "1 prepared job was not added. Check that the job queue is available, then try again.",
         )
         self.assertEqual(dialog.call_args.args[1], "ComfyUI Jobs Not Submitted")
-
-    async def test_queue_submission_partial_failure_continues_and_reports_exact_counts(self):
-        """A failed material does not block later graphs or invite retrying successful work."""
-        # Arrange
-        submission = ComfyUISubmission((MagicMock(), MagicMock(), MagicMock()), 0)
-        core = _make_core(_make_workflow())
-        core.submit_prepared_submission = AsyncMock(return_value=ComfyUISubmissionResult(2, 1))
-        widget = _make_bare_widget(core)
-
-        # Act
-        with (
-            patch("lightspeed.trex.comfyui.widget.workflow.widget._TrexMessageDialog") as dialog,
-        ):
-            await widget._submit_prepared_submission(submission)
-
-        # Assert
-        core.submit_prepared_submission.assert_awaited_once_with(submission)
-        self.assertEqual(
-            dialog.call_args.args,
-            (
-                (
-                    "2 prepared jobs were added to the queue.\n\n"
-                    "1 prepared job was not added. To avoid duplicates, select only the failed material before "
-                    "submitting again."
-                ),
-                "Some ComfyUI Jobs Not Submitted",
-            ),
-        )
 
     async def test_refresh_replaces_in_flight_task_to_prevent_stale_result(self):
         """The latest workflow refresh cancels an older request before it can publish stale data."""
@@ -1069,10 +1015,10 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
         widget = _make_bare_widget(core)
         pending_task = MagicMock()
         pending_task.done.return_value = False
-        widget._submit_task = pending_task
+        widget._submissions._tasks[None] = pending_task
 
         # Act
-        with patch("lightspeed.trex.comfyui.widget.workflow.widget.asyncio.ensure_future") as ensure_future:
+        with patch("omni.flux.utils.common.task_tracker.asyncio.ensure_future") as ensure_future:
             widget._on_submit_clicked()
 
         # Assert
@@ -1150,7 +1096,7 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
         submit_task = MagicMock()
         widget._workflow_refresh_task = refresh_task
         widget._workflow_load_task = load_task
-        widget._submit_task = submit_task
+        widget._submissions._tasks[None] = submit_task
 
         # Act
         widget._on_core_event(ComfyUIEventPayload("texturecraft", ComfyUIEventType.STATE_CHANGED))
@@ -1161,14 +1107,13 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
         submit_task.cancel.assert_called_once_with()
         self.assertIsNone(widget._workflow_refresh_task)
         self.assertIsNone(widget._workflow_load_task)
-        self.assertIsNone(widget._submit_task)
 
     async def test_destroy_cancels_tasks_and_releases_widgets(self):
         """Destroy cancels retained work and clears owned widget references."""
         # Arrange
         widget = _make_bare_widget(_make_core(_make_workflow()))
         tasks = [MagicMock(), MagicMock(), MagicMock()]
-        widget._workflow_refresh_task, widget._workflow_load_task, widget._submit_task = tasks
+        widget._workflow_refresh_task, widget._workflow_load_task, widget._submissions._tasks[None] = tasks
         widget._event_subscription = MagicMock()
         inputs_widget = MagicMock()
         widget._inputs_property_widgets = [inputs_widget]
@@ -1186,7 +1131,6 @@ class TestWorkflowSetupWidgetUnit(AsyncTestCase):
             task.cancel.assert_called_once_with()
         self.assertIsNone(widget._workflow_refresh_task)
         self.assertIsNone(widget._workflow_load_task)
-        self.assertIsNone(widget._submit_task)
         self.assertIsNone(widget._event_subscription)
         inputs_widget.destroy.assert_called_once_with()
         self.assertEqual(widget._inputs_property_widgets, [])

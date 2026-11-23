@@ -1,6 +1,22 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.6.1]
+### Changed
+- Removed agent-plugin tags from code comments.
+
+## [1.6.0]
+### Added
+- Added `MetaStepOperation` and `skip_operations` so a caller can skip scale normalization or root wrapping.
+- Stored generated reference markers relative to their author layer. Queued Apply and Revert still require the original project paths.
+- Added persisted Apply/Revert coverage and reused in-place marker lookup for targets with the same owner.
+- Protected persisted file inputs of queued jobs during graph cleanup.
+
+## [1.5.0]
+### Added
+- Added shared reference Apply, Revert, and capture-owner Undo for asset modifiers and ComfyUI, with private ingestion timelines.
+- Added `ApplyStageWatcher`, which refreshes Apply and Revert availability when a project opens or closes, and applies pending automatic jobs once their project opens again, for every Apply handler with a stage target.
+
 ## [1.4.0]
 ### Added
 - Added `StandardizeLinearTexturesStep`, which writes every non-DDS texture as a linear float OpenEXR file and resolves every UDIM tile list before channel extraction, factor application, normal conversion, and DDS encoding. Added Skybox textures with linear BC6H UF16 output, and used linear BC4 for Anisotropy and Measurement Distance and linear BC7 for Single Scattering. The pipeline identifies DDS sources by their `DDS ` magic number, not their suffix, and DDS sources skip every step except the final DDS step.

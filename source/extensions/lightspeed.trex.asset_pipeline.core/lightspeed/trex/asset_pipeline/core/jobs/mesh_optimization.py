@@ -83,6 +83,20 @@ class MeshOptimizationJob(Job):
     input_ports: ClassVar[tuple[JobInputPort[Any], ...]] = (SOURCE_MODEL, TEXTURE_INPUT)
     output_ports: ClassVar[tuple[JobOutputPort[Any], ...]] = (OPTIMIZED_MESH,)
 
+    def get_input_urls(self, inputs: JobInputs) -> tuple[str, ...]:
+        """Return model, layer, and processed texture files from available inputs."""
+        urls = []
+        if self.SOURCE_MODEL in inputs:
+            prepared = inputs[self.SOURCE_MODEL]
+            if prepared.already_optimized:
+                return (str(prepared.source_path),)
+            urls.extend((str(prepared.model_work_path), str(prepared.source_path), *prepared.referenced_layers))
+        if self.TEXTURE_INPUT in inputs:
+            urls.extend(
+                url for texture in inputs[self.TEXTURE_INPUT].items for url in (texture.asset_url, *texture.udim_tiles)
+            )
+        return tuple(urls)
+
     async def execute(
         self,
         job_directory: pathlib.Path,
@@ -111,7 +125,7 @@ class MeshOptimizationJob(Job):
             # The prepare job found a valid .meta sidecar on the source. Publish it in place with no step and
             # settle as skipped with outputs, so the Apply handler still consumes it (ComfyUI Replace today,
             # asset library later).
-            # ponytail: lineage lists the model only; add its layers and textures when the asset library moves files.
+            # The lineage lists the model only. Add its layers and textures when the asset library moves files.
             model_hash = await run_in_worker_thread(hash_file, str(prepared.source_path))
             if model_hash is None:
                 raise RuntimeError(f"Cannot hash model lineage entry: {prepared.source_path}")
@@ -169,7 +183,9 @@ class MeshOptimizationJob(Job):
             source_path=prepared.source_path,
         )
         local_output_dir, is_remote_output = resolve_local_output_dir(job_directory, prepared.output_url)
-        config = RemixAssetPipelineConfig(output_dir=local_output_dir, texture_type=None)
+        config = RemixAssetPipelineConfig(
+            output_dir=local_output_dir, texture_type=None, skip_operations=prepared.skip_operations
+        )
         context = RemixAssetPipelineContext(items=[remix_item], source_root=prepared.source_root)
         context.replace_udim_textures_by_empty = prepared.replace_udim_textures_by_empty
         # Validate every ledger entry against the texture result and build the lookup map.

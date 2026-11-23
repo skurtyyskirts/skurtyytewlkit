@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from omni.flux.job_queue.core.enums import ApplyDisposition, ApplyOperation, JobState
 from omni.flux.job_queue.core.errors import JobError
-from omni.flux.job_queue.core.models import QueueGraphSnapshot, QueueJobSnapshot
+from omni.flux.job_queue.core.models import QueueGraphSnapshot, QueueJobSnapshot, UsageSnapshot
 from omni.flux.job_queue.core.job import Job, JobInputs, JobOutputs, JobProgress, JobProgressCallback
 from omni.flux.job_queue.widget.constants import APPLY_FILTER_OPTIONS, PROBLEM_DISPLAY_STATES
 from omni.flux.job_queue.widget.enums import DisplayState
@@ -173,6 +173,7 @@ def _model(
         Refreshed queue model with mocked runtime dependencies.
     """
     interface = MagicMock()
+    interface.usage_snapshot_provider = None
     interface.get_graph_snapshots.return_value = graphs
     snapshots = {snapshot.job_id: snapshot for graph in graphs for snapshot in graph.jobs}
     interface.get_job_snapshot.side_effect = snapshots.get
@@ -496,6 +497,24 @@ class TestQueueModel(AsyncTestCase):
         # Assert
         self.assertEqual(state, DisplayState.WAITING)
         self.assertEqual(model.get_state_tooltip(row, state), "Waiting for the product server.")
+
+    async def test_target_adapter_failure_shows_no_target_and_warns(self):
+        """A product adapter that fails to resolve targets leaves the job and its graph without a target."""
+        # Arrange
+        snapshot = _snapshot(graph_id=uuid.uuid4())
+        job = _MockJob(job_id=snapshot.job_id)
+        adapter = MagicMock()
+        adapter.get_targets.side_effect = RuntimeError("The product stage is unavailable.")
+        model = _model([_graph(snapshot)], {snapshot.job_id: job}, adapter)
+        graph = model.get_item_children(None)[0]
+
+        # Act
+        with patch("omni.flux.job_queue.widget.model.carb.log_warn") as log_warn:
+            targets = (model.get_targets(model.all_items[0].row), model.get_graph_targets(graph))
+
+        # Assert
+        self.assertEqual(targets, ((), ()))
+        self.assertIn("Could not resolve targets", log_warn.call_args.args[0])
 
     async def test_failure_tooltip_uses_safe_reason_not_diagnostic(self):
         """Primary status help never leaks the durable exception message."""
@@ -926,7 +945,7 @@ class TestQueueModel(AsyncTestCase):
         ui_thread = threading.get_ident()
         inventory_threads = []
 
-        def get_graphs_artifact_file_count(_graph_ids):
+        def get_graphs_artifact_file_count(_graph_ids, _snapshot):
             inventory_threads.append(threading.get_ident())
             return 2
 
@@ -938,7 +957,7 @@ class TestQueueModel(AsyncTestCase):
         await model.wait_for_background_tasks()
 
         # Assert
-        model.interface.get_graphs_artifact_file_count.assert_called_once_with((snapshot.graph_id,))
+        model.interface.get_graphs_artifact_file_count.assert_called_once_with((snapshot.graph_id,), UsageSnapshot())
         self.assertEqual(len(inventory_threads), 1)
         self.assertNotEqual(inventory_threads[0], ui_thread)
         self.assertEqual(counts, [2])
@@ -1003,7 +1022,7 @@ class TestQueueModel(AsyncTestCase):
         ui_thread = threading.get_ident()
         delete_threads = []
 
-        def delete_graphs(_graph_ids):
+        def delete_graphs(_graph_ids, _snapshot):
             delete_threads.append(threading.get_ident())
             model.interface.get_graph_snapshots.return_value.clear()
             return (retained_path,)

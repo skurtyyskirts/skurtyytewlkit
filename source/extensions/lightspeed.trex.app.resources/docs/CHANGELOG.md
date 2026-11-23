@@ -1,10 +1,18 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [1.31.0]
+## [1.32.0]
 ### Added
 - Added the scatter brush toolbar icon and docked the Scatter window next to the Editor in the StageCraft layout (hidden in the other layouts)
 - Added a `cube_textured` ingested asset and its texture set to the example project so the scatter brush's texture assignment can be tested end to end
+
+## [1.31.1]
+### Removed
+- Removed Job Details from the StageCraft layout. It opens floating at its default size from the Window menu.
+
+## [1.31.0]
+### Added
+- Added Asset Modifiers and a docked Job Queue to the StageCraft layout, and the MDI `vector-square-edit` icon.
 
 ## [1.30.5]
 ### Added

@@ -32,6 +32,7 @@ import omni.kit.clipboard
 import omni.kit.undo
 import omni.ui as ui
 import omni.usd
+from carb.eventdispatcher import get_eventdispatcher
 from carb.input import KeyboardInput
 from lightspeed.common import constants as _constants
 from lightspeed.hdremix.renderer_settings.dlss_settings import SETTINGS_DLSS_NEURAL_RENDERING_AVAILABLE
@@ -89,6 +90,24 @@ def _push_window_drop_event(asset_path):
     carb.eventdispatcher.get_eventdispatcher().dispatch_event(omni.appwindow.GLOBAL_EVENT_WINDOW_DROP, payload)
 
 
+async def _wait_for_material_actions(max_updates: int = 300) -> None:
+    """Wait until the open material menu replaces its loading item with the material actions.
+
+    The menu loads its actions asynchronously from the MDL subidentifier of each shader. A cold MDL cache on a CI
+    runner can make this load take seconds, so a fixed number of frames is not enough.
+
+    Args:
+        max_updates: Maximum number of app updates to wait before the caller checks the menu content.
+    """
+    for _ in range(max_updates):
+        menu = ui.Menu.get_current()
+        if menu is not None and all(
+            child.identifier != "material_actions_loading" for child in ui.Inspector.get_children(menu)
+        ):
+            return
+        await ui_test.human_delay(1)
+
+
 class TestComponents(Enum):
     """
     Simple Enum used to find the components of interest during tests
@@ -117,6 +136,14 @@ class TestComponents(Enum):
 class TestMaterialPropertyWidget(AsyncTestCase):
     # Before running each test
     async def setUp(self):
+        settings = carb.settings.get_settings()
+        policy = "/persistent/app/material/dragDropMaterialPath"
+        previous = settings.get(policy)
+        if previous is None:
+            self.addCleanup(settings.destroy_item, policy)
+        else:
+            self.addCleanup(settings.set, policy, previous)
+        settings.set_string(policy, "relative")
         await arrange_windows()
         await open_stage(_get_test_data("usd/project_example/combined.usda"))
         # be sure that the replacement layer is the target layer
@@ -146,20 +173,19 @@ class TestMaterialPropertyWidget(AsyncTestCase):
         usd_context = omni.usd.get_context()
 
         # Create Material Property refresher for USD selection changed events
-        def on_stage_event(event):
-            if event.type == int(omni.usd.StageEventType.SELECTION_CHANGED):
-                # Grab the USD selected prims
-                prim_paths = list(set(usd_context.get_selection().get_selected_prim_paths()))
-                items = [usd_context.get_stage().GetPrimAtPath(prim_path) for prim_path in prim_paths]
+        def on_stage_event(_event):
+            # Grab the USD selected prims
+            prim_paths = list(set(usd_context.get_selection().get_selected_prim_paths()))
+            items = [usd_context.get_stage().GetPrimAtPath(prim_path) for prim_path in prim_paths]
 
-                # Grab prims and refresh the material properties
-                mat_property_wid.refresh(items)  # NOTE: This occurs from AssetReplacementsPane in app
+            # Grab prims and refresh the material properties
+            mat_property_wid.refresh(items)  # NOTE: This occurs from AssetReplacementsPane in app
 
         # Subscribe to USD selection changes
-        self._events = usd_context.get_stage_event_stream()
-        self._stage_event_delegate = self._events.create_subscription_to_pop(
-            on_stage_event,
-            name="Selection Change Subscription",
+        self._stage_event_delegate = get_eventdispatcher().observe_event(
+            event_name=usd_context.stage_event_name(omni.usd.StageEventType.SELECTION_CHANGED),
+            on_event=on_stage_event,
+            observer_name="lightspeed.trex.properties_pane.material.widget:TestMaterialPropertyWidget.__setup_widget",
         )
 
         await ui_test.human_delay(human_delay_speed=1)
@@ -201,8 +227,6 @@ class TestMaterialPropertyWidget(AsyncTestCase):
         return False
 
     async def __destroy(self, window, material_property_wid):
-        self._events = None
-        self._stage_event_delegate.unsubscribe()
         self._stage_event_delegate = None
 
         material_property_wid.destroy()
@@ -534,10 +558,14 @@ class TestMaterialPropertyWidget(AsyncTestCase):
             self.assertIsNone(ignore_ingestion_button)
             self.assertIsNone(cancel_ingestion_button)
 
-            # text should be the asset path
-            self.assertEqual(
-                OmniUrl(asset_path).path, OmniUrl(texture_file_fields[0].widget.model.get_value_as_string()).path
+            # The authored relative reference and displayed field still identify the entered texture.
+            attribute = texture_file_fields[0].widget.model.attributes[-1]
+            authored = (
+                usd_context.get_stage().GetEditTarget().GetLayer().GetAttributeAtPath(attribute.GetPath()).default
             )
+            self.assertFalse(Path(authored.path).is_absolute())
+            self.assertEqual(texture_file_fields[0].widget.model.get_value_as_string(), authored.path)
+            self.assertEqual(Path(attribute.Get().resolvedPath), Path(asset_path))
 
         finally:
             await self.__destroy(_window, _material_property_wid)
@@ -621,10 +649,14 @@ class TestMaterialPropertyWidget(AsyncTestCase):
             await ignore_ingestion_button.click()
             await ui_test.human_delay(20)
 
-            # text should be the asset path
-            self.assertEqual(
-                OmniUrl(asset_path).path, OmniUrl(diffuse_texture_file_field.widget.model.get_value_as_string()).path
+            # Ignore permits the edit; formatting preserves the same un-ingested texture's identity.
+            attribute = diffuse_texture_file_field.widget.model.attributes[-1]
+            authored = (
+                usd_context.get_stage().GetEditTarget().GetLayer().GetAttributeAtPath(attribute.GetPath()).default
             )
+            self.assertFalse(Path(authored.path).is_absolute())
+            self.assertEqual(diffuse_texture_file_field.widget.model.get_value_as_string(), authored.path)
+            self.assertEqual(Path(attribute.Get().resolvedPath), Path(asset_path))
 
         finally:
             await self.__destroy(_window, _material_property_wid)
@@ -1352,7 +1384,7 @@ class TestMaterialPropertyWidget(AsyncTestCase):
             menu_image = ui_test.find(f"{_window.title}//Frame/**/Image[*].identifier=='menu_burger_image'")
             self.assertIsNotNone(menu_image)
             await menu_image.click()
-            await ui_test.human_delay(15)
+            await _wait_for_material_actions()
 
             # grab hamburger menu and ensure it is populated correctly
             context_menu = await omni.kit.ui_test.menu.get_context_menu()
@@ -1375,7 +1407,7 @@ class TestMaterialPropertyWidget(AsyncTestCase):
             menu_image = ui_test.find(f"{_window.title}//Frame/**/Image[*].identifier=='menu_burger_image'")
             self.assertIsNotNone(menu_image)
             await menu_image.click()
-            await ui_test.human_delay(15)
+            await _wait_for_material_actions()
 
             # grab hamburger menu and ensure it is populated correctly
             context_menu = await omni.kit.ui_test.menu.get_context_menu()
@@ -1390,6 +1422,15 @@ class TestMaterialPropertyWidget(AsyncTestCase):
 
             # Convert through the reopened menu and verify the authored material reference.
             stage = usd_context.get_stage()
+
+            def refresh_material_properties():
+                """Use the app's synchronous material-change refresh wiring during conversion."""
+                selected_paths = usd_context.get_selection().get_selected_prim_paths()
+                _material_property_wid.refresh([stage.GetPrimAtPath(path) for path in selected_paths])
+
+            _material_changed_subscription = _material_property_wid.subscribe_on_material_changed(
+                refresh_material_properties
+            )
             replacement_layer = Sdf.Layer.FindOrOpen(stage.GetRootLayer().ComputeAbsolutePath("./replacements.usda"))
             self.assertIsNotNone(replacement_layer)
             self.assertEqual(stage.GetEditTarget().GetLayer(), replacement_layer)
@@ -1451,7 +1492,7 @@ class TestMaterialPropertyWidget(AsyncTestCase):
             menu_image = ui_test.find(f"{_window.title}//Frame/**/Image[*].identifier=='menu_burger_image'")
             self.assertIsNotNone(menu_image)
             await menu_image.click()
-            await ui_test.human_delay(15)
+            await _wait_for_material_actions()
             context_menu = await ui_test.menu.get_context_menu()
             self.assertIn("_", context_menu, f"No enabled material actions after undo: {context_menu}")
             self.assertIn("Convert to Translucent", context_menu["_"])

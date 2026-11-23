@@ -1,6 +1,15 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.10.5]
+### Fixed
+
+- Fixed nested mesh names to retain the owning mesh asset in the selection tree.
+
+## [1.10.4]
+### Changed
+- Migrated deprecated event stream subscriptions to Events 2.0 (`carb.eventdispatcher`).
+
 ## [1.10.3]
 ### Added
 - Added Copy Light and Paste Light actions for mesh asset, descendant, and instance selections to the Property Panel selection-tree context menu.

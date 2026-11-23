@@ -1,6 +1,22 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.3.14]
+### Changed
+- Migrated the end-to-end test selection subscription to Events 2.0 (`carb.eventdispatcher`).
+
+## [2.3.13]
+### Fixed
+- Deferred material-menu destruction until callbacks finish and verified texture references after ingestion decisions.
+
+## [2.3.12]
+### Fixed
+- Show only the Thin Opaque or Diffusion Profile subsurface scattering properties selected by `subsurface_diffusion_profile`.
+
+## [2.3.11]
+### Fixed
+- Made the material burger menu end-to-end tests wait until the menu loads its actions, so that slow MDL loads on CI no longer fail them.
+
 ## [2.3.10]
 ### Added
 - End-to-end coverage for Texture Transform defaults, editing, and reset.

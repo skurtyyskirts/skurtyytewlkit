@@ -1,6 +1,33 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.4.0]
+### Changed
+- Updated the Job Queue visibility test cleanup to supply a usage snapshot before graph deletion.
+- Used shared Job Queue notifications for submission counts, skip reasons, and accepted ComfyUI results, even when submission is cancelled.
+- Replaced mocked notification unit tests with E2E checks in the Job Queue visibility and typed product workflow tests.
+- Imported the shared submission notification helper from its notifications submodule.
+
+## [2.3.1]
+### Changed
+- Migrated deprecated event stream subscriptions to Events 2.0 (`carb.eventdispatcher`).
+
+## [2.3.0]
+### Added
+- Showed the target prim paths of ComfyUI jobs in the Job Queue Target column.
+
+## [2.2.3]
+### Changed
+- Used the shared `ProgressPopup.run_cancellable()`, `CallbackValueModel`, and `TaskTracker` instead of local copies. A cancelled submission now keeps the Run button busy until it settles.
+
+## [2.2.2]
+### Added
+- Added an E2E test for node pack inputs that have no Toolkit semantic type, for example a prompt.
+
+## [2.2.1]
+### Fixed
+- Opened the Timeout field editor with Ctrl+click in the timeout edit test. A double click did not open the editor when slow frames put the two clicks outside the real-time double-click window.
+
 ## [2.2.0]
 ### Added
 - Added a persistent Timeout field in Workflow Inputs, in minutes, with the shared input-row layout, a drag range of 1–360 minutes, and a hard minimum of 0. A Timeout of 0 means no timeout.

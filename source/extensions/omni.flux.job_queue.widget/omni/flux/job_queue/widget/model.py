@@ -26,6 +26,7 @@ from omni.flux.job_queue.core.apply_executor import ApplyExecutor
 from omni.flux.job_queue.core.enums import ApplyDisposition, ApplyOperation, JobState
 from omni.flux.job_queue.core.interface import QueueInterface
 from omni.flux.job_queue.core.job import Job, JobProgress
+from omni.flux.job_queue.core.models import UsageSnapshot
 from omni.flux.utils.common import Event, EventSubscription
 from omni.flux.utils.widget.tree_widget.model import TreeModelBase
 from omni.kit.notification_manager import NotificationStatus, post_notification
@@ -670,6 +671,38 @@ class QueueModel(TreeModelBase):
             return row.name
 
     @staticmethod
+    def get_targets(row: Row) -> tuple[str, ...]:
+        """Return adapter targets without allowing product failures into rendering.
+
+        Args:
+            row: Child presentation data.
+
+        Returns:
+            Safe targets, or an empty tuple.
+        """
+        if row.adapter is None or row.job is None:
+            return ()
+        try:
+            return tuple(row.adapter.get_targets(row.job))
+        except ADAPTER_ERRORS as error:
+            carb.log_warn(f"Could not resolve targets for queue job {row.job_id}: {error}")
+            return ()
+
+    @classmethod
+    def get_graph_targets(cls, graph: QueueGraphItem) -> tuple[str, ...]:
+        """Return the targets of the first graph job that has any.
+
+        Processing stages have no target of their own, so a graph shows the target of the job that produced its input.
+
+        Args:
+            graph: Graph presentation item.
+
+        Returns:
+            Safe targets, or an empty tuple when no job has one.
+        """
+        return next((targets for child in graph.children if (targets := cls.get_targets(child.row))), ())
+
+    @staticmethod
     def get_active_progress_label(row: Row) -> str | None:
         """Return safe adapter progress text for one active row.
 
@@ -1042,7 +1075,9 @@ class QueueModel(TreeModelBase):
         """
         graph_ids = tuple(graph.graph_id for graph in graphs)
         try:
-            file_count = await asyncio.to_thread(self.interface.get_graphs_artifact_file_count, graph_ids)
+            provider = self.interface.usage_snapshot_provider
+            snapshot = await provider() if provider else UsageSnapshot()
+            file_count = await asyncio.to_thread(self.interface.get_graphs_artifact_file_count, graph_ids, snapshot)
         except GRAPH_DELETE_ERRORS as error:
             carb.log_warn(f"Could not inventory queue output files for graphs {graph_ids}: {error}")
             self._notify_inventory_failure(len(graphs))
@@ -1057,7 +1092,9 @@ class QueueModel(TreeModelBase):
         """
         graph_ids = tuple(graph.graph_id for graph in graphs)
         try:
-            retained_cleanup_paths = await asyncio.to_thread(self.interface.delete_graphs, graph_ids)
+            provider = self.interface.usage_snapshot_provider
+            snapshot = await provider() if provider else UsageSnapshot()
+            retained_cleanup_paths = await asyncio.to_thread(self.interface.delete_graphs, graph_ids, snapshot)
         except GRAPH_DELETE_ERRORS as error:
             carb.log_warn(f"Could not delete queue graphs {graph_ids}: {error}")
             graph_count = len(graphs)
@@ -1073,7 +1110,7 @@ class QueueModel(TreeModelBase):
             paths = '", "'.join(str(path) for path in retained_cleanup_paths)
             post_notification(
                 f"Deleted {graph_count} selected graph{'s' if graph_count != 1 else ''}, but inactive output "
-                f'folders remain at "{paths}". Cleanup will be retried when the job queue starts.',
+                f'folders remain at "{paths}".',
                 status=NotificationStatus.WARNING,
             )
 

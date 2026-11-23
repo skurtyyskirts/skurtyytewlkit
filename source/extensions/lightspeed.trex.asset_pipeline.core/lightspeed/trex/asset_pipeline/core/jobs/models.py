@@ -25,6 +25,7 @@ __all__ = [
     "MeshOptimizationResult",
     "PrepareOptimizationResult",
     "ProcessedTexture",
+    "ReferenceTarget",
     "TextureLedgerEntry",
     "TextureOptimizationItem",
     "TextureOptimizationRequest",
@@ -38,12 +39,44 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from omni.flux.asset_importer.core.data_models import TextureTypes
+from pxr import Sdf
 
+from ..pipeline.enums import MetaStepOperation
 from ..pipeline.item import TextureAsset
 
 # Skip reasons the optimization jobs record when they settle with outputs but did no work.
 ALREADY_OPTIMIZED_REASON = "Asset already optimized"
 NO_TEXTURES_REASON = "No textures to optimize"
+
+
+def _validate_nonblank_string(field_name: str, value: object) -> None:
+    """Validate one exact persisted identity string."""
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a str")
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be blank")
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceTarget:
+    """Identify one reference owner and the source reference that Replace removes."""
+
+    owner_prim_path: str
+    source_reference: Sdf.Reference | None
+    source_layer_identifier: str | None
+
+    def __post_init__(self) -> None:
+        """Validate the exact owner and source identities."""
+        _validate_nonblank_string("owner_prim_path", self.owner_prim_path)
+        sdf_path = Sdf.Path(self.owner_prim_path)
+        if not sdf_path.IsAbsolutePath() or not sdf_path.IsPrimPath():
+            raise ValueError("owner_prim_path must be an absolute USD prim path")
+        if self.source_reference is not None and not isinstance(self.source_reference, Sdf.Reference):
+            raise TypeError("source_reference must be an Sdf.Reference or None")
+        if self.source_layer_identifier is not None:
+            _validate_nonblank_string("source_layer_identifier", self.source_layer_identifier)
+        if (self.source_reference is None) is not (self.source_layer_identifier is None):
+            raise ValueError("source reference and layer identifier must both be set or both be None")
 
 
 def _validate_texture_fields(key: str, path: pathlib.Path, texture_type: TextureTypes) -> None:
@@ -260,6 +293,7 @@ class MeshOptimizationRequest:
         replace_udim_textures_by_empty: Author an empty shader attribute for UDIM textures instead
             of a ``<UDIM>`` token. Model ingestion sets this to ``True``.
         extra_textures: Additional textures to process and publish without model bindings.
+        skip_operations: Optional pipeline operations to omit.
     """
 
     source_path: pathlib.Path
@@ -268,6 +302,7 @@ class MeshOptimizationRequest:
     replace_udim_textures_by_empty: bool = True
 
     extra_textures: tuple[TextureOptimizationItem, ...] = ()
+    skip_operations: tuple[MetaStepOperation, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the persisted request boundary.
@@ -284,6 +319,10 @@ class MeshOptimizationRequest:
             raise TypeError("output_url must be a str or None")
         if self.output_url is not None and not self.output_url.strip():
             raise ValueError("output_url must not be blank")
+        if type(self.skip_operations) is not tuple or not all(
+            isinstance(operation, MetaStepOperation) for operation in self.skip_operations
+        ):
+            raise TypeError("skip_operations must be a tuple of MetaStepOperation values")
 
         if type(self.extra_textures) is not tuple or not all(
             type(item) is TextureOptimizationItem for item in self.extra_textures
@@ -449,6 +488,7 @@ class PrepareOptimizationResult:
             a ``<UDIM>`` token. Carried from the source request through the prepare phase.
         already_optimized: The source model has a valid ``.meta`` sidecar, so it was ingested before. The
             prepare job ran no steps, and the mesh job publishes the source in place without any step.
+        skip_operations: Optional pipeline operations to omit, carried from the source request.
     """
 
     model_work_path: pathlib.Path
@@ -460,6 +500,7 @@ class PrepareOptimizationResult:
     output_url: str | None = None
     replace_udim_textures_by_empty: bool = True
     already_optimized: bool = False
+    skip_operations: tuple[MetaStepOperation, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the exact persisted result shape.
@@ -494,3 +535,7 @@ class PrepareOptimizationResult:
             raise TypeError("texture_ledger must be a tuple of TextureLedgerEntry values")
         if type(self.already_optimized) is not bool:
             raise TypeError("already_optimized must be a bool")
+        if type(self.skip_operations) is not tuple or not all(
+            isinstance(operation, MetaStepOperation) for operation in self.skip_operations
+        ):
+            raise TypeError("skip_operations must be a tuple of MetaStepOperation values")

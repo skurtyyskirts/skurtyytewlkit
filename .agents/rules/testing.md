@@ -13,9 +13,18 @@ Non-trivial/risky feature work -> plan tests before impl. Use Plan mode/approval
   Helpers, cleanup, and exception-assertion contexts do not themselves add Acts; each subtest has independent AAA.
 - Expected exceptions use `self.assertRaises`/`self.assertRaisesRegex`, never manual flags.
 - Test run: direct ext BAT -> add `-- --no-window`; visible UI only on ask. `repo.toml` `repo_test` already headless.
+- Unattended tests and coverage runs must save reports without opening browsers or other visible UI. For Python
+  `webbrowser` consumers, use a process-local `BROWSER` command override that exits successfully; preserve normal CI
+  detection and the user's browser settings. Open a report only when the user asks.
 - E2E tests: `tests/e2e/`, real Kit, real data, actual UI or public service/API entry point; verify the workflow outcome
   through UI, API responses, USD, or filesystem state. Headless unless user asks visible UI. UI E2Es use widget IDs and
-  narrative workflow comments, not Arrange/Act/Assert sections; service/API tests need no UI gestures.
+  narrative workflow comments, not Arrange/Act/Assert sections; service/API tests need no UI gestures. Every E2E
+  describes each step and expected outcome with a plain-language inline comment; a docstring alone is not enough.
+- Tests do what the real app or user does: same entry points, inputs, and completion signals. Wait for the signal the
+  app uses (returned future/task done, UI state, event), never a fixed frame count. For a flaky test, find how it
+  differs from the app first; fix a wrong setup to match the app, and never make a test pass by making it less like the
+  app (longer waits, retries, direct model writes, skipped steps). A test that needs a hook the app lacks means the app
+  or the test design is wrong.
 - E2E must not replace workflow data or exercised components with mocks/fakes/stubs. A representative real in-memory
   stage is valid; a stage-independent workflow needs no stage. Only data-free interception of an irreversible external
   effect may replace its terminal boundary; verify the request after the real application path reaches it.
@@ -29,6 +38,9 @@ Non-trivial/risky feature work -> plan tests before impl. Use Plan mode/approval
   fixture project -> explicit fixture layers/paths; no production discovery APIs unless discovery itself under test.
 - Every `tests/__init__.py` must export its test classes.
 - Never skip tests unless the user explicitly authorizes it.
+- Commit only tests that CI runs. Tests for `tools/` scripts and other code outside CI test jobs never run, so do not
+  commit them. Write throwaway regression tests while coding if needed, then delete them. Reviews must not ask to keep
+  or restore such tests.
 - Review only violations introduced or worsened by the delta; unrelated historical test debt remains out of scope.
   Touching a test, class, or file does not make its existing violations reviewable. Require a causal link from the
   changed behavior to each finding and requested fix; proximity or relevance to the same feature is insufficient.

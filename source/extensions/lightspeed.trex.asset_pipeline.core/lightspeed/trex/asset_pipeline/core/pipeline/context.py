@@ -24,9 +24,9 @@ import itertools
 import os
 import pathlib
 import shutil
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from collections.abc import Iterator
 
 import carb
 import omni.usd
@@ -36,8 +36,8 @@ from pxr import Sdf, Usd
 if TYPE_CHECKING:
     from ..jobs.models import TextureLedgerEntry
 
+from .enums import MetaStepOperation
 from .item import RemixAssetItem, TextureAsset
-
 
 # Keep runner-owned path segments short so a deep workspace root (for example a OneDrive-redirected
 # Documents folder) stays under MAX_PATH. No consumer of these paths is given a \\?\ prefix: NVTT
@@ -76,7 +76,9 @@ def _lease_ingestion_context() -> _IngestionContextLease:
         return _INGESTION_CONTEXT_FREE_LIST.pop()
 
     name = f"remix_asset_pipeline_ingestion_{next(_INGESTION_CONTEXT_NAME_COUNTER)}"
-    return _IngestionContextLease(name=name, context=omni.usd.create_context(name))
+    context = omni.usd.create_context(name)
+    context.set_timeline(name)
+    return _IngestionContextLease(name=name, context=context)
 
 
 def _return_ingestion_context(lease: _IngestionContextLease) -> None:
@@ -126,6 +128,7 @@ class RemixAssetPipelineContext(PipelineContext[RemixAssetItem]):
         sub_usd_lineage: Every (source_path, published_path) pair for sub-USD layers the runner published
             alongside the model. Populated by the publication step so the mesh job can include them in
             the complete asset lineage.
+        skip_operations: Optional operations that the caller supplies or does not require.
     """
 
     source_root: pathlib.Path | None = None
@@ -135,6 +138,7 @@ class RemixAssetPipelineContext(PipelineContext[RemixAssetItem]):
     force_dds_reencode: bool = False
     referenced_layers: tuple[str, ...] = ()
     texture_ledger: tuple[TextureLedgerEntry, ...] = ()
+    skip_operations: tuple[MetaStepOperation, ...] = ()
     stage_context_name: str = field(default="", init=False)
     _stage_context: omni.usd.UsdContext | None = field(default=None, init=False, repr=False)
     _stage_path: pathlib.Path | None = field(default=None, init=False, repr=False)

@@ -3,15 +3,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [1.10.0]
 ### Added
+- Loaded the Scatter window (lightspeed.trex.scatter.widget) in StageCraft.
 - Listed Kit's studio light rigs in the viewport Lighting menu after its lookdev HDRI rigs.
 - Added a Mod Sky light rig for each sky of the open project's skydome folder, showing the level's in-game Remix API dome and its sun while keeping the level's own lights lit.
 
 ### Changed
 - Made the per-stage lighting-mode setting key public as `get_lighting_mode_setting_key`.
 
+## [1.9.2]
+### Changed
+- Migrated deprecated event stream subscriptions to Events 2.0 (`carb.eventdispatcher`).
+
+## [1.9.1]
+### Fixed
+- Opened the workspace panels before querying lazy viewport content in the capture-swap and viewport hotkey E2E workflows.
+- Matched the application startup settings in StageCraft workflow tests so Kit's stock viewport cannot replace the Remix viewport window.
+
 ## [1.9.0]
 ### Added
-- Loaded the Scatter window (lightspeed.trex.scatter.widget) in StageCraft.
+- Added the Asset Modifiers and Job Queue windows to the StageCraft dependencies.
 
 ## [1.8.11]
 ### Added

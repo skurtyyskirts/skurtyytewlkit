@@ -1,6 +1,29 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [4.1.0]
+### Fixed
+
+- Fixed the AI Tools action to focus the workflow tab after the layout opens.
+- Reported Stage Manager submission counts, skip reasons, and accepted ComfyUI results after cancellation, and modifier results in Last Run.
+- Replaced mocked tab focus and notification unit tests with E2E checks in the widget test.
+- Cancelled layout callbacks and deferred tab focus on shutdown and tested AI Tools and Asset Modifiers tab focus after layout completion.
+
+## [4.0.0]
+### Changed
+- Standardized row-action item queries, including Asset Modifiers, simplified Category callbacks, retained explicit Delete/Restore targets, and tightened regression coverage.
+
+## [3.2.1]
+### Changed
+- Checked in the asset modifier workflow test that the Job Queue Target column shows the selected prim.
+
+## [3.2.0]
+### Added
+- Added the Asset Modifiers row action and Remix Asset Modifiers context submenu.
+
+### Changed
+- Used the shared `ProgressPopup.run_cancellable()` and `TaskTracker` to prepare and track ComfyUI jobs.
+
 ## [3.1.8]
 ### Fixed
 - The ComfyUI submission action adds the valid items to the queue without a confirmation. A dialog shows only when no selected item is valid.

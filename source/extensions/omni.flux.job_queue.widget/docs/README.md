@@ -11,9 +11,10 @@ Hierarchical UI for queues owned by `omni.flux.job_queue.core`.
   selected-graph Delete controls.
 - Expose persistent Start and Stop controls for the core-owned scheduler, with Running, Stopping, and Stopped status.
 - Confirm Revert and selected-graph Delete, and report exact bulk-action results with native notifications.
-- Provide exact-job-type display adapters for job names, user-facing progress, focus/edit, and product actions.
+- Provide job-type display adapters for job names, user-facing progress, focus/edit, and product actions.
 - Show graph summaries, topology, exclusive child-state counts, and clickable child navigation in the details panel.
 - Show typed job ports, available values, product metadata/actions, logs, and explicitly labelled technical diagnostics.
+- Centralize submission counts, skip reasons, and one result notification per registered job.
 
 ## Non-Responsibilities
 
@@ -75,8 +76,8 @@ boundary. Apply-operation failures retain the prior stable disposition, remain a
 not automatically loop. Filter-scoped root and footer actions remain available for other eligible jobs. Selected-graph
 Delete remains available for completed work and warns that queue cleanup does not restore project changes.
 
-Display adapters register one explicit `name` and one exact `job_type`. Lookup never walks inheritance or depends on
-registration order. Active adapters may provide user-facing status and progress phrases, a temporary waiting reason,
+Display adapters register one explicit `name` and one `job_type`. Lookup uses the nearest registered type in the
+job's MRO, so an exact registration wins over its base type, and never depends on registration order. Active adapters may provide user-facing status and progress phrases, a temporary waiting reason,
 an ordered collection of product actions with stable IDs, and ordered product-detail sections with explicit placement
 and optional local directories. They may create one model-scoped action event subscription while the queue is visible.
 The queue owns that subscription; the product adapter handles its events and requests the appropriate model rows to
@@ -104,11 +105,51 @@ Exact directories appear as actions in their owning Inputs, Outputs, or product 
 technical sections own actions that copy their identifiers and diagnostics. Technical exception types and tracebacks
 appear only in the final **Technical details** section. Detail labels use the same standard sizes as the rest of the app.
 
-The five columns are **Job / Stage**, **Status**, **Completed**, **Apply**, and **Actions**. Status combines the current
-state with structured job or graph progress. Completed shows execution completion time; clicking its header or any
+The six columns are **Job / Stage**, **Target**, **Status**, **Completed**, **Apply**, and **Actions**. Target shows the
+first path from `JobDisplayAdapter.get_targets()` like the Stage Manager (`mesh_123/mesh`), a bold count of the
+others, and every full path in the tooltip. Only the longer of the parent name and the name elides. A graph
+shows the targets of its first job that has any. Status combines the current state with structured job or graph progress. Completed shows execution completion time; clicking its header or any
 completed timestamp toggles the persistent relative/absolute format. Only graph roots are
 draggable or deletable. A one-job graph still renders as a root and one child. The toolbar filter button opens one
 Stage Manager-style popup containing the graph/stage, status, and Apply filters. The Apply filter exposes the five
 durable dispositions directly: **Not Ready**, **No Apply Needed**, **Ready to Apply**, **Applied**, and **Declined**.
 The adjacent **AUTO**/**MANUAL** badge toggles the persistent automatic-Apply preference. Detailed operation failures
 remain in Status and tooltips.
+
+## Notifications
+
+Asset Modifiers and AI Tools use the shared notification API.
+`omni.flux.job_queue.widget.notifications.post_submission_notification(submitted_count, skip_reasons, button_infos=None)`
+reports the accepted count.
+If items were skipped, it also reports their count and the first reason.
+Skips use `WARNING`. Other submissions use `INFO`.
+Zero accepted jobs is an error. Kit notifications have no error status, so it shows the modal **No Jobs Created**
+dialog with the first skip reason instead of a notification.
+Callers can supply buttons that open the relevant workspace.
+
+Register the prepared graphs after submission settles, including when it raises or is cancelled:
+
+```python
+from omni.flux.job_queue.widget import get_job_result_notifier
+
+get_job_result_notifier().register_graphs(graphs)
+```
+
+`register_graphs(graphs, summarize=None, on_result=None)` registers each graph's first job with its graph name.
+Graphs that the queue did not accept are ignored.
+This preserves result notifications when persistence completes before submission cancellation reaches the caller.
+Call `register_graphs()` in a `finally` block around the awaited submission.
+The submission must settle persistence before it propagates cancellation.
+
+`register(job_id: UUID, graph_name: str, summarize=None, on_result=None)` tracks that job, not the whole graph.
+The notifier posts once when the job reaches a terminal state.
+Registration reports an already-terminal job synchronously before it returns.
+For `DONE`, `summarize(job_id)` can return the result text.
+If no summary is available, the text is `graph name: state`.
+`FAILED` uses `WARNING`. Other terminal states use `INFO`.
+After the notification, `on_result(message)` can update a caller-owned result field, such as **Last Run**.
+
+The widget extension owns the `JobResultNotifier` instance and releases its queue subscriptions at shutdown.
+The notifier retains callbacks until the job completes, its graph is deleted, or the notifier is destroyed.
+Queue events reach the main loop before the notifier posts notifications or calls result callbacks.
+Callers use `get_job_result_notifier()` instead of creating their own notifier or queue subscription.

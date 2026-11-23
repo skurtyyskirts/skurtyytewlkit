@@ -1,6 +1,28 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [6.0.0]
+### Added
+- Added persisted output folder ownership for ComfyUI jobs so queue cleanup can remove generated files.
+
+### Changed
+- Breaking API change: replaced `ComfyUISubmission.skipped_count` with `skip_reasons: tuple[str, ...]`, which preserves exact first-job skip reasons in preparation order.
+- Replaced unit tests that mocked submission and material candidates with E2E tests on a real stage.
+- Added queue-load coverage for generation jobs saved before the output folder field existed.
+- Protected persisted file inputs of queued jobs during graph cleanup.
+- Protected native USD mesh dependencies of queued ComfyUI jobs during graph cleanup.
+- Shortened the processed output folder name to the first 12 characters of the job id, to keep Windows paths short.
+
+## [5.0.0]
+### Changed
+- Moved reference Apply to Asset Pipeline with renamed USD markers and codecs, so meshes applied and jobs queued with 1.6.x ComfyUI cannot be reverted or restored.
+- Moved the Apply refresh on project open and close to Asset Pipeline, which covers every stage target in every USD context, not only contexts with a ComfyUI core. `ComfyUICore` no longer takes `stage_event_callback`.
+- `ComfyUIApplyTarget` and `ComfyUIAssetApplyTarget` extend the Asset Pipeline `ApplyStageTarget`, which validates the context, project, and edit layer.
+
+## [4.0.1]
+### Fixed
+- Fixed workflow inputs that the Toolkit skipped when it did not know their `remix_type`, for example `prompt` or `auto`, or their primitive `type`. These inputs now get a Constant default. A float input and an active preset accept an integer value such as `1`.
+
 ## [4.0.0]
 ### Added
 - Added prompt cancellation that waits for queue removal and a persistent job timeout with a 3600-second default. A timeout of 0 means no time limit.

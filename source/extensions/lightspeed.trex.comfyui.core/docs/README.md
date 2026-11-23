@@ -15,12 +15,13 @@ file transfer, persistence, and output Apply behavior.
 - Build one typed job graph for each resolved source candidate.
 - Register all job, result, resolver, target, receipt, and handler codecs.
 - Apply texture and model changes only at one terminal graph job.
-- Reconcile pending Apply work for each explicit USD context.
 
 ## Non-Responsibilities
 
 - Does not render the AI Tools UI. `lightspeed.trex.comfyui.widget` owns that surface.
 - Does not execute or store the shared queue. `omni.flux.job_queue.core` owns that work.
+- Does not refresh Apply work when a project opens or closes. `ApplyStageWatcher` in
+  `lightspeed.trex.asset_pipeline.core` does that for every stage target.
 - Does not define Remix model and texture processing steps. `lightspeed.trex.asset_pipeline.core` owns them.
 - Does not define general texture or reference mutations.
 - Does not implement tagging outputs until the RTX Remix node pack defines their result contract.
@@ -40,8 +41,10 @@ ComfyUICore
 
 - `ComfyUICore` resolves candidates and builds output-driven graphs for one USD context.
 - `ComfyUICore.prepare_submission(prim_paths)` returns a `ComfyUISubmission` with only valid graphs.
-  `skipped_count` counts excluded items. It does not count graphs in the returned collection.
+  `skip_reasons` preserves the exact reason from each excluded graph's first job, in preparation order.
   `submit_prepared_submission` adds the valid batch in one queue transaction and returns a `ComfyUISubmissionResult`.
+  The first graph job generates the ComfyUI output. UI callers register that job with the shared result notifier.
+  UI callers use `post_submission_notification` from `omni.flux.job_queue.widget.notifications` to report accepted graphs and skip reasons.
   `get_retarget_state` returns a `ComfyUIRetargetState` for the Retarget action.
 - `ComfyUIAPI` uploads inputs, submits prompts, reads history, downloads declared files, and cancels prompts.
   Cancellation retries requests and queue checks until a valid response confirms removal, without a time limit.
@@ -55,6 +58,18 @@ ComfyUICore
 - `ComfyUITextureApplyHandler` replaces only configured texture outputs.
 - `ComfyUIAssetApplyHandler` adds or replaces model references through `Setup` and replaces textures in one undo group.
 - Constant-only asset graphs use the terminal asset Apply handler for metadata. They do not mutate the stage.
+
+### Input Contract
+
+- `texture_file_path` and `mesh_file_path` inputs use their semantic getters. Selected Texture and Selected Mesh are
+  the defaults.
+- Every other `remix_type`, for example `prompt`, `auto`, or a value from a newer node pack, has no semantic getter.
+  The input offers the getters of its primitive type, and Constant is the default.
+- A primitive `type` that the Toolkit does not know uses the JSON type of the workflow value: text, integer, float,
+  or boolean. A linked value uses text.
+- A workflow value that does not match the input type gives an empty Constant of that type.
+- A float input accepts an integer value, for example `1`, because ComfyUI saves a whole float as an integer.
+- Only malformed metadata skips an input, for example a `type` or `remix_type` that is not a string.
 
 ### Output Contract
 

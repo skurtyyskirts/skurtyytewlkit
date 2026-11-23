@@ -56,7 +56,7 @@ or raw log noise:
 | Plugin/skill | Use |
 |--------------|-----|
 | Superpowers | Workflow skills for planning, debugging, TDD, review, and verification when the task warrants the extra structure. |
-| Ponytail | Keeps scope small: prefer existing repo patterns, standard tools, and the smallest correct diff. Install the plugin; no repo wiring is required. |
+| Ponytail | Keeps scope small: prefer existing repo patterns, standard tools, and the smallest correct diff. Install the plugin; no repo wiring is required. Do not commit its `# ponytail:` comments. |
 | Caveman | Forces terse agent responses while preserving exact code, commands, and technical terms. Install/configure it user-locally; this repo does not enable terse mode by default. |
 | tokf | Filters verbose command output before it reaches the agent. Keep normal repo commands; the repo-local `.tokf` rewrites and filters make `build.bat`, `build_docs.bat`, `format_code.bat`, `lint_code.bat`, `repo.bat` subcommands, Kit tests, and Toolkit app BAT launches plug-and-play. |
 
@@ -143,6 +143,13 @@ the relevant `.agents/rules/` file first, then update wrappers only when discove
 Internal-only procedures live under `.agents/commands/internal/` and are indexed from that directory's README. They are
 not listed in the public command tables. Their `internal-<name>` skill wrappers make them discoverable, and the GitHub
 mirror removes the wrappers with the procedures.
+
+### Codex Reviews on Windows
+
+Codex review workers grant read access to the installation directory of `pwsh` found on `PATH`, falling back to
+`powershell`. Self-contained PowerShell needs adjacent runtime files to start; without this access, the canary can
+fail with `Failed to resolve full path of the current executable`. The grant remains read-only, and shell network
+access remains disabled.
 
 ### Review Scheduling
 

@@ -19,10 +19,10 @@ __all__ = ["WorkflowSetupWidget"]
 
 import asyncio
 import functools
-import threading
 
 import carb
 import omni.kit.undo
+from carb.eventdispatcher import get_eventdispatcher
 from lightspeed.trex.comfyui.core.core import ComfyUISubmission
 from lightspeed.trex.comfyui.core.enums import (
     ComfyUIEventType,
@@ -37,9 +37,12 @@ from lightspeed.trex.comfyui.core.resolvers import ConstantResolver, ResolverCon
 from lightspeed.trex.utils.widget import TrexMessageDialog as _TrexMessageDialog
 from lightspeed.trex.utils.widget.workspace import WorkspaceWidget
 from omni import ui, usd
+from omni.flux.job_queue.widget import get_job_result_notifier
+from omni.flux.job_queue.widget.notifications import post_submission_notification
 from omni.flux.property_widget_builder.model.native import NativeDelegate
 from omni.flux.property_widget_builder.widget import Model, PropertyWidget
 from omni.flux.utils.common.decorators import ignore_function_decorator
+from omni.flux.utils.common.task_tracker import TaskTracker
 from omni.flux.utils.dialog.progress_popup import ProgressPopup
 from omni.flux.utils.widget.collapsable_frame import PropertyCollapsableFrameWithInfoPopup
 from omni.flux.utils.widget.combo_box import SectionedComboBox, SectionedComboItem
@@ -140,7 +143,7 @@ class WorkflowSetupWidget(WorkspaceWidget):
         self._stage_event_subscription = None
         self._workflow_refresh_task: asyncio.Task | None = None
         self._workflow_load_task: asyncio.Task | None = None
-        self._submit_task: asyncio.Task | None = None
+        self._submissions = TaskTracker()
         self._splitter_layout_task: asyncio.Task | None = None
         self._selected_workflow_identity: Workflow | None = None
         self._workflow_load_failed = False
@@ -150,10 +153,14 @@ class WorkflowSetupWidget(WorkspaceWidget):
         self._build_ui()
         self._event_subscription = subscribe_comfyui_event(context_name, self._on_core_event)
         context = usd.get_context(context_name)
-        self._stage_event_subscription = context.get_stage_event_stream().create_subscription_to_pop(
-            self._on_stage_event,
-            name="ComfyUIWorkflowProjectState",
-        )
+        self._stage_event_subscription = [
+            get_eventdispatcher().observe_event(
+                event_name=context.stage_event_name(event_type),
+                on_event=lambda _: self._update_submit_button_state(),
+                observer_name="lightspeed.trex.comfyui.widget:WorkflowSetupWidget._update_submit_button_state",
+            )
+            for event_type in (usd.StageEventType.CLOSED, usd.StageEventType.OPENED)
+        ]
         self._on_workflow_changed()
 
     def _build_ui(self):
@@ -951,24 +958,22 @@ class WorkflowSetupWidget(WorkspaceWidget):
         self._update_submit_button_state()
         if self._get_submit_block_reason() is not None:
             return
-        self._submit_task = asyncio.ensure_future(self._prepare_and_submit())
-        self._submit_task.set_name("ComfyUIWorkflowSubmission")
+        task = self._submissions.start(None, self._prepare_and_submit, name="ComfyUIWorkflowSubmission")
+        if task is not None:
+            # The tracker frees the widget first, so the Run button reads the final state.
+            task.add_done_callback(lambda _task: self._update_submit_button_state())
         self._update_submit_button_state()
 
     async def _prepare_and_submit(self) -> None:
         """Prepare jobs and submit the valid graphs."""
-        task = asyncio.current_task()
         try:
-            submission, cancelled = await self._prepare_with_progress()
+            submission, cancelled = await ProgressPopup.run_cancellable(
+                "Preparing ComfyUI Jobs", "Preparing jobs...", self._core.prepare_submission
+            )
             if cancelled:
                 return
             if not submission.graphs:
-                _TrexMessageDialog(
-                    "The selected items do not provide the inputs required by the active workflow.\n\n"
-                    "No jobs were added to the queue.",
-                    "No ComfyUI Jobs Created",
-                    disable_cancel_button=True,
-                )
+                post_submission_notification(0, submission.skip_reasons)
             else:
                 await self._submit_prepared_submission(submission)
         except ResolverConfigurationError as error:
@@ -986,45 +991,6 @@ class WorkflowSetupWidget(WorkspaceWidget):
                 "ComfyUI Jobs Not Prepared",
                 disable_cancel_button=True,
             )
-        finally:
-            if self._submit_task is task:
-                self._submit_task = None
-            self._update_submit_button_state()
-
-    async def _prepare_with_progress(self) -> tuple[ComfyUISubmission, bool]:
-        """Prepare a submission behind a cancellable progress popup.
-
-        Returns:
-            The prepared submission and whether the user cancelled preparation.
-        """
-        cancel_event = threading.Event()
-        progress_popup = ProgressPopup(title="Preparing ComfyUI Jobs", status_text="Preparing jobs...")
-        progress_popup.set_cancel_fn(cancel_event.set)
-        progress_popup.show()
-        try:
-            submission = await self._core.prepare_submission(
-                progress=functools.partial(self._update_prepare_progress, progress_popup),
-                is_cancelled=cancel_event.is_set,
-            )
-            return submission, cancel_event.is_set()
-        finally:
-            progress_popup.hide()
-            progress_popup.destroy()
-
-    @staticmethod
-    def _update_prepare_progress(progress_popup: ProgressPopup, current: int, total: int, status: object) -> None:
-        """Render the latest preparation progress on the main thread.
-
-        Args:
-            progress_popup: Popup rendering job-preparation progress.
-            current: Latest processed count reported by the worker.
-            total: Latest total count, or a non-positive value while the total is unknown.
-            status: Latest status message, if any.
-        """
-        if status:
-            progress_popup.set_status_text(str(status))
-        if total and total > 0:
-            progress_popup.set_progress(max(0.0, min(1.0, current / total)))
 
     async def _submit_prepared_submission(self, submission: ComfyUISubmission) -> None:
         """Submit one core-prepared request and render its exact result.
@@ -1042,24 +1008,21 @@ class WorkflowSetupWidget(WorkspaceWidget):
                 disable_cancel_button=True,
             )
             return
-        if result.failed_count:
-            submitted_suffix = "" if result.submitted_count == 1 else "s"
-            submitted_verb = "was" if result.submitted_count == 1 else "were"
+        finally:
+            get_job_result_notifier().register_graphs(submission.graphs)
+        if not result.failed_count:
+            post_submission_notification(result.submitted_count, submission.skip_reasons)
+        else:
             failed_suffix = "" if result.failed_count == 1 else "s"
             failed_verb = "was" if result.failed_count == 1 else "were"
             message = (
-                f"{result.submitted_count} prepared job{submitted_suffix} {submitted_verb} added to the queue.\n\n"
-                f"{result.failed_count} prepared job{failed_suffix} {failed_verb} not added."
+                "0 prepared jobs were added to the queue.\n\n"
+                f"{result.failed_count} prepared job{failed_suffix} {failed_verb} not added. "
+                "Check that the job queue is available, then try again."
             )
-            if result.submitted_count:
-                message += (
-                    f" To avoid duplicates, select only the failed material{failed_suffix} before submitting again."
-                )
-            else:
-                message += " Check that the job queue is available, then try again."
             _TrexMessageDialog(
                 message,
-                "Some ComfyUI Jobs Not Submitted" if result.submitted_count else "ComfyUI Jobs Not Submitted",
+                "ComfyUI Jobs Not Submitted",
                 disable_cancel_button=True,
             )
 
@@ -1127,15 +1090,6 @@ class WorkflowSetupWidget(WorkspaceWidget):
         elif event.event_type == ComfyUIEventType.WORKFLOWS_LOADED:
             self._update_workflow_combo()
 
-    def _on_stage_event(self, event) -> None:
-        """Refresh submission availability after a project closes or finishes opening.
-
-        Args:
-            event: USD stage event from the widget's configured context.
-        """
-        if event.type in {int(usd.StageEventType.CLOSED), int(usd.StageEventType.OPENED)}:
-            self._update_submit_button_state()
-
     def _on_workflow_changed(self):
         """Respond to a workflow change by rebuilding all dynamic sections."""
         if self._core.workflow is not None:
@@ -1152,14 +1106,13 @@ class WorkflowSetupWidget(WorkspaceWidget):
         for task in (
             self._workflow_refresh_task,
             self._workflow_load_task,
-            self._submit_task,
             self._splitter_layout_task,
         ):
             if task is not None:
                 task.cancel()
+        self._submissions.cancel_all()
         self._workflow_refresh_task = None
         self._workflow_load_task = None
-        self._submit_task = None
         self._splitter_layout_task = None
 
     def _update_workflow_combo(self):
@@ -1412,7 +1365,7 @@ class WorkflowSetupWidget(WorkspaceWidget):
             return "Reconnect to ComfyUI and select a workflow again"
         if project_reason := self._core.get_submission_block_reason():
             return project_reason
-        if self._submit_task and not self._submit_task.done():
+        if self._submissions.is_running(None):
             return "Preparing the selected materials."
         return None
 

@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Created 1.6.1-0 build
 - Added RTX Remix 1.6 release notes
 - REMIX-6265: Excluded invalid ComfyUI selections and cancelled timed-out prompts before the next ComfyUI job starts. Added a persistent 60-minute timeout (0 for no limit), Timed Out labels with the error color, Retry, and queue resume while active work continues. Added a job graph Stop action that stops a running job and its ComfyUI prompt, with a Stopped label and Retry. Disabled the Stage Manager AI Tools action when the workflow has no Selected Texture or Selected Mesh input. A ComfyUI workflow with only Constant inputs creates one job, texture inputs must match the mesh input scope, and All Textures expands mesh workflows without a mesh input to the whole stage. Texture workflows with a mesh input apply textures to the materials under that mesh. Documented AI Tools workflow types, input getters, the job timeout, and the job queue.
+- REMIX-6266: Added an Asset Modifiers framework for local model transforms, with persistent inputs, Stage Manager actions, Job Queue integration, and reversible replacement.
+- REMIX-6266: Added a Job Queue Target column that shows the prims or model file of each job, and Job Queue and Asset Modifiers user guides, and updated the AI Tools guide and its screenshots.
+- REMIX-4954: Added paste diagnostics and warnings for skipped, failed, or clamped values, Paste Selected between differently named attributes of the same USD type, and source-aware texture references across layers.
 - Added a viewport asset scattering brush: a Scatter window docked next to the Editor and a viewport toolbar tool (Ctrl+B) that paints, erases and floods ingested assets onto captured meshes with Paint-Tool-style density, falloff, spacing, padding, strength, random rotation and scale, per-asset weights, presets and per-stroke undo; painted assets are given their ingested texture set (albedo, normal, roughness, height) automatically, using the same detection as Assign Texture Sets. While painting, the cursor reports the prims the stroke is adding to the rendered stage, counting a placement once per instance of the prototype it lands on, and turns amber at the brush's Prim Budget and red at five times it, where the stroke stops and says why, as a flood does, so one stroke cannot add more than the game can keep up with. Scatter that has already been painted can be tuned afterwards: with painted placements or a scatter container selected (or, while the brush paints on every mesh, a mesh or an instance), changing a placement, scale or seed setting updates the selected scatter live and commits as one undo step, while everything outside the selection is left exactly as it was. That same selection also gets the familiar transform gizmo in the viewport: dragging its arrows or rotate rings moves the whole patch, which settles back onto the surface it lands on, or aims it where it stands without moving it, again as a single undo step. Right after a stroke, that stroke is what live edits and the gizmo change: tune it by eye, including a Base Rotation that stands up an asset that comes out lying down, then undo once to remove it with the tuned settings kept for the next stroke. A Max Surface Angle setting keeps stamps from snapping onto walls and ledges, and live edits and gizmo drags of large patches are several times faster. By default the brush paints on the selected mesh, straight through the foliage cards and props in front of it, with every asset standing straight up even on captures whose ground is wound upside down; an Asset Up Axis readout says which way each asset was modelled and flags one that would lie on its side, and Reset to Defaults puts the brush settings back. Painted grass is now instanced for the game: each stroke is merged into one PointInstancer per patch when the next one is painted, so the runtime draws every asset from one copy of its geometry and culls it by distance on the GPU instead of processing every blade, while the Toolkit viewport keeps showing it exactly as before; Instance All and Split Selection in the Scatter window merge everything now or turn a patch back into editable placements
 - Restored the lookdev HDRI light rigs (Autoshop, Bush Restaurant, Kloofendal, Old Room and the rest) to the StageCraft viewport's Lighting menu, which had shown only Kit's studio rigs since IngestCraft stopped loading at startup; the studio rigs stay listed after them. A project whose mod has an `assets/skydomes` folder also gets a Mod Sky rig for each level of its `skydomes.ini` and each other dome texture there, showing the level's sky the way the game's Remix API dome does (texture, radiance, tint, rotation and the dome's own sun) with the level's own lights kept lit
 
@@ -21,9 +24,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Excluded internal CI from future GitHub mirror commits while preserving previously exported history and GitHub workflows.
 - Added contributor names to the community PR entries in the RTX Remix 1.6 release notes
 - Updated Packman to 8.7.0 with its Python 3.12 bootstrap, including the fix for failed `copyPath` renames reporting success.
+- Reduced the size of each built documentation version from about 1.5 GB to 182 MB: re-encoded the 8 largest videos from 4K to 1080p H.264 and converted 65 large PNG images to JPEG
+- Added Remix Review rules from human review feedback: whole-change simplification and shared-consumer checks, API, configuration, typing, module structure, `extension.py` scope, core shape, Flux mechanism reuse, undo, widget isolation, layer ownership, window layout scope, app `.kit` contents, dependency pin, test-setting, root export, mock-heavy unit test, test fidelity, E2E step comment, and published-documentation rules, and E2E subsumption in test redundancy checks.
+- Update Remix target dependencies: hdremix and omni_core_materials to `ext-0b1da77-main`
+
+- REMIX-3047: Added a floating RGB/HSV/hex color editor with live previews and per-gesture Undo, cancelled unfinished previews on row removal, and ensured reliable color-field cleanup.
+- Update Remix target dependencies: hdremix and omni_core_materials to `ext-689244e-main`
+- REMIX-6019: Standardized Stage Manager row-action targets through one filtered-model item query.
+- Update Remix target dependencies: hdremix and omni_core_materials to `ext-385e699-main`
+- REMIX-6354: Replaced the deprecated Kit event streams (stage, layer, app startup/shutdown/update, and app window streams) with Events 2.0 (`carb.eventdispatcher`), and replaced the deprecated menu `onclick_fn` callbacks with `omni.kit.actions.core` actions, to remove the deprecation messages from the Kit log.
+- Replaced agent-plugin tags in code comments with plain comments that keep each known limit and when to revisit it.
 
 ### Fixed
 
+- REMIX-6266: Gave the Job Queue summary row its own background so it no longer blends into the job rows.
 - Made `tools/ci/scripts/notify_remix_target_dep_bot.sh` use a bash 3.2-compatible channel de-duplication so its test suite passes with the default macOS `/bin/bash` (associative arrays require bash 4.0+).
 - Constrained the docs build to the `pydantic` version in `deps/pip_flux.toml` because `pydantic` 2.14 broke `autodoc` for parametrized generic models
 - Fixed an intermittent test hang: the first USD call in a test could deadlock with the MDL preload, which made `lss-e2e-tests-windows-a2s` lose 5 minutes per job and sometimes time out.
@@ -31,8 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kept the merge request note token out of the curl command line in the missing-tests comment job, so process monitoring on the CI runners no longer records it.
 - Fixed documentation publishing with Packman 8 by updating the documentation tool's package lookup API.
 - REMIX-6095: Fixed vector attributes in the Properties panels, including MDL `float2` parameters, raising `TypeError` and showing wrong defaults, and fixed resetting a vector to restore the wrong channel default. Updated HdRemix and material definitions to `ext-e62bf4b-main` for texture transforms.
+- Fixed a light manipulator leak: each manipulator rebuild kept its light models subscribed to all stage events, which made the Properties panel e2e tests 34% slower and close to the CI extension timeout. Fixed the flaky ComfyUI Timeout edit test, which used a double click that slow frames broke.
+- Fixed `github-mirror-sync` rejections when LFS files change by pushing the LFS objects of commits missing from the staging mirror, and checked that the runner has `git-lfs`
+- Fixed ComfyUI workflow inputs that the node pack tags as `prompt`, `auto`, a prim path, a layer identifier, or a type that the Toolkit does not know: they were missing from the AI Tools input list and now use the getters of their primitive type.
+- Fixed `publish-etm-list` using a duplicate rules block that overrode its intended `when: always` behavior for pushes to `main`.
+- Fixed standalone IngestCraft startup failures by deferring hidden viewport initialization, resuming it when shown, and propagating ingestion preview visibility.
+- Fixed viewport startup timeouts during project loading by restarting renderer activation for the newly opened stage.
+- Fixed material properties to show the matching Thin Opaque or Diffusion Profile subsurface scattering fields.
+- Fixed Codex review workers on Windows failing to start bundled PowerShell by granting read access to its runtime directory.
+- REMIX-3057: Reduced light intensity, light radius, and material emissive intensity drag speeds, with a finer distant-light intensity default and support for per-type tuning and metadata overrides, while preserving precise typed input.
+- Fixed Windows agent-hook Unicode diagnostics and excluded ignored local scratch packages from repository lint.
+- REMIX-6266: Fixed Job Queue output cleanup, Asset Modifier feedback, and workspace window behavior.
+- Hardened light manipulator teardown: each light model now unsubscribes from stage events explicitly, every handle is released even when an earlier teardown step fails, and teardown failures are logged instead of silently suppressed.
 
 ### Removed
+
+- Removed unused tools: `tools/ci/vault/download_vault.ps1`, `tools/repoman/sign_archive.py`, `tools/repoman/launcher-pipeline-template/`, the `auto_update_deps` repo tool with its `print_published_extensions.py` helper, and the manual test scripts in `tools/ci/scripts/`, `tools/crash_debug/`, and `tools/migrations/tests/`. No CI job, build step, script, or doc calls them.
 
 ## [1.6.1-0]
 

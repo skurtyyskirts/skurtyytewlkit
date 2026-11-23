@@ -23,14 +23,15 @@ import pathlib
 import re
 import tempfile
 import uuid
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import carb.input
 import carb.settings
+import omni.flux.job_queue.core.persistence as persistence
 import omni.kit.clipboard
 import omni.kit.ui_test as ui_test
 from omni import ui
-import omni.flux.job_queue.core.persistence as persistence
+from omni.flux.job_queue.core import get_job_queue
 from omni.flux.job_queue.core.apply_executor import ApplyExecutor
 from omni.flux.job_queue.core.apply_handler_base import ApplyHandler
 from omni.flux.job_queue.core.apply_handler_registry import ApplyHandlerRegistry
@@ -49,6 +50,7 @@ from omni.flux.job_queue.core.job import (
     JobProgress,
     JobProgressCallback,
 )
+from omni.flux.job_queue.core.models import UsageSnapshot
 from omni.flux.job_queue.core.persistence import PersistenceCodec
 from omni.flux.job_queue.core.settings import (
     AUTO_APPLY_SETTING_PATH,
@@ -75,9 +77,11 @@ from omni.flux.job_queue.widget.display_adapter_base import (
 )
 from omni.flux.job_queue.widget.enums import DisplayState, JobDetailSectionPlacement
 from omni.flux.job_queue.widget.extension import get_display_adapter_registry
+from omni.flux.job_queue.widget.notifications import JobResultNotifier, post_submission_notification
 from omni.flux.job_queue.widget.row import Row
+from omni.flux.job_queue.widget.target_label import TargetLabel
 from omni.flux.job_queue.widget.widget import QueueWidget
-from omni.kit.notification_manager import destroy_all_notifications, get_all_notifications
+from omni.kit.notification_manager import NotificationStatus, destroy_all_notifications, get_all_notifications
 from omni.kit.test import AsyncTestCase
 
 __all__ = ("TestQueueWidget",)
@@ -222,6 +226,22 @@ class _WidgetJob(Job):
         return JobOutputs({RESULT: self.value, DETAILS: self.details})
 
 
+class _FailedNotificationJob(Job):
+    """Fail a real queue execution before it produces outputs."""
+
+    async def execute(self, _job_directory, _inputs, _progress_callback):
+        """Report a generation failure through the real executor."""
+        raise RuntimeError("Generation failed")
+
+
+class _FittedTarget(NamedTuple):
+    """Describe one target row after it stops changing."""
+
+    ancestor: str
+    name_elided: bool
+    end: float
+
+
 class _WidgetDisplayAdapter(JobDisplayAdapter):
     """Expose stable user-facing labels for the concrete E2E job."""
 
@@ -238,6 +258,19 @@ class _WidgetDisplayAdapter(JobDisplayAdapter):
             Stable test workflow label.
         """
         return "Test workflow"
+
+    def get_targets(self, job: _WidgetJob) -> tuple[str, ...]:
+        """Return two stable targets so the Target column shows a count, or none for a processing stage.
+
+        Args:
+            job: Exact widget test job handled by this adapter.
+
+        Returns:
+            Test prim paths, or an empty tuple when the job name starts with "Processing".
+        """
+        if job.name.startswith("Processing"):
+            return ()
+        return ("/RootNode/meshes/mesh_A/mesh", "/RootNode/meshes/mesh_B/mesh")
 
     def get_name_display(self, job: _WidgetJob) -> str:
         """Return the persisted child name.
@@ -742,13 +775,13 @@ class TestQueueWidget(AsyncTestCase):
         headers = {header.widget.text: header for header in self._find_all("Label[*].name=='ColumnHeader'")}
         header_cells = {
             key: self._find(f"HStack[*].identifier=='queue_header_cell_{key}'")
-            for key in ("job_stage", "status", "completed", "apply", "actions")
+            for key in ("job_stage", "target", "status", "completed", "apply", "actions")
         }
 
-        self.assertEqual(set(headers), {"Job / Stage", "Status", "Completed", "Apply", "Actions"})
+        self.assertEqual(set(headers), {"Job / Stage", "Target", "Status", "Completed", "Apply", "Actions"})
         self.assertTrue(all(cell is not None for cell in header_cells.values()))
         self.assertEqual(self._find_all("Image[*].name=='QueueFilter'"), [])
-        for key, label_text in zip(header_cells, ("Job / Stage", "Status", "Completed", "Apply", "Actions")):
+        for key, label_text in zip(header_cells, ("Job / Stage", "Target", "Status", "Completed", "Apply", "Actions")):
             label = headers[label_text]
             cell = header_cells[key]
             frame_left = cell.center.x - (cell.widget.computed_width / 2)
@@ -1147,6 +1180,9 @@ class TestQueueWidget(AsyncTestCase):
         footer_apply_cell = self._find("Frame[*].identifier=='queue_footer_apply'")
         self.assertIsNotNone(footer_label_cell)
         self.assertIsNotNone(footer_apply_cell)
+        # The summary row keeps its own band, so it reads apart from the job rows above it.
+        footer_background = self._find("Rectangle[*].identifier=='job_queue_footer_background'")
+        self.assertEqual(footer_background.widget.name, "QueueFooterBackground")
         row_left = row_frame.center.x - (row_frame.widget.computed_width / 2)
         label_left = label.center.x - (label.widget.computed_width / 2)
         self.assertGreaterEqual(label_left - row_left, PADDING_SMALL.value - 1)
@@ -2046,6 +2082,109 @@ class TestQueueWidget(AsyncTestCase):
         self.assertIsNotNone(updated_label)
         self.assertEqual(updated_label.widget.text, "Updated stage name")
 
+    async def test_target_column_shows_the_first_target_and_the_count_of_the_others(self):
+        """The graph and its job show the first target as parent/name, with every full path in the tooltip."""
+        # Show the graph and its child job.
+        job = _WidgetJob(name="Targeted stage")
+        graph = self._submit_graph("Targeted graph", job)
+        await ui_test.human_delay()
+        await self._find("Image[*].identifier=='queue_graph_branch'").click()
+        await ui_test.human_delay()
+
+        # Both rows show the first target like the Stage Manager does: a faded parent name, then the name and the count
+        # of the others.
+        for identifier in (f"queue_graph_target_{graph.graph_id}", f"job_target_{job.job_id}"):
+            ancestor = self._find(f"Label[*].identifier=='{identifier}_ancestor'")
+            label = self._find(f"Label[*].identifier=='{identifier}'")
+            count = self._find(f"Label[*].identifier=='{identifier}_count'")
+            # The test window is narrow, so the parent name may be shortened. The elision test covers that.
+            self.assertEqual(ancestor.widget.name, "FadedLabel")
+            self.assertEqual((count.widget.text, count.widget.name), (" (+1)", "CellLabelBold"))
+            self.assertEqual(
+                (label.widget.text, label.widget.tooltip),
+                ("mesh", "/RootNode/meshes/mesh_A/mesh\n/RootNode/meshes/mesh_B/mesh"),
+            )
+
+    async def test_graph_target_comes_from_the_first_stage_that_has_one(self):
+        """A graph whose first stage has no target, like a processing stage, shows the target of the next stage."""
+        # Submit a graph whose first stage has no target, then show its stages.
+        processing = _WidgetJob(name="Processing stage")
+        targeted = _WidgetJob(name="Targeted stage")
+        graph = self._submit_graph("Processing first", processing, targeted)
+        await ui_test.human_delay()
+        await self._find("Image[*].identifier=='queue_graph_branch'").click()
+        await ui_test.human_delay()
+
+        # The processing stage shows no target, and the graph shows the target of the later stage with every full path.
+        self.assertIsNone(self._find(f"Label[*].identifier=='job_target_{processing.job_id}'"))
+        label = self._find(f"Label[*].identifier=='queue_graph_target_{graph.graph_id}'")
+        self.assertEqual(
+            (label.widget.text, label.widget.tooltip),
+            ("mesh", "/RootNode/meshes/mesh_A/mesh\n/RootNode/meshes/mesh_B/mesh"),
+        )
+
+    async def test_target_label_elides_only_the_longer_part_and_refits_when_widened(self):
+        """A narrow cell elides only the longer of the parent name and the name, and refits when it widens."""
+        # Build one wide and two narrow cells: a long parent name, then a long name.
+        window = ui.Window("TargetLabelE2E", width=600, height=200)
+        try:
+            cells = {
+                "wide": (400, "/RootNode/meshes/mesh_0AB745B8BEE1F16B/mesh"),
+                "ancestor": (120, "/RootNode/meshes/mesh_0AB745B8BEE1F16B/mesh"),
+                "name": (120, "/RootNode/meshes/mesh_0AB745B8BEE1F16B_with_a_long_name"),
+            }
+            frames = {}
+            with window.frame, ui.VStack():
+                for key, (width, target) in cells.items():
+                    frames[key] = ui.Frame(width=ui.Pixel(width))
+                    with frames[key]:
+                        TargetLabel((target,), f"target_{key}")
+            rows = await self._wait_for_fitted_targets({key: width for key, (width, _target) in cells.items()})
+
+            # Only the longer part elides, and a narrow row ends within one character of the 120 px cell edge.
+            self.assertEqual((rows["wide"].ancestor, rows["wide"].name_elided), ("mesh_0AB745B8BEE1F16B", False))
+            self.assertIn("...", rows["ancestor"].ancestor)
+            self.assertFalse(rows["ancestor"].name_elided)
+            self.assertEqual((rows["name"].ancestor, rows["name"].name_elided), ("meshes", True))
+            for key in ("ancestor", "name"):
+                self.assertTrue(108 < rows[key].end <= 121, f"The {key} row ends at {rows[key].end}.")
+
+            # Widen the shortened cell. It refits from the full parent name: more of it shows, and the row still fits.
+            frames["ancestor"].width = ui.Pixel(160)
+            widened = (await self._wait_for_fitted_targets({"ancestor": 160}))["ancestor"]
+            self.assertIn("...", widened.ancestor)
+            self.assertGreater(len(widened.ancestor), len(rows["ancestor"].ancestor))
+            self.assertTrue(148 < widened.end <= 161, f"The widened row ends at {widened.end}.")
+        finally:
+            window.destroy()
+
+    async def _wait_for_fitted_targets(self, widths: dict[str, int]) -> dict[str, _FittedTarget]:
+        """Wait until each target row in the TargetLabelE2E window fits its cell and stops changing.
+
+        Args:
+            widths: Cell width of each target identifier key.
+
+        Returns:
+            The settled row of each key.
+        """
+        previous = None
+        stable_frames = 0
+        for _ in range(300):
+            await ui_test.human_delay(1)
+            rows = {}
+            for key in widths:
+                # Fitting rebuilds the labels, so look them up again on every frame.
+                ancestor = ui_test.find(f"TargetLabelE2E//Frame/**/Label[*].identifier=='target_{key}_ancestor'").widget
+                name = ui_test.find(f"TargetLabelE2E//Frame/**/Label[*].identifier=='target_{key}'").widget
+                end = name.screen_position_x + name.computed_width - ancestor.screen_position_x
+                rows[key] = _FittedTarget(ancestor.text, name.elided_text, end)
+            fits = all(row.end <= widths[key] + 1 for key, row in rows.items())
+            stable_frames = stable_frames + 1 if fits and rows == previous else 0
+            if stable_frames == 3:
+                return rows
+            previous = rows
+        raise self.failureException(f"The target rows did not fit and settle: {previous}")
+
     async def test_delete_graph_removes_real_row_and_all_queue_owned_job_directories(self):
         """Confirming root Delete commits the graph and removes both child folders."""
         # Create queue-owned artifacts, confirm Delete through the row, and inspect disk and UI state.
@@ -2078,6 +2217,39 @@ class TestQueueWidget(AsyncTestCase):
         self.assertEqual(self._interface.get_graph_snapshots(), [])
         self.assertEqual(self._find_all("Label[*].text=='Delete Material'"), [])
         self.assertTrue(all(not directory.exists() for directory in directories))
+
+    async def test_delete_graph_awaits_fresh_usage_after_confirmation(self):
+        """Await a new usage snapshot after confirmation and keep files that became used."""
+        # Prepare an unused output so the first prompt includes its file in the deletion count.
+        job = _WidgetJob(name="Generation")
+        graph = self._submit_graph("Fresh usage", job)
+        directory = self._interface.get_job_directory(job.job_id)
+        directory.mkdir(parents=True)
+        output = directory / "result.bin"
+        output.write_bytes(b"result")
+        used, snapshots = [], []
+
+        async def provide_usage():
+            await asyncio.sleep(0)
+            snapshot = UsageSnapshot.from_urls(used)
+            snapshots.append(snapshot)
+            return snapshot
+
+        self._interface.usage_snapshot_provider = provide_usage
+        await ui_test.human_delay()
+        await self._find(f"Image[*].identifier=='delete_graph_{graph.graph_id}'").click()
+        labels = await self._wait_for_prompt("Delete Job Graph")
+        self.assertTrue(any("1 output file" in label.widget.text for label in labels))
+        self.assertEqual(snapshots, [UsageSnapshot()])
+
+        # Mark the output as used while the prompt stays open so confirmation must read a new usage snapshot.
+        used.append(str(output))
+        await ui_test.find("Delete Job Graph//Frame/**/Button[*].name=='confirm_button'").click()
+        await self._widget.model.wait_for_background_tasks()
+        # Confirmation removes the graph but preserves the output that became used.
+        self.assertEqual(snapshots, [UsageSnapshot(), UsageSnapshot.from_urls(used)])
+        self.assertEqual(self._interface.get_graph_snapshots(), [])
+        self.assertTrue(output.is_file())
 
     async def test_delete_selected_graphs_uses_one_confirmation_and_removes_every_root(self):
         """Deleting a selected root applies one exact confirmation to every selected graph."""
@@ -2179,6 +2351,135 @@ class TestQueueWidget(AsyncTestCase):
         self.assertIsNotNone(child_label)
         self.assertIsNotNone(child_details)
         self.assertEqual(child_details.widget.text, "Asset processing")
+
+    async def test_result_notifications_execute_delete_and_destroy(self):
+        """Report submission and execution results, then release callbacks after deletion or destruction."""
+        queue, settings, notifier = get_job_queue(), JobQueueSettings(), JobResultNotifier()
+        scheduler_enabled = settings.scheduler_enabled
+        settings.set_scheduler_enabled(False)
+        callbacks, graphs = [], []
+        claimed_jobs = []
+        result_reported = asyncio.Event()
+        known_graphs = {graph.graph_id for graph in queue.get_graph_snapshots()}
+        failure_codec = PersistenceCodec(
+            "tests.e2e.FailedNotificationJob",
+            _FailedNotificationJob,
+            lambda job: (job.job_id, job.name),
+            lambda values: _FailedNotificationJob(*values),
+        )
+        persistence.get_registry().register_codecs((failure_codec,))
+
+        def record_result(message: str) -> None:
+            """Record the consumer-visible result and release its completion wait."""
+            callbacks.append(message)
+            result_reported.set()
+
+        try:
+            # A partial submission posts one warning and leaves only the submitted graph in the queue.
+            skipped = ("This material has no albedo texture.",) * 2
+            binding = ApplyBinding(RESULT, _TestApplyHandler, _ApplyTarget("result"))
+            job = _WidgetJob(value=7, apply_binding=binding)
+            graph = JobGraph(name="Notification workflow", jobs=[job])
+            graph.bind(job, REQUEST, job.request)
+            graphs.append(graph.graph_id)
+            queue.submit(graph)
+            post_submission_notification(1, skipped)
+            (notification,) = get_all_notifications()
+            self.assertEqual(
+                notification.info.text,
+                "Submitted 1 job(s) to the job queue. 2 item(s) were skipped: This material has no albedo texture.",
+            )
+            self.assertEqual(notification.info.status, NotificationStatus.WARNING)
+            self.assertEqual({graph.graph_id for graph in queue.get_graph_snapshots()}, known_graphs | set(graphs))
+            self.assertFalse(ui.Workspace.get_window("No Jobs Created"))
+            destroy_all_notifications()
+            notifier.register_graphs(
+                (graph,),
+                summarize=lambda job_id: f"Generated value {queue.get_job_outputs(job_id)[RESULT]}",
+                on_result=record_result,
+            )
+            claimed = queue.claim_runnable_jobs()
+            claimed_jobs.extend(claimed)
+            self.assertIn(job.job_id, claimed)
+            await JobExecutor(queue).execute(job.job_id)
+            await asyncio.wait_for(result_reported.wait(), 2)
+            self.assertEqual(get_all_notifications()[0].info.status, NotificationStatus.INFO)
+            self.assertTrue(queue.decline_apply(job.job_id))
+            notifier.register(job.job_id, "Already complete")
+
+            # A failed generation reports once. It must not call a successful-result summary.
+            failed = _FailedNotificationJob()
+            graph = JobGraph(name="Failed generation", jobs=[failed])
+            graphs.append(graph.graph_id)
+            queue.submit(graph)
+            result_reported.clear()
+            notifier.register_graphs((graph,), summarize=callbacks.append, on_result=record_result)
+            claimed = queue.claim_runnable_jobs()
+            claimed_jobs.extend(claimed)
+            self.assertIn(failed.job_id, claimed)
+            await JobExecutor(queue).execute(failed.job_id)
+            await asyncio.wait_for(result_reported.wait(), 2)
+            self.assertIs(queue.get_job_snapshot(failed.job_id).state, JobState.FAILED)
+            self.assertEqual(get_all_notifications()[-1].info.status, NotificationStatus.WARNING)
+
+            # Deletion releases a pending registration without a result callback or notification.
+            pending = _WidgetJob()
+            graph = JobGraph(jobs=[pending])
+            graph.bind(pending, REQUEST, pending.request)
+            graphs.append(graph.graph_id)
+            queue.submit(graph)
+            notifier.register(pending.job_id, graph.name, summarize=callbacks.append, on_result=callbacks.append)
+            self.assertIn(pending.job_id, notifier._jobs)
+            await asyncio.to_thread(queue.delete_graphs, (graph.graph_id,), UsageSnapshot())
+            graphs.remove(graph.graph_id)
+            await ui_test.human_delay()
+            self.assertNotIn(pending.job_id, notifier._jobs)
+            self.assertEqual(
+                [item.info.text for item in get_all_notifications()],
+                ["Generated value 7", "Already complete: DONE", "Failed generation: FAILED"],
+            )
+            self.assertEqual(callbacks, ["Generated value 7", "Failed generation: FAILED"])
+            destroy_all_notifications()
+            # Destroy the notifier before another pending job completes so no callback or notification survives.
+            pending = _WidgetJob()
+            graph = JobGraph(jobs=[pending])
+            graph.bind(pending, REQUEST, pending.request)
+            graphs.append(graph.graph_id)
+            queue.submit(graph)
+            notifier.register_graphs((graph,), summarize=callbacks.append, on_result=record_result)
+            self.assertIn(pending.job_id, notifier._jobs)
+            notifier.destroy()
+            self.assertEqual(notifier._jobs, {})
+            claimed = queue.claim_runnable_jobs()
+            claimed_jobs.extend(claimed)
+            self.assertIn(pending.job_id, claimed)
+            await JobExecutor(queue).execute(pending.job_id)
+            await ui_test.human_delay()
+            notifier.register(job.job_id, "After shutdown", on_result=callbacks.append)
+            self.assertEqual(
+                (get_all_notifications(), callbacks), ([], ["Generated value 7", "Failed generation: FAILED"])
+            )
+
+            # No jobs opens a modal prompt with the skip reason and adds no graph or notification.
+            for reasons in ((), skipped):
+                post_submission_notification(0, reasons)
+                labels = await self._wait_for_prompt("No Jobs Created")
+                suffix = f"\n\n2 item(s) were skipped: {skipped[0]}" if reasons else ""
+                self.assertIn(f"No jobs were added to the job queue.{suffix}", [label.widget.text for label in labels])
+                self.assertTrue(ui.Workspace.get_window("No Jobs Created").flags & ui.WINDOW_FLAGS_MODAL)
+                self.assertEqual(
+                    (get_all_notifications(), {graph.graph_id for graph in queue.get_graph_snapshots()}),
+                    ([], known_graphs | set(graphs)),
+                )
+                await ui_test.find("No Jobs Created//Frame/**/Button[*].text=='Okay'").click()
+        finally:
+            notifier.destroy()
+            try:
+                queue.release_scheduled_jobs(claimed_jobs)
+                queue.delete_graphs(graphs, UsageSnapshot())
+            finally:
+                persistence.get_registry().unregister_codecs((failure_codec,))
+                settings.set_scheduler_enabled(scheduler_enabled)
 
     async def test_successful_execution_log_is_visible_in_job_details_at_completion(self):
         """Real execution publishes a readable success log before its terminal notification."""

@@ -1,6 +1,17 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.4.3]
+### Removed
+- Removed screenshot-based light gizmo tests, reference images, and test display overrides.
+
+### Added
+- Added real viewport tests for light icon shape, size, visibility, and selection.
+
+## [1.4.2]
+### Changed
+- Migrated deprecated event stream subscriptions to Events 2.0 (`carb.eventdispatcher`).
+
 ## [1.4.1]
 ### Changed
 - Updated extension metadata for Kit SDK 110 compatibility.

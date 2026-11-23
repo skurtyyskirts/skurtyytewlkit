@@ -23,6 +23,7 @@ import asyncio
 import lightspeed.trex.sidebar as sidebar
 import omni.kit.app
 import omni.usd
+from carb.eventdispatcher import get_eventdispatcher
 from lightspeed.common.constants import LayoutFiles as _LayoutFiles
 from lightspeed.common.constants import WindowNames as _WindowNames
 from lightspeed.trex.utils.widget.quicklayout import load_layout
@@ -35,6 +36,9 @@ from .graph_window import RemixLogicGraphWindow
 
 class RemixLogicGraphWorkspaceWindow(_WorkspaceWindowBase):
     """Remix Logic Graph window manager"""
+
+    _DEFAULT_WIDTH = 1000
+    _DEFAULT_HEIGHT = 800
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -55,7 +59,7 @@ class RemixLogicGraphWorkspaceWindow(_WorkspaceWindowBase):
         return ui.WINDOW_FLAGS_NO_SCROLLBAR | ui.WINDOW_FLAGS_NO_SCROLL_WITH_MOUSE
 
     def _create_window(self) -> ui.Window:
-        return RemixLogicGraphWindow(title=self.title, width=1000, height=800)
+        return RemixLogicGraphWindow(title=self.title, width=self._DEFAULT_WIDTH, height=self._DEFAULT_HEIGHT)
 
     # overrides for updating content, leave that to omni graph window
     def _update_ui(self):
@@ -83,16 +87,16 @@ class RemixLogicGraphWorkspaceWindow(_WorkspaceWindowBase):
 
     def __subscribe_stage_events(self):
         context = omni.usd.get_context(self._usd_context_name or "")
-        self.__sub_stage_event = context.get_stage_event_stream().create_subscription_to_pop(
-            self.__on_stage_event, name="LogicGraphStageEvent"
-        )
-
-    def __on_stage_event(self, event):
-        if event.type in {
-            int(omni.usd.StageEventType.OPENED),
-            int(omni.usd.StageEventType.CLOSING),
-        }:
-            asyncio.ensure_future(self.__update_button_state_deferred())
+        self.__sub_stage_event = [
+            get_eventdispatcher().observe_event(
+                event_name=context.stage_event_name(event_type),
+                on_event=lambda _: asyncio.ensure_future(self.__update_button_state_deferred()),
+                observer_name=(
+                    "lightspeed.trex.logic.widget:RemixLogicGraphWorkspaceWindow.__update_button_state_deferred"
+                ),
+            )
+            for event_type in (omni.usd.StageEventType.OPENED, omni.usd.StageEventType.CLOSING)
+        ]
 
     async def __update_button_state_deferred(self):
         await omni.kit.app.get_app().next_update_async()

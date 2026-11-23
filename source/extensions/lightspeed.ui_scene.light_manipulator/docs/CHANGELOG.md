@@ -1,6 +1,27 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.3.6]
+### Fixed
+- Stopped each light model's stage event observer explicitly on destroy and cleared its cached xform prim, instead of relying on the subscription handle being dropped.
+- Made manipulator and model teardown release every handle even when an earlier step raises, so one failing handle can no longer strand a live stage event subscription.
+- Logged light manipulator teardown failures instead of silently suppressing them.
+
+## [1.3.5]
+### Removed
+- Removed screenshot-based light manipulator tests, reference images, and test display overrides.
+
+### Added
+- Added tests for light handles and spotlight cones through real viewport actions.
+
+## [1.3.4]
+### Changed
+- Migrated deprecated event stream subscriptions to Events 2.0 (`carb.eventdispatcher`).
+
+## [1.3.3]
+### Fixed
+- Released the stage event subscription and USD listener of each light model when its manipulator is destroyed. Before, each manipulator rebuild leaked models that handled every stage event for the rest of the session.
+
 ## [1.3.2]
 ### Fixed
 - Used native light-selection membership instead of copying the selected-path list.

@@ -26,6 +26,7 @@ import omni.appwindow
 import omni.kit.app
 import omni.ui as ui
 import omni.usd
+from carb.eventdispatcher import Event, get_eventdispatcher
 from lightspeed.common.constants import GlobalEventNames
 from lightspeed.events_manager import get_instance as _get_event_manager_instance
 from lightspeed.hydra.remix.core import REMIX_HYDRA_ENGINE_NAME as _HDREMIX_HYDRA_ENGINE_NAME
@@ -150,8 +151,11 @@ class SetupUI(_WorkspaceWidget):
         )
 
         app_window = omni.appwindow.get_default_app_window()
-        self._minimize_window_subscription = app_window.get_window_minimize_event_stream().create_subscription_to_push(
-            self._on_minimized, name=f"lightspeed.trex.viewports.shared.widget.minimize_window_subscription.{self}"
+        self._minimize_window_subscription = get_eventdispatcher().observe_event(
+            event_name=omni.appwindow.GLOBAL_EVENT_WINDOW_MINIMIZE_IMMEDIATE,
+            on_event=self._on_minimized,
+            filter=app_window.get_event_key(),
+            observer_name="lightspeed.trex.viewports.shared.widget:SetupUI._on_minimized",
         )
 
         # connect viewport to active viewport event
@@ -164,12 +168,7 @@ class SetupUI(_WorkspaceWidget):
         self.__create_ui()
         update_viewport_menu_style()
 
-        # connect viewport to stage events
-        self._stage_event_subscription = (
-            self.viewport_api.usd_context.get_stage_event_stream().create_subscription_to_pop(
-                self._on_stage_event, name="StageEvent"
-            )
-        )
+        self._subscribe_stage_events()
 
     @classmethod
     def next_unique_viewport_name(cls, context_name: str) -> str:
@@ -245,20 +244,33 @@ class SetupUI(_WorkspaceWidget):
         """Halt or resume viewport updates depending on state."""
         if not self._viewport_layers or not self._viewport_layers.viewport_api:
             return
-        updates_enabled = True
+        updates_enabled = self.window_visible
         if self._docked and carb.settings.get_settings().get("/app/renderer/skipWhileMinimized"):
             updates_enabled = False
         if not self._active:
             updates_enabled = False
+        was_enabled = self.viewport_api.updates_enabled
         self.viewport_api.updates_enabled = updates_enabled
+        if not updates_enabled:
+            if self._remix_renderer_activation_task is not None:
+                self._remix_renderer_activation_task.cancel()
+                self._remix_renderer_activation_task = None
+        elif not was_enabled and self.viewport_api.stage is not None:
+            self._schedule_remix_renderer_activation("viewport-active")
 
-    def _on_minimized(self, event: carb.events.IEvent, *args, **kwargs):
+    def _on_minimized(self, event: Event, *args, **kwargs):
+        """Apply the window minimize state to viewport updates."""
         self._docked = event.payload.get("isMinimized", False)
         self._set_viewport_api_updates_enabled()
 
+    def show(self, visible: bool):
+        """Update viewport activity when its containing workspace is shown or hidden."""
+        super().show(visible)
+        self.set_active(visible)
+
     def set_active(self, active: bool):
-        """Call this method when a higher level ui element obscures or uncovers this shared viewport widget"""
-        self._active = active
+        """Update viewport activity while respecting workspace visibility."""
+        self._active = active and self.window_visible
         if self._active:
             # send an event to deactivate all other viewports
             _get_event_manager_instance().call_global_custom_event(
@@ -278,14 +290,44 @@ class SetupUI(_WorkspaceWidget):
     def _on_viewport_frame_mouse_pressed(self, x: float, y: float, button: int, modifier: int):
         self.set_active(True)
 
-    def _on_stage_event(self, event):
-        if event.type == int(omni.usd.StageEventType.OPENED):
-            # If a new stage is opened on the associated usd_context, we want to activate
-            # the viewport in order to make sure we always show the current stage.
-            self.set_active(True)
-            self._schedule_remix_renderer_activation("stage-opened")
+    def _subscribe_stage_events(self):
+        """Activate the viewport when its stage opens, and cancel renderer activation when the stage changes."""
+        usd_context = self.viewport_api.usd_context
+        self._stage_event_subscription = [
+            get_eventdispatcher().observe_event(
+                event_name=usd_context.stage_event_name(omni.usd.StageEventType.OPENED),
+                on_event=self._on_stage_opened,
+                observer_name="lightspeed.trex.viewports.shared.widget:SetupUI._on_stage_opened",
+            ),
+            *(
+                get_eventdispatcher().observe_event(
+                    event_name=usd_context.stage_event_name(event_type),
+                    on_event=lambda _: self._cancel_remix_renderer_activation(),
+                    observer_name="lightspeed.trex.viewports.shared.widget:SetupUI._cancel_remix_renderer_activation",
+                )
+                for event_type in (omni.usd.StageEventType.CLOSING, omni.usd.StageEventType.OPENING)
+            ),
+        ]
+
+    def _on_stage_opened(self, _event):
+        """Activate the viewport and schedule renderer activation when its stage opens.
+
+        Args:
+            _event: Unused stage open event.
+        """
+        self.set_active(True)
+        self._schedule_remix_renderer_activation("stage-opened")
+
+    def _cancel_remix_renderer_activation(self):
+        """Cancel renderer activation that belongs to the stage that closes or is replaced."""
+        if self._remix_renderer_activation_task is not None:
+            self._remix_renderer_activation_task.cancel()
+            self._remix_renderer_activation_task = None
 
     def _schedule_remix_renderer_activation(self, reason: str, retry_support: bool = True):
+        """Schedule renderer initialization for a visible, updating viewport with a stage."""
+        if not self.window_visible or not self.viewport_api.updates_enabled or self.viewport_api.stage is None:
+            return
         task = self._remix_renderer_activation_task
         if task is not None and not task.done():
             carb.log_info(

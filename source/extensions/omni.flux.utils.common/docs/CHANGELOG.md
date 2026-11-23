@@ -2,6 +2,31 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [5.1.1]
+### Changed
+- Migrated deprecated event stream subscriptions to Events 2.0 (`carb.eventdispatcher`).
+
+## [5.1.0]
+### Added
+- Added source-aware asset path resolution using the layer contributing an attribute's default value, preserving resolved identities and reporting unanchored relative paths.
+- Added `EditResult` and the `EditResultType` enum to share accepted (default), clamped, rejected, and deferred outcomes between editor models and their callers.
+
+## [5.0.0]
+### Changed
+- Changed `get_light_type()` to accept a USD prim and classify derived and versioned light schemas; renamed the existing string lookup to `get_light_type_from_type_name()` without changing its mappings.
+
+## [4.4.0]
+### Added
+- Added `weak_callback()` for bound-method subscriptions that do not retain their owner.
+
+## [4.3.0]
+### Added
+- Added `TaskTracker`, which runs at most one task per key and keeps the key taken until the task settles, even after cancellation.
+
+## [4.2.0]
+### Added
+- Added the Remix Asset Modifiers context submenu labels.
+
 ## [4.1.0]
 ### Added
 - Added `get_bound_material()`, which returns no material for a mesh whose faces are all bound through GeomSubsets

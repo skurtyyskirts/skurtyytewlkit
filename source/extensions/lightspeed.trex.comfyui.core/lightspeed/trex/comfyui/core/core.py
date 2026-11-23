@@ -37,6 +37,7 @@ import carb
 from lightspeed.common.constants import REGEX_INSTANCE_PATH, REGEX_IN_INSTANCE_PATH, REMIX_INGESTED_ASSETS_FOLDER
 from lightspeed.trex.asset_pipeline.core.jobs import TextureOptimizationJob, add_asset_optimization_jobs
 from lightspeed.trex.asset_pipeline.core.jobs.apply_handler import SaveTextureMetadataHandler
+from lightspeed.trex.asset_pipeline.core.jobs.models import ReferenceTarget
 from lightspeed.trex.asset_pipeline.core.worker import run_in_worker_thread
 from omni.flux.job_queue.core import get_job_queue
 from omni.flux.job_queue.core.enums import JobState
@@ -76,7 +77,6 @@ from .models import (
     ComfyUIInputBinding,
     ComfyUIWorkflowRequest,
     MeshCandidate,
-    ReferenceTarget,
     Workflow,
     WorkflowOutput,
     WorkflowTypeCategory,
@@ -113,11 +113,11 @@ class ComfyUISubmission:
 
     Attributes:
         graphs: Independently submitted graphs in deterministic order. Skipped items are not included.
-        skipped_count: Selected items left out because they do not provide the workflow inputs.
+        skip_reasons: Exact first-job reasons for excluded graphs, in preparation order.
     """
 
     graphs: tuple[JobGraph, ...]
-    skipped_count: int
+    skip_reasons: tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -208,7 +208,8 @@ def _get_processed_output_url(stage: Usd.Stage, job_id: uuid.UUID) -> str | None
         return None
     project_path = str(root_layer.identifier)
     project_directory = OmniUrl(OmniUrl(project_path).parent_url)
-    return str(project_directory / REMIX_INGESTED_ASSETS_FOLDER / COMFYUI_PROCESSED_FOLDER / str(job_id))
+    # 12 hex digits are 48 random bits: a name collision needs millions of jobs in one project.
+    return str(project_directory / REMIX_INGESTED_ASSETS_FOLDER / COMFYUI_PROCESSED_FOLDER / job_id.hex[:12])
 
 
 def _get_workflow_status_message(error: BaseException) -> str:
@@ -253,14 +254,12 @@ class ComfyUICore:
         context_name: str,
         *,
         settings_changed_callback: Callable[[str, object], None] | None = None,
-        stage_event_callback: Callable[[Any], None] | None = None,
     ):
         """Initialize the ComfyUI runtime for one USD context.
 
         Args:
             context_name: USD context this runtime operates on.
             settings_changed_callback: Optional process-wide settings change observer.
-            stage_event_callback: Optional observer for this context stage lifecycle.
 
         Raises:
             ValueError: If ``context_name`` is None.
@@ -285,15 +284,6 @@ class ComfyUICore:
         self._connected_base_url: str | None = None
         self._active_operation: ComfyUIOperation | None = None
         self._destroyed = False
-        self._stage_event_subscription = (
-            get_context(context_name)
-            .get_stage_event_stream()
-            .create_subscription_to_pop(
-                stage_event_callback, name=f"ComfyUIApplyProjectState:{context_name or 'default'}"
-            )
-            if stage_event_callback is not None
-            else None
-        )
 
         self._state = ComfyUIState.READY
         self._objects_changed_subscription = Tf.Notice.Register(
@@ -735,7 +725,7 @@ class ComfyUICore:
         progress: Callable[[int, int, Any], Any] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> ComfyUISubmission:
-        """Prepare valid material graphs and count excluded selections.
+        """Prepare valid graphs and preserve the reasons for excluded selections.
 
         Args:
             prim_paths: Explicit selection snapshot, or the current USD selection when omitted.
@@ -743,12 +733,12 @@ class ComfyUICore:
             is_cancelled: Optional callback returning whether the caller requested cancellation.
 
         Returns:
-            Valid graphs and the excluded item count. Empty when cancelled.
+            Valid graphs and the exact reasons for excluded graphs. Empty when cancelled.
         """
         graphs = tuple(await self.prepare_jobs(prim_paths=prim_paths, progress=progress, is_cancelled=is_cancelled))
-        # Items without the workflow inputs never enter the queue. Only their count reaches the UI.
         valid_graphs = tuple(graph for graph in graphs if graph.jobs[0].skip_reason is None)
-        return ComfyUISubmission(valid_graphs, len(graphs) - len(valid_graphs))
+        skip_reasons = tuple(graph.jobs[0].skip_reason for graph in graphs if graph.jobs[0].skip_reason is not None)
+        return ComfyUISubmission(valid_graphs, skip_reasons)
 
     async def submit_prepared_submission(
         self,
@@ -1050,7 +1040,6 @@ class ComfyUICore:
         if self._destroyed:
             return
         self._destroyed = True
-        self._stage_event_subscription = None
         self._objects_changed_subscription.Revoke()
         self._objects_changed_subscription = None
         self._connect_generation += 1
@@ -1952,12 +1941,13 @@ class ComfyUICore:
                 port=endpoint[2],
                 skip_reason=skip_reason,
             )
+            generation_job.output_url = _get_processed_output_url(stage, generation_job.job_id)
             request = ComfyUIWorkflowRequest(
                 prompt=prompt,
                 input_bindings=input_bindings if skip_reason is None else (),
                 client_id=client_id,
                 timeout=job_timeout,
-                output_url=_get_processed_output_url(stage, generation_job.job_id),
+                output_url=generation_job.output_url,
                 workflow=deepcopy(workflow),
             )
             graph = JobGraph(name=workflow.display_name)

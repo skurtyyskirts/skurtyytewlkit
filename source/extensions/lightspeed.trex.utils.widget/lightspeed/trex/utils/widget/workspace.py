@@ -19,9 +19,13 @@ import abc
 import asyncio
 
 import omni.kit
+from carb.eventdispatcher import get_eventdispatcher
 from omni import ui
+from omni.kit.actions.core import get_action_registry
 from omni.kit.menu import utils as _menu_utils
 from omni.kit.menu.utils import build_submenu_dict
+
+_EXTENSION_ID = "lightspeed.trex.utils.widget"
 
 
 class WorkspaceWidget(abc.ABC):
@@ -72,12 +76,13 @@ class WorkspaceWidget(abc.ABC):
 class WorkspaceWindowBase(abc.ABC):
     """Base class with common functionalities for all workspace windows.
 
-    A subclass that needs one size while its window floats sets `_DEFAULT_WIDTH` and `_DEFAULT_HEIGHT`. A dock
-    gives the window the size of its column instead, so a window that a layout always docks needs neither.
+    On its first show, a floating window uses `_DEFAULT_WIDTH` x `_DEFAULT_HEIGHT` after its first frame.
+    If the window is docked then, it keeps the dock size and does not retry the default size on later shows.
+    A subclass can override the defaults or set them to None to keep the content size.
     """
 
-    _DEFAULT_WIDTH: int | None = None
-    _DEFAULT_HEIGHT: int | None = None
+    _DEFAULT_WIDTH: int | None = 400
+    _DEFAULT_HEIGHT: int | None = 600
 
     def __init__(
         self,
@@ -105,6 +110,9 @@ class WorkspaceWindowBase(abc.ABC):
         self._show_dock_tab_bars = show_dock_tab_bars
 
         self.__sub_app_ready = None
+        self.__default_size: tuple[int | None, int | None] | None = None
+        self.__default_size_task: asyncio.Task | None = None
+        self.__menu_action_id: str | None = None
 
     @property
     @abc.abstractmethod
@@ -137,19 +145,18 @@ class WorkspaceWindowBase(abc.ABC):
     def create_window(self, width: int | None = None, height: int | None = None):
         """Creates the ui.Window instance and sets up the "Window" menu item.
 
-        A caller that passes no size gets the default size of the class, when the class declares one.
+        A caller that passes no size gets the default size of the class.
         """
         if self._window:
             return
 
         self._window = self._create_window()
 
-        width = self._DEFAULT_WIDTH if width is None else width
-        height = self._DEFAULT_HEIGHT if height is None else height
-        if width is not None:
-            self._window.width = width
-        if height is not None:
-            self._window.height = height
+        # ImGui drops a size set before the first frame of a window, so the first show applies it.
+        self.__default_size = (
+            self._DEFAULT_WIDTH if width is None else width,
+            self._DEFAULT_HEIGHT if height is None else height,
+        )
 
         self._window.padding_x = 0
         self._window.padding_y = 0
@@ -161,13 +168,14 @@ class WorkspaceWindowBase(abc.ABC):
 
         if self.menu_path():
             # Editor Menu API must be used when the app is ready.
-            def add_window_menu_item(*args):
+            def on_app_ready(*args):
                 self.update_menu_item(False)
                 self.__sub_app_ready = None
 
-            startup_event_stream = omni.kit.app.get_app().get_startup_event_stream()
-            self.__sub_app_ready = startup_event_stream.create_subscription_to_pop_by_type(
-                omni.kit.app.EVENT_APP_READY, add_window_menu_item, name="Window Menu Item - App Ready"
+            self.__sub_app_ready = get_eventdispatcher().observe_event(
+                event_name=omni.kit.app.GLOBAL_EVENT_APP_READY,
+                on_event=on_app_ready,
+                observer_name="lightspeed.trex.utils.widget:WorkspaceWindowBase.create_window",
             )
 
     def get_window(self) -> ui.Window | ui.ToolBar:
@@ -197,6 +205,11 @@ class WorkspaceWindowBase(abc.ABC):
         Clean up all window resources.
         Properly destroys the content widget before cleanup.
         """
+        if self.__default_size_task:
+            self.__default_size_task.cancel()
+            self.__default_size_task = None
+        self.__default_size = None
+
         # Clean up app ready subscription
         if self.__sub_app_ready:
             self.__sub_app_ready = None
@@ -214,6 +227,10 @@ class WorkspaceWindowBase(abc.ABC):
                 _menu_utils.remove_menu_items(self._menu_dict[group], group)
         self._menu_dict = None
 
+        if self.__menu_action_id is not None:
+            get_action_registry().deregister_action(_EXTENSION_ID, self.__menu_action_id)
+        self.__menu_action_id = None
+
     def update_menu_item(self, visible: bool):
         menu_path = self.menu_path()
         if not menu_path:
@@ -224,13 +241,20 @@ class WorkspaceWindowBase(abc.ABC):
             ui.Workspace.show_window(self.title, not is_visible)
 
         if not self._menu_dict:
-            # path, item_name = menu_path.rsplit("/", 1) if "/" in menu_path else ("", menu_path)
+            self.__menu_action_id = f"toggle_window:{self.title}"
+            get_action_registry().register_action(
+                _EXTENSION_ID,
+                self.__menu_action_id,
+                toggle_callback,
+                display_name=f"Toggle {self.title}",
+                tag="Window",
+            )
             menus = [
                 _menu_utils.MenuItemDescription(
                     name=f"Window/{menu_path}",
                     ticked=visible,
                     ticked_fn=lambda: self._window.visible,
-                    onclick_fn=toggle_callback,
+                    onclick_action=(_EXTENSION_ID, self.__menu_action_id, _menu_utils.MenuActionControl.NODELAY),
                 )
             ]
             self._menu_dict = build_submenu_dict(menus)
@@ -282,9 +306,25 @@ class WorkspaceWindowBase(abc.ABC):
     def _on_visibility_changed(self, visible: bool):
         if visible:
             self._update_ui()
+            if self.__default_size:
+                self.__default_size_task = asyncio.ensure_future(self.__apply_default_size(*self.__default_size))
+                self.__default_size = None
         elif self._content:
             self._content.show(False)
         self.update_menu_item(visible)
+
+    async def __apply_default_size(self, width: int | None, height: int | None):
+        """Size a floating window after its first frame. A dock gives the window the size of its column."""
+        try:
+            await omni.kit.app.get_app().next_update_async()
+            if not self._window or self._window.docked:
+                return
+            if width is not None:
+                self._window.width = width
+            if height is not None:
+                self._window.height = height
+        finally:
+            self.__default_size_task = None
 
     def _on_dock_changed(self, docked: bool):
         async def _refresh_tab_bars():

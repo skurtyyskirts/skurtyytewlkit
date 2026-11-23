@@ -15,11 +15,16 @@
 * limitations under the License.
 """
 
+from unittest.mock import MagicMock
+
 import carb
 import omni.kit.test
 import omni.usd
+from carb.eventdispatcher import get_eventdispatcher
 from omni.flux.utils.common.interactive_usd_notices import begin_interaction as _begin_interaction
 from omni.flux.utils.common.interactive_usd_notices import end_interaction as _end_interaction
+from omni.kit.app import get_app
+from omni.kit.commands import execute
 from lightspeed.ui_scene.light_manipulator.constants import (
     CONE_SIDES_MIN_INPUT,
     CONE_THRESHOLD_DEFAULT,
@@ -58,18 +63,47 @@ class TestLightLayer(OmniUiTest):
             light = self.stage.DefinePrim(f"/TestLight{i}")
             light.SetTypeName(light_type)
 
-        # simulate a hierarchy change
-        class MockEvent:
-            type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-        # trigger change
-        layer._on_stage_event(MockEvent())
+        get_eventdispatcher().dispatch_event(
+            omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+        )
 
         # make sure a manipulator object was created for each light in the stage
         self.assertEqual(len(layer.manipulators), len(lights))
 
         # make sure we can destroy layer properly
         layer.destroy()
+
+    async def test_layer_rebuild_stops_previous_light_models_following_selection(self):
+        """Verify that only the replacement light model follows the selection after a layer rebuild."""
+        light_path = "/TestLight"
+        viewport_api = ViewportAPI("", 0, lambda: 0)
+        layer = LightManipulatorLayer({"viewport_api": viewport_api})
+        usd_context = omni.usd.get_context()
+
+        async def wait_for_stage_events():
+            for _ in range(5):
+                await get_app().next_update_async()
+
+        try:
+            # The user adds a light: the layer builds a manipulator for it
+            execute("CreatePrim", prim_path=light_path, prim_type="DiskLight", select_new_prim=False)
+            await wait_for_stage_events()
+            previous_model = layer.manipulators[light_path].model
+
+            # The user adds a second light: the layer rebuilds every manipulator
+            execute("CreatePrim", prim_path="/OtherLight", prim_type="DiskLight", select_new_prim=False)
+            await wait_for_stage_events()
+            current_model = layer.manipulators[light_path].model
+            self.assertIsNot(current_model, previous_model)
+
+            # The user selects the first light: only the current manipulator model follows the selection
+            usd_context.get_selection().set_selected_prim_paths([light_path], True)
+            await wait_for_stage_events()
+
+            self.assertIsNotNone(current_model.light)
+            self.assertIsNone(previous_model.light)
+        finally:
+            layer.destroy()
 
     async def test_layer_uses_default_visible_setting(self):
         vp_api = ViewportAPI("", 0, lambda: 0)
@@ -137,10 +171,9 @@ class TestLightLayer(OmniUiTest):
                 light = self.stage.DefinePrim(f"/SpotTest{i}")
                 light.SetTypeName(light_type)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             self.assertEqual(len(layer.manipulators), 2)
 
             settings.set(SETTING_SPOTLIGHT_CONE_VISIBLE, False)
@@ -173,10 +206,9 @@ class TestLightLayer(OmniUiTest):
                 light = self.stage.DefinePrim(f"/ThreshTest{i}")
                 light.SetTypeName(light_type)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             self.assertEqual(len(layer.manipulators), 2)
 
             # A positive override propagates unchanged.
@@ -207,10 +239,9 @@ class TestLightLayer(OmniUiTest):
             light = self.stage.DefinePrim("/ColorValidationDisk")
             light.SetTypeName("DiskLight")
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             manipulator = layer.manipulators["/ColorValidationDisk"]
 
             for value in ((1.0, 0.0), (1.0, 0.0, 0.0, 1.0)):
@@ -229,10 +260,9 @@ class TestLightLayer(OmniUiTest):
             light = self.stage.DefinePrim("/ConeSidesDisk")
             light.SetTypeName("DiskLight")
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             manipulator = layer.manipulators["/ConeSidesDisk"]
 
             manipulator.cone_sides = 2
@@ -258,10 +288,9 @@ class TestLightLayer(OmniUiTest):
             light.SetTypeName("DiskLight")
             UsdLux.ShapingAPI.Apply(light).CreateShapingConeAngleAttr(30.0)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             manipulator = self._wire_model_light(layer, "/ShapedDisk")
             base = manipulator._base_intensity_scale
 
@@ -285,10 +314,9 @@ class TestLightLayer(OmniUiTest):
                 light = self.stage.DefinePrim(path)
                 light.SetTypeName(light_type)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
 
             for path in ("/ScaledDisk", "/ScaledSphere"):
                 manipulator = self._wire_model_light(layer, path)
@@ -305,10 +333,9 @@ class TestLightLayer(OmniUiTest):
             light = self.stage.DefinePrim("/PlainDisk")
             light.SetTypeName("DiskLight")
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             manipulator = self._wire_model_light(layer, "/PlainDisk")
             base = manipulator._base_intensity_scale
             for threshold in (0.01, CONE_THRESHOLD_DEFAULT, 1.0, 10.0):
@@ -325,10 +352,9 @@ class TestLightLayer(OmniUiTest):
             light = self.stage.DefinePrim("/ARect")
             light.SetTypeName("RectLight")
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             manipulator = self._wire_model_light(layer, "/ARect")
             base = manipulator._base_intensity_scale
             manipulator.cone_threshold = 5.0 * CONE_THRESHOLD_DEFAULT
@@ -346,10 +372,9 @@ class TestLightLayer(OmniUiTest):
             light.SetTypeName("DiskLight")
             UsdLux.ShapingAPI.Apply(light).CreateShapingConeAngleAttr(30.0)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             manipulator = self._wire_model_light(layer, "/ShapedDiskForCache")
             self.assertIsNone(manipulator._shaping_authored_cache)
             manipulator.mark_drag_began()
@@ -375,10 +400,9 @@ class TestLightLayer(OmniUiTest):
                 if cone_angle is not None:
                     UsdLux.ShapingAPI.Apply(light).CreateShapingConeAngleAttr(cone_angle)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
 
             invalidated: list[str] = []
             for path, manipulator in layer.manipulators.items():
@@ -407,10 +431,9 @@ class TestLightLayer(OmniUiTest):
             for prim in (disk, sphere):
                 UsdLux.ShapingAPI.Apply(prim).CreateShapingConeAngleAttr(30.0)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             self.assertEqual(len(layer.manipulators), 2)
 
             # The Tf.Notice listener is normally registered on selection; this harness
@@ -451,10 +474,9 @@ class TestLightLayer(OmniUiTest):
             for prim in (disk, sphere):
                 UsdLux.ShapingAPI.Apply(prim).CreateShapingConeAngleAttr(30.0)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             self.assertEqual(len(layer.manipulators), 2)
 
             for path, manipulator in layer.manipulators.items():
@@ -498,10 +520,9 @@ class TestLightLayer(OmniUiTest):
             disk.SetTypeName("DiskLight")
             UsdLux.ShapingAPI.Apply(disk).CreateShapingConeAngleAttr(30.0)
 
-            class MockEvent:
-                type = omni.usd.StageEventType.HIERARCHY_CHANGED.value
-
-            layer._on_stage_event(MockEvent())
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
             self.assertEqual(len(layer.manipulators), 1)
 
             manipulator = self._wire_model_light(layer, "/DeferredDestroyDisk")
@@ -534,4 +555,104 @@ class TestLightLayer(OmniUiTest):
         finally:
             if token is not None:
                 _end_interaction(token)
+            layer.destroy()
+
+    async def test_manipulator_teardown_releases_model_stage_event_subscription(self):
+        """Layer teardown should release each model's stage event subscription and USD listener, and stay idempotent."""
+        vp_api = ViewportAPI("", 0, lambda: 0)
+        layer = LightManipulatorLayer({"viewport_api": vp_api})
+        try:
+            light = self.stage.DefinePrim("/TeardownDisk")
+            light.SetTypeName("DiskLight")
+
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
+            self.assertEqual(len(layer.manipulators), 1)
+
+            model = self._wire_model_light(layer, "/TeardownDisk").model
+            model._stage_listener = Tf.Notice.Register(Usd.Notice.ObjectsChanged, model._notice_changed, self.stage)
+
+            model._xform_prim = self.stage.GetPrimAtPath("/TeardownDisk")
+
+            self.assertIsNotNone(model._stage_event_sub)
+            self.assertIsNotNone(model._stage_listener)
+
+            layer._destroy_manipulators()
+
+            self.assertIsNone(model._stage_event_sub)
+            self.assertIsNone(model._stage_listener)
+            self.assertIsNone(model._xform_prim)
+
+            model.destroy()
+        finally:
+            layer.destroy()
+
+    async def test_model_teardown_keeps_failed_handles_and_releases_the_rest(self):
+        """A failing release must not strand the others, must keep its own handle, and must stay retryable."""
+        vp_api = ViewportAPI("", 0, lambda: 0)
+        layer = LightManipulatorLayer({"viewport_api": vp_api})
+        try:
+            light = self.stage.DefinePrim("/FailingTeardownDisk")
+            light.SetTypeName("DiskLight")
+
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
+            model = self._wire_model_light(layer, "/FailingTeardownDisk").model
+
+            failing_sub = MagicMock()
+            failing_sub.reset.side_effect = RuntimeError("reset failed")
+            failing_listener = MagicMock()
+            failing_listener.Revoke.side_effect = RuntimeError("revoke failed")
+
+            model._stage_event_sub.reset()
+            model._stage_event_sub = failing_sub
+            model._stage_listener = failing_listener
+            model._xform_prim = self.stage.GetPrimAtPath("/FailingTeardownDisk")
+
+            with self.assertRaises(RuntimeError):
+                model.destroy()
+
+            failing_sub.reset.assert_called_once()
+            failing_listener.Revoke.assert_called_once()
+            self.assertIs(model._stage_event_sub, failing_sub)
+            self.assertIs(model._stage_listener, failing_listener)
+            self.assertIsNone(model._light)
+            self.assertIsNone(model._xform_prim)
+
+            retry_sub, retry_listener = MagicMock(), MagicMock()
+            model._stage_event_sub = retry_sub
+            model._stage_listener = retry_listener
+            model.destroy()
+
+            retry_sub.reset.assert_called_once()
+            retry_listener.Revoke.assert_called_once()
+            self.assertIsNone(model._stage_event_sub)
+            self.assertIsNone(model._stage_listener)
+        finally:
+            layer.destroy()
+
+    async def test_layer_teardown_releases_model_when_manipulator_cleanup_fails(self):
+        """A manipulator whose own teardown raises must still release its model's stage event subscription."""
+        vp_api = ViewportAPI("", 0, lambda: 0)
+        layer = LightManipulatorLayer({"viewport_api": vp_api})
+        try:
+            light = self.stage.DefinePrim("/FailingManipulatorDisk")
+            light.SetTypeName("DiskLight")
+
+            get_eventdispatcher().dispatch_event(
+                omni.usd.get_context().stage_event_name(omni.usd.StageEventType.HIERARCHY_CHANGED), payload={}
+            )
+            manipulator = self._wire_model_light(layer, "/FailingManipulatorDisk")
+            model = manipulator.model
+            manipulator._interaction_end_subscription = MagicMock()
+            manipulator._interaction_end_subscription.revoke.side_effect = RuntimeError("revoke failed")
+
+            self.assertIsNotNone(model._stage_event_sub)
+
+            layer._destroy_manipulators()
+
+            self.assertIsNone(model._stage_event_sub)
+        finally:
             layer.destroy()

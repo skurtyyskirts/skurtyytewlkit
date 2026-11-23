@@ -27,6 +27,8 @@ icon = "data/icon.png"
 "lightspeed.trex.stage.core.shared" = {}
 "lightspeed.trex.utils.widget" = {}
 "lightspeed.trex.stage_manager.widget" = {}
+"lightspeed.trex.asset_modifiers.widget" = {}
+"lightspeed.trex.job_queue.widget" = {}
 "lightspeed.trex.capture_tree.widget" = {}
 "lightspeed.trex.home.widget" = {}
 "lightspeed.trex.logic.widget" = {}
@@ -59,7 +61,12 @@ dependencies = [
 ]
 
 args = [
-    "--/renderer/mdl/searchPaths/templates=${lightspeed.trex.app.resources}/deps/omni_core_materials/Base;${kit}/mdl/core/Base;${kit}/mdl/core/Volume;${kit}/mdl/core/mdl"
+    "--/renderer/mdl/searchPaths/templates=${lightspeed.trex.app.resources}/deps/omni_core_materials/Base;${kit}/mdl/core/Base;${kit}/mdl/core/Volume;${kit}/mdl/core/mdl",
+    # Match the base app before Kit's stock viewport extension starts.
+    "--/exts/omni.kit.viewport.window/startup/cameraManipulator/enabled=false",
+    "--/exts/omni.kit.viewport.window/startup/disableWindowOnLoad=true",
+    "--/exts/omni.kit.viewport.window/startup/showOnLaunch=false",
+    "--/exts/omni.kit.viewport.window/windowMenu/entryCount=0",
 ]
 
 pythonTests.exclude = [
@@ -82,6 +89,10 @@ dependencies = [
 args = [
     "--/app/trex/default_layout=stagecraft",
     "--/renderer/mdl/searchPaths/templates=${lightspeed.trex.app.resources}/deps/omni_core_materials/Base;${kit}/mdl/core/Base;${kit}/mdl/core/Volume;${kit}/mdl/core/mdl",
+    "--/exts/omni.kit.viewport.window/startup/cameraManipulator/enabled=false",
+    "--/exts/omni.kit.viewport.window/startup/disableWindowOnLoad=true",
+    "--/exts/omni.kit.viewport.window/startup/showOnLaunch=false",
+    "--/exts/omni.kit.viewport.window/windowMenu/entryCount=0",
 ]
 
 pythonTests.include = [

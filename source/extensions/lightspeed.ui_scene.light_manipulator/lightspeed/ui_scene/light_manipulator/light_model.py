@@ -31,6 +31,7 @@ __all__ = [
 from typing import TYPE_CHECKING
 
 import omni.usd
+from carb.eventdispatcher import get_eventdispatcher
 from omni.ui import scene as sc
 from pxr import Gf, Sdf, Tf, Usd, UsdGeom, UsdLux
 
@@ -121,6 +122,9 @@ class AbstractLightModel(sc.AbstractManipulatorModel):
 
     light_class: type[UsdLuxLight] = None
     linked_axes = [0, 0, 0]
+    # Class defaults so destroy() is safe from __del__ on a model whose __init__ raised before assigning them.
+    _stage_event_sub = None
+    _stage_listener = None
 
     def __init__(self, prim: Usd.Prim, usd_context_name: str = "", viewport_layer: LightManipulatorLayer = None):
         super().__init__()
@@ -154,13 +158,36 @@ class AbstractLightModel(sc.AbstractManipulatorModel):
         self._stage_listener: Tf.Listener | None = None
 
         # Track selection change
-        self._events = self._usd_context.get_stage_event_stream()
-        self._stage_event_sub = self._events.create_subscription_to_pop(
-            self._on_stage_event, name="Light Manipulator Selection Change"
+        self._stage_event_sub = get_eventdispatcher().observe_event(
+            event_name=self._usd_context.stage_event_name(omni.usd.StageEventType.SELECTION_CHANGED),
+            on_event=lambda _: self._on_kit_selection_changed(),
+            observer_name="lightspeed.ui_scene.light_manipulator:AbstractLightModel._on_kit_selection_changed",
         )
 
     def __del__(self):
-        self._invalidate_object()
+        self.destroy()
+
+    def destroy(self):
+        """Release the stage event subscription, the USD listener, and cached USD references.
+
+        The subscription holds a callback that references this model, so the two form a reference cycle that
+        refcounting alone can never break. Each release runs even if an earlier one raises, so one
+        failing handle cannot strand the others, and a handle is dropped only once its release
+        succeeded so a later call can retry it. Safe to call more than once.
+        """
+        try:
+            if self._stage_event_sub is not None:
+                self._stage_event_sub.reset()
+                self._stage_event_sub = None
+        finally:
+            # Not _invalidate_object: it broadcasts an item change, rebuilding scene items being torn down.
+            try:
+                if self._stage_listener is not None:
+                    self._stage_listener.Revoke()
+                    self._stage_listener = None
+            finally:
+                self._light = None
+                self._xform_prim = None
 
     def set_path_redirect(self, path: Sdf.Path):
         self.__redirect_path = path
@@ -327,11 +354,6 @@ class AbstractLightModel(sc.AbstractManipulatorModel):
             self._set_intensity(self._time, value[0])
         else:
             self._set_floats(item, value)
-
-    def _on_stage_event(self, event):
-        """Called by stage_event_stream"""
-        if event.type == int(omni.usd.StageEventType.SELECTION_CHANGED):
-            self._on_kit_selection_changed()
 
     def _invalidate_object(self):
         # Revoke the Tf.Notice listener, we don't need to update anything

@@ -15,6 +15,7 @@
 * limitations under the License.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -707,3 +708,102 @@ class TestSetupUI(omni.kit.test.AsyncTestCase):
         self.assertNotIn("omni.kit.viewport.LightManipulatorLayer", extension._TrexViewportSharedExtension__registered)
         self.assertIn("omni.kit.viewport.SceneLayer", extension._TrexViewportSharedExtension__registered)
         self.assertIn("omni.kit.viewport.ViewportTools", extension._TrexViewportSharedExtension__registered)
+
+    async def test_stage_transition_pending_activation_cancels_and_clears_task(self):
+        """Closing or opening a stage should discard activation owned by the previous stage."""
+        for event_type in (_setup_ui.omni.usd.StageEventType.CLOSING, _setup_ui.omni.usd.StageEventType.OPENING):
+            with self.subTest(title=event_type.name):
+                # Arrange
+                setup = _setup_ui.SetupUI.__new__(_setup_ui.SetupUI)
+                usd_context = MagicMock()
+                usd_context.stage_event_name.side_effect = lambda stage_event_type: stage_event_type
+                setup._viewport_layers = SimpleNamespace(viewport_api=SimpleNamespace(usd_context=usd_context))
+                dispatcher = MagicMock()
+                with patch.object(_setup_ui, "get_eventdispatcher", return_value=dispatcher):
+                    setup._subscribe_stage_events()
+                callbacks = {
+                    call.kwargs["event_name"]: call.kwargs["on_event"]
+                    for call in dispatcher.observe_event.call_args_list
+                }
+                activation = asyncio.get_running_loop().create_future()
+                self.addCleanup(activation.cancel)
+                setup._remix_renderer_activation_task = activation
+
+                # Act
+                callbacks[event_type](None)
+
+                # Assert
+                self.assertTrue(activation.cancelled())
+                self.assertIsNone(setup._remix_renderer_activation_task)
+
+    async def test_schedule_remix_renderer_activation_without_stage_defers_activation(self):
+        """A visible viewport without a stage should not start renderer initialization."""
+        # Arrange
+        setup = _setup_ui.SetupUI.__new__(_setup_ui.SetupUI)
+        setup._window_visible = True
+        setup._remix_renderer_activation_task = None
+        setup._viewport_layers = SimpleNamespace(viewport_api=SimpleNamespace(stage=None, updates_enabled=True))
+        activation = asyncio.get_running_loop().create_future()
+        self.addCleanup(activation.cancel)
+
+        with patch.object(
+            setup, "_activate_remix_renderer_async", new=MagicMock(return_value=activation)
+        ) as mock_activate:
+            # Act
+            setup._schedule_remix_renderer_activation("viewport-active")
+
+        # Assert
+        self.assertIsNone(setup._remix_renderer_activation_task)
+        mock_activate.assert_not_called()
+
+    async def test_stage_opened_visible_viewport_schedules_activation(self):
+        """Opening the replacement stage should resume renderer initialization."""
+        # Arrange
+        setup = _setup_ui.SetupUI.__new__(_setup_ui.SetupUI)
+        setup.viewport_id = "Viewport0"
+        setup._window_visible = True
+        setup._active = False
+        setup._docked = False
+        setup._remix_renderer_activation_task = None
+        viewport_api = SimpleNamespace(stage=object(), updates_enabled=False)
+        setup._viewport_layers = SimpleNamespace(viewport_api=viewport_api)
+        activation = asyncio.get_running_loop().create_future()
+        self.addCleanup(activation.cancel)
+        stage_opened = SimpleNamespace()
+
+        with (
+            patch.object(_setup_ui, "_get_event_manager_instance"),
+            patch.object(setup, "_activate_remix_renderer_async", new=MagicMock(return_value=activation)),
+        ):
+            # Act
+            setup._on_stage_opened(stage_opened)
+
+        # Assert
+        self.assertIs(activation, setup._remix_renderer_activation_task)
+        self.assertFalse(activation.done())
+        self.assertTrue(viewport_api.updates_enabled)
+        self.assertTrue(setup.is_active())
+
+    async def test_stage_opened_hidden_viewport_defers_activation(self):
+        """Opening a stage in a hidden viewport leaves renderer initialization deferred."""
+        # Arrange
+        setup = _setup_ui.SetupUI.__new__(_setup_ui.SetupUI)
+        setup.viewport_id = "ingestcraft/Viewport0"
+        setup._window_visible = False
+        setup._active = False
+        setup._docked = False
+        setup._remix_renderer_activation_task = None
+        viewport_api = SimpleNamespace(stage=object(), updates_enabled=False)
+        setup._viewport_layers = SimpleNamespace(viewport_api=viewport_api)
+        setup._activate_remix_renderer_async = AsyncMock()
+        stage_opened = SimpleNamespace()
+
+        with patch.object(_setup_ui, "_get_event_manager_instance"):
+            # Act
+            setup._on_stage_opened(stage_opened)
+
+        # Assert
+        self.assertIsNone(setup._remix_renderer_activation_task)
+        setup._activate_remix_renderer_async.assert_not_called()
+        self.assertFalse(viewport_api.updates_enabled)
+        self.assertFalse(setup.is_active())
