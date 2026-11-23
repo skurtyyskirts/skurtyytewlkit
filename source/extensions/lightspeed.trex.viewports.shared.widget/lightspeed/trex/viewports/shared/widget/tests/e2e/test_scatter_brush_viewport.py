@@ -101,6 +101,8 @@ class TestScatterBrushViewportE2E(OmniUiTest):
         self._window = ui.Window("TestScatterBrushViewportUI", width=_WINDOW_WIDTH, height=_WINDOW_HEIGHT)
         with self._window.frame:
             self._widget = _create_viewport_instance(_CONTEXT_NAME)
+        # The viewport starts its renderer only once it is shown, as the Toolkit's docked viewport is.
+        self._widget.show(True)
         await self.__wait_for_viewport()
         self._viewport_api = self._widget.viewport_api
         self._stage = self._usd_context.get_stage()

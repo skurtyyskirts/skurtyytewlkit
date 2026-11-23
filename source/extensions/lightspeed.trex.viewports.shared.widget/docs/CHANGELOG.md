@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - With Apply To set to Selected, the scatter brush casts the camera ray at the selected meshes itself, so the ground is painted straight through the foliage cards, props and earlier scatter in front of it; the renderer pick only decides the cursor off the selection. A stroke started with nothing selected is refused with a status message. The cursor normal faces the camera, and each stroke hands the camera position to the core so it paints the side of the surface being looked at
 - The scatter brush now says when a stroke stops at its prim limit: the counter reads "(limit reached)" in red, the cursor turns grey, and the stroke ends with a status message naming the limit and the settings that change it, plus a notification the first time while the brush stays on. A stroke that ended before the brush caught up with the cursor, or that an error stopped, is reported the same way. Over a mesh with more instances than the stroke has room left for, the cursor turns grey and the counter reads "(too many instances here)" while the stroke stays open for the meshes it can still paint, and its status message names that mesh and why nothing was painted on it. Every other stroke ends with a status line of what it painted, with the prims that renders, or erased. The cursor now turns red or green as Shift is pressed or released with the mouse at rest, where it used to wait for the next mouse move
 
+### Fixed
+- Showed the viewport in the scatter brush E2E setup, since the viewport now starts its renderer only once shown.
+
 ## [1.8.8]
 ### Changed
 - Migrated deprecated event stream subscriptions to Events 2.0 (`carb.eventdispatcher`).

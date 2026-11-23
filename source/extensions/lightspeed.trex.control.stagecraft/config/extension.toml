@@ -58,6 +58,7 @@ exts."lightspeed.trex.control.stagecraft".lightRigs.modSkyDirectories = ["assets
 [[test]]
 dependencies = [
     "lightspeed.trex.tests.dependencies",
+    "lightspeed.trex.viewports.stagecraft.bundle",  # the StageCraft viewport's Lighting menu rigs, as in the app
 ]
 
 args = [

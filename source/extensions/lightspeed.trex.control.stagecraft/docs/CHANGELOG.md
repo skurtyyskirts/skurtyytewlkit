@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - Made the per-stage lighting-mode setting key public as `get_lighting_mode_setting_key`.
+- Loaded the StageCraft viewport bundle in the extension tests so the Lighting menu lists the same rigs as in the app.
 
 ## [1.9.2]
 ### Changed
