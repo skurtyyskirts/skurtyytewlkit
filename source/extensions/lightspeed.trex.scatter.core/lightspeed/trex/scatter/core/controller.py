@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 __all__ = [
+    "FloodOutcome",
     "ScatterBrushController",
     "ScatterMode",
     "destroy_reapply_drivers",
     "destroy_scatter_brush_controller",
+    "flood_targets",
     "get_reapply_driver",
     "get_scatter_brush_controller",
 ]
@@ -51,9 +53,10 @@ from .assets import (
     read_authored_asset_up_axis,
 )
 from .commands import ScatterStrokeCommand, ScatterStrokeKind
+from .instancing import instanced_points, instancers_of_selection
 from .materials import asset_source_hash, build_materials_payload, resolve_asset_texture_set
 from .picking import create_surface_picker
-from .placement import existing_placement_points, generate_flood
+from .placement import existing_placement_points, flood_sample_count, generate_flood
 from .presets import PresetStore, get_default_presets_directory
 from .geometry import MeshSurfaceCache
 from .reapply import ReapplyDriver, ReapplyScope, scope_of_placements
@@ -66,6 +69,7 @@ from .settings import (
     UpAxis,
     load_assets_from_carb,
     save_assets_to_carb,
+    stroke_prim_limit,
 )
 from .targets import (
     ScatterTarget,
@@ -78,6 +82,10 @@ if TYPE_CHECKING:
     from .picking import SurfacePicker
 
 _LOG_PREFIX = "[lightspeed.trex.scatter.core]"
+# Samples a flood draws for every placement its prim limit leaves room for. Padding and the surface angle reject some
+# samples, so drawing only as many as there is room for would leave a limited flood short of its limit, while drawing
+# everything the surface takes would compose thousands of placements to keep a handful.
+_FLOOD_OVERSAMPLE = 4
 
 
 class ScatterMode(Enum):
@@ -159,6 +167,8 @@ class ScatterBrushController:
         self._stroke_index = 0
         # Paths already reported as disagreeing with their file, so a stroke does not repeat the warning.
         self._up_axis_warned: set[str] = set()
+        # Up-axis mismatches reported since the last stroke summary, by asset path, for that summary to repeat.
+        self._stroke_notes: dict[str, str] = {}
         self._picker_factory: Callable[[object, MeshSurfaceCache], SurfacePicker] | None = None
 
         # The turn the viewport gizmo and the Scatter window's turn fields have between them put on one patch,
@@ -178,7 +188,14 @@ class ScatterBrushController:
         self.__on_status_message = Event(copy=True)
         self.__on_selection_turn_changed = Event(copy=True)
         self.__on_preview_changed = Event(copy=True)
+        self.__on_history_stepped = Event(copy=True)
         omni.kit.undo.subscribe_on_change(self._on_undo_stack_changed)
+        # The undo stack reports a command the same way whether it was done, undone or redone, so the two commands
+        # that step through the history are listened to directly.
+        self._history_callbacks = [
+            omni.kit.commands.register_callback(name, omni.kit.commands.POST_DO_CALLBACK, self._on_history_stepped)
+            for name in ("Undo", "Redo")
+        ]
 
     @property
     def settings(self) -> ScatterBrushSettings:
@@ -231,6 +248,24 @@ class ScatterBrushController:
         """Replace the whole settings object with a copy of the given one, persist it and notify subscribers."""
         self._set_settings(settings.model_copy(deep=True))
 
+    def reset_settings(self) -> None:
+        """Put every brush setting back to its default, the way loading a preset replaces them all.
+
+        The asset palette and the presets on disk are left alone: they are what the user collected, not settings. Like
+        a preset, the change reaches the stroke just painted when live editing is on, and one undo still removes it.
+
+        Two fields are kept. The preset name says which preset is being edited and names the container the next
+        stroke goes into, so resetting it would send new scatter into another patch than the one being painted.
+        ``edit_selection_live`` says whether a settings change may rewrite scatter that is already painted, so turning
+        it back on here would rewrite the selection with the very defaults being restored.
+        """
+        self.replace_settings(
+            ScatterBrushSettings(
+                preset_name=self._settings.preset_name, edit_selection_live=self._settings.edit_selection_live
+            )
+        )
+        self.post_status("Brush settings reset to their defaults")
+
     def add_asset(self, path: str, up_axis: UpAxis | None = None) -> bool:
         """Append an ingested asset to the palette.
 
@@ -265,6 +300,7 @@ class ScatterBrushController:
         if entry is None:
             return False
         self._assets.remove(entry)
+        self._stroke_notes.pop(entry.path, None)
         self._assets_changed()
         return True
 
@@ -279,7 +315,9 @@ class ScatterBrushController:
     def set_asset_up_axis(self, path: str, up_axis: UpAxis) -> bool:
         """Override the authored up axis of a palette entry. Returns False when the path is unknown."""
         # Forgotten so the entry is judged again: an override that still disagrees with the file is worth saying.
-        self._up_axis_warned.discard(normalize_asset_path(path))
+        normalized = normalize_asset_path(path)
+        self._up_axis_warned.discard(normalized)
+        self._stroke_notes.pop(normalized, None)
         return self._update_asset(path, "up_axis", up_axis)
 
     def set_asset_texture_source(self, path: str, texture_path: str) -> bool:
@@ -363,11 +401,29 @@ class ScatterBrushController:
                 continue
             self._up_axis_warned.add(entry.path)
             reported.append(entry.path)
-            self.post_status(
+            message = (
                 f"{_asset_display_name(entry.path)} is authored {authored.value}-up but the brush is set to "
-                f"{entry.up_axis.value}-up, so it will be scattered on its side"
+                f"{entry.up_axis.value}-up, so it will be scattered on its side; set it to {authored.value} in "
+                "Placement > Asset Up Axis"
             )
+            # Kept for the summary of the stroke this is reported at the start of, which would otherwise replace it.
+            self._stroke_notes[entry.path] = message
+            self.post_status(message)
         return reported
+
+    def post_stroke_summary(self, text: str, is_error: bool = False) -> None:
+        """Post what a stroke or a flood did, behind whatever was reported about its assets when it started.
+
+        An up-axis mismatch is reported once, as the stroke that will paint the asset on its side begins, and the
+        summary arrives when that stroke ends. Posted on its own, the summary would take the one line that explains
+        what is wrong with the placements just painted off the status line a moment after it appeared.
+
+        Args:
+            text: What the stroke or the flood did.
+            is_error: Whether the summary reports something that went wrong.
+        """
+        notes, self._stroke_notes = list(self._stroke_notes.values()), {}
+        self.post_status(". ".join([*notes, text]), is_error)
 
     def materials_payload(self, layer: Sdf.Layer, assets: Sequence[ScatterAssetEntry] | None = None) -> dict:
         """Build the shader-override payload for ``assets`` (the enabled palette by default).
@@ -386,14 +442,32 @@ class ScatterBrushController:
         """Sorted names of the stored presets."""
         return self._presets.list_names()
 
+    def stored_preset_name(self, name: str) -> str | None:
+        """Return the name of the stored preset a save under ``name`` would overwrite, or None when there is none.
+
+        The stored name can differ from ``name`` in case, on a file system that ignores it. A name that is not a
+        valid preset name overwrites nothing, so it returns None and is left for the save to refuse.
+
+        Args:
+            name: Name a preset would be saved under.
+        """
+        try:
+            return self._presets.stored_name(name)
+        except ValueError:
+            return None
+
     def apply_preset(self, name: str) -> bool:
-        """Load a preset and make it the current settings. Returns False and posts an error when it cannot be loaded."""
+        """Load a preset and make it the current settings. Returns False and posts an error when it cannot be loaded.
+
+        ``edit_selection_live`` keeps its current value: a preset describes a brush, and a preset saved with live
+        editing on would otherwise turn it back on and rewrite the selected scatter in the same step.
+        """
         try:
             settings = self._presets.load(name)
         except ValueError as exc:
             self.post_status(f"Cannot load preset '{name}': {exc}", is_error=True)
             return False
-        self.replace_settings(settings)
+        self.replace_settings(settings.model_copy(update={"edit_selection_live": self._settings.edit_selection_live}))
         return True
 
     def save_preset(self, name: str | None = None) -> bool:
@@ -519,43 +593,84 @@ class ScatterBrushController:
 
         layer = stage.GetEditTarget().GetLayer()
         materials = self.materials_payload(layer, assets)
-        stage_up = stage_up_axis(stage)
-        stage_units = stage_meters_per_unit(stage)
         seed, stroke_index = self.next_stroke()
-        remaining = self._settings.flood_max_instances
-        total = 0
         with omni.kit.undo.group():
-            for target_index, target in enumerate(targets):
-                if remaining <= 0:
-                    break
-                padding_index = PaddingIndex(max(self._settings.padding, 1.0))
-                if self._settings.padding > 0.0:
-                    padding_index.add_many(existing_placement_points(stage, target))
-                records = generate_flood(
-                    cache,
-                    target,
-                    self._settings,
-                    assets,
-                    stamp_rng(seed, stroke_index, target_index),
-                    padding_index,
-                    stage_up,
-                    stage_units,
-                    layer,
-                    remaining,
-                )
-                if not records:
-                    continue
-                omni.kit.commands.execute(
-                    "ScatterFloodCommand",
-                    context_name=usd_context_name,
-                    layer_identifier=layer.identifier,
-                    records=records,
-                    materials=materials,
-                )
-                total += len(records)
-                remaining -= len(records)
-        self.notify_stroke_committed(total, False)
-        return total
+            outcome = flood_targets(
+                stage, usd_context_name, layer, cache, targets, self._settings, assets, materials, seed, stroke_index
+            )
+        self.notify_stroke_committed(outcome.placed, False)
+        self._report_flood(outcome)
+        return outcome.placed
+
+    def instance_all(self, usd_context_name: str) -> int:
+        """Merge every loose placement of the edit layer into the instancers of their patches, in one undo step.
+
+        Painting merges the stroke before the one being painted on its own; this covers the rest, such as the last
+        stroke of a session, scatter painted before instancing existed, or a patch that was split to be edited.
+
+        Args:
+            usd_context_name: USD context whose edit layer is merged.
+
+        Returns:
+            How many placements were merged; problems and the result are reported through status messages.
+        """
+        stage = omni.usd.get_context(usd_context_name).get_stage()
+        if stage is None:
+            self.post_status("Open a project before instancing scatter", is_error=True)
+            return 0
+        layer = stage.GetEditTarget().GetLayer()
+        # The stroke being previewed is merged too, so it stops being the preview before its prims go away.
+        self.end_preview()
+        _, command = omni.kit.commands.execute(
+            "ScatterInstanceCommand", context_name=usd_context_name, layer_identifier=layer.identifier
+        )
+        count = command if isinstance(command, int) else 0
+        if count:
+            self.post_status(f"Instanced {count} placement{'s' if count != 1 else ''}")
+        else:
+            self.post_status("No loose placements to instance in the edit layer")
+        return count
+
+    def split_selection(self, usd_context_name: str) -> int:
+        """Turn the instancers the selection names back into loose placements the brush can edit, in one undo step.
+
+        The split placements are selected, which makes them what live edits and the gizmo change. Painting the next
+        stroke merges them again.
+
+        Args:
+            usd_context_name: USD context whose selection names the instancers.
+
+        Returns:
+            How many placements the split created; problems are reported through status messages.
+        """
+        usd_context = omni.usd.get_context(usd_context_name)
+        stage = usd_context.get_stage()
+        if stage is None:
+            self.post_status("Open a project before splitting scatter", is_error=True)
+            return 0
+        instancers = instancers_of_selection(stage, usd_context.get_selection().get_selected_prim_paths())
+        if not instancers:
+            self.post_status("Select instanced scatter, or the mesh it is painted on, to split it", is_error=True)
+            return 0
+        layer = stage.GetEditTarget().GetLayer()
+        _, paths = omni.kit.commands.execute(
+            "ScatterSplitCommand",
+            context_name=usd_context_name,
+            layer_identifier=layer.identifier,
+            instancer_paths=[str(path) for path in instancers],
+        )
+        paths = list(paths or [])
+        if not paths:
+            self.post_status(
+                "The selected instanced scatter is authored in another layer; set that layer as the edit target to "
+                "split it",
+                is_error=True,
+            )
+            return 0
+        containers = sorted({str(Sdf.Path(path).GetParentPath()) for path in paths})
+        usd_context.get_selection().set_selected_prim_paths(containers, True)
+        self.post_status(f"Split {len(paths)} placement{'s' if len(paths) != 1 else ''} for editing")
+        return len(paths)
 
     def subscribe_mode_changed(self, fn: Callable[[ScatterMode], None]) -> EventSubscription:
         """Subscribe to mode changes; the subscription ends when the returned object is released."""
@@ -667,6 +782,10 @@ class ScatterBrushController:
         """Subscribe to the preview starting or ending; the subscription ends when the returned object is released."""
         return EventSubscription(self.__on_preview_changed, fn)
 
+    def subscribe_history_stepped(self, fn: Callable[[], None]) -> EventSubscription:
+        """Subscribe to an undo or a redo having run, which can add or remove scatter without a stroke committing."""
+        return EventSubscription(self.__on_history_stepped, fn)
+
     def subscribe_settings_changed(self, fn: Callable[[ScatterBrushSettings], None]) -> EventSubscription:
         """Subscribe to settings replacements; the subscription ends when the returned object is released."""
         return EventSubscription(self.__on_settings_changed, fn)
@@ -704,7 +823,11 @@ class ScatterBrushController:
         self.__on_status_message = Event(copy=True)
         self.__on_selection_turn_changed = Event(copy=True)
         self.__on_preview_changed = Event(copy=True)
+        self.__on_history_stepped = Event(copy=True)
         omni.kit.undo.unsubscribe_on_change(self._on_undo_stack_changed)
+        for callback_id in self._history_callbacks:
+            omni.kit.commands.unregister_callback(callback_id)
+        self._history_callbacks = []
         self._preview = None
         self._picker_factory = None
 
@@ -731,6 +854,22 @@ class ScatterBrushController:
         except Exception as exc:  # noqa: BLE001 - runs inside an unrelated command, which must not fail because of it.
             self._preview = None
             carb.log_error(f"{_LOG_PREFIX} Ending the scatter stroke preview failed: {exc}")
+
+    def _on_history_stepped(self, _info: dict) -> None:
+        """Start the turn count of the selection again and tell subscribers that an undo or a redo has run.
+
+        What a patch has been turned by is recorded here, not read from the stage, and an undo takes a turn away
+        without saying so. Kept, the record would show a turn the patch no longer has and the next turn would be
+        measured from it, landing the patch somewhere other than the angle typed.
+
+        Called from inside the undo or redo command, so nothing may escape it: a fault here would fail a command that
+        has nothing to do with scatter.
+        """
+        try:
+            self.set_selection_turn(self._selection_turn_scope, (0.0, 0.0, 0.0))
+            self.__on_history_stepped()
+        except Exception as exc:  # noqa: BLE001 - runs inside the undo command, which must not fail because of it.
+            carb.log_error(f"{_LOG_PREFIX} Following an undo or a redo failed: {exc}")
 
     def _set_settings(self, settings: ScatterBrushSettings) -> None:
         """Adopt validated settings, persist them and notify subscribers."""
@@ -772,6 +911,35 @@ class ScatterBrushController:
             return
         self.post_status(f"{_asset_display_name(entry.path)}: {texture_set.reason}")
 
+    def _report_flood(self, outcome: FloodOutcome) -> None:
+        """Post what a flood placed, and say so when the prim limit kept it from placing more.
+
+        A flood that places nothing looks like a button that does nothing, and one the prim limit trimmed looks like
+        a flood cap that was ignored, so both are said rather than left to be guessed.
+        """
+        placements = f"{outcome.placed:,} placement{'s' if outcome.placed != 1 else ''}"
+        prims = f"{outcome.rendered_prims:,} prim{'s' if outcome.rendered_prims != 1 else ''}"
+        if outcome.limited and not outcome.placed:
+            self.post_stroke_summary(
+                "Flood placed nothing: one placement on the target renders on more instances than the flood's limit "
+                f"of {outcome.prim_limit:,} rendered prims allows. Raise Target > Prim Budget to flood it",
+                is_error=True,
+            )
+        elif outcome.limited:
+            self.post_stroke_summary(
+                f"Flood placed {placements}, rendering {prims}, and was held back by its limit of "
+                f"{outcome.prim_limit:,} rendered prims. Raise Target > Prim Budget to allow more in one flood",
+                is_error=True,
+            )
+        elif outcome.placed:
+            self.post_stroke_summary(f"Flood placed {placements}, rendering {prims}")
+        else:
+            self.post_stroke_summary(
+                "Flood placed nothing: the surface may already be filled at this Padding or be steeper than Max "
+                "Surface Angle, or no enabled asset has a Weight above zero",
+                is_error=True,
+            )
+
     def _assets_changed(self) -> None:
         """Persist the palette and notify subscribers."""
         save_assets_to_carb(self._assets)
@@ -790,6 +958,121 @@ class ScatterBrushController:
             if target is not None:
                 targets.append(target)
         return targets
+
+
+@dataclass(frozen=True)
+class FloodOutcome:
+    """What a flood authored.
+
+    Attributes:
+        placed: Placements created across every target.
+        rendered_prims: Prims they add to the rendered stage; a placement renders once per instance of the prototype
+            it was authored under.
+        limited: Whether the prim limit, rather than the surfaces or ``flood_max_instances``, decided how many
+            placements at least one target received: it was filled up to the limit, or had no room left at all.
+        prim_limit: Rendered prims the flood was allowed, from ``stroke_prim_limit``.
+    """
+
+    placed: int = 0
+    rendered_prims: int = 0
+    limited: bool = False
+    prim_limit: int = 0
+
+
+def flood_targets(
+    stage: Usd.Stage,
+    usd_context_name: str,
+    layer: Sdf.Layer,
+    cache: MeshSurfaceCache,
+    targets: Sequence[ScatterTarget],
+    settings: ScatterBrushSettings,
+    assets: Sequence[ScatterAssetEntry],
+    materials: dict,
+    seed: int,
+    stroke_index: int,
+) -> FloodOutcome:
+    """Fill whole target surfaces with placements, one flood command per target that received any.
+
+    The brush floods with its own settings and palette; a scatter group floods with the ones it recorded, so neither
+    changes the other. Callers open the undo group, so a flood can share one undo step with the edits around it.
+
+    Two caps bound a flood. ``settings.flood_max_instances`` is the number of samples it may draw, shared by the
+    targets in order. ``stroke_prim_limit`` is the number of prims its placements may render, which is what a
+    prototype with many instances runs into first, since each placement under it renders once per instance; a target
+    that would pass it keeps only the placements there is room for.
+
+    Args:
+        stage: Stage the targets belong to.
+        usd_context_name: USD context the flood commands are executed in.
+        layer: Layer the placements are authored in.
+        cache: Mesh cache providing the geometry of the targets.
+        targets: Surfaces to fill, in the order they share the two caps.
+        settings: Settings the placements are generated with.
+        assets: Enabled assets to choose from, with their textures and measurements resolved.
+        materials: Shader-override payload authored with the placements, empty to author none.
+        seed: Seed of the flood's random draws.
+        stroke_index: Stroke counter value mixed into the seed.
+
+    Returns:
+        What the flood authored.
+    """
+    stage_up = stage_up_axis(stage)
+    stage_units = stage_meters_per_unit(stage)
+    prim_limit = stroke_prim_limit(settings.prim_budget)
+    remaining = settings.flood_max_instances
+    placed = 0
+    rendered_prims = 0
+    limited = False
+    for target_index, target in enumerate(targets):
+        if remaining <= 0:
+            break
+        replicas = max(target.instance_count, 1)
+        wanted = min(remaining, flood_sample_count(cache, target, settings))
+        if wanted <= 0:
+            continue
+        room = (prim_limit - rendered_prims) // replicas
+        if room <= 0:
+            # A later target with fewer instances may still fit under the prim limit.
+            limited = True
+            continue
+        padding_index = PaddingIndex(max(settings.padding, 1.0))
+        if settings.padding > 0.0:
+            # A flood is merged into its patch's instancer as soon as it is authored, so the placements an earlier
+            # flood left here are instancer entries; reading the loose ones alone would stack every flood on the last.
+            for points in (existing_placement_points(stage, target), instanced_points(stage, target)):
+                if len(points):
+                    padding_index.add_many(points)
+        records = generate_flood(
+            cache,
+            target,
+            settings,
+            assets,
+            stamp_rng(seed, stroke_index, target_index),
+            padding_index,
+            stage_up,
+            stage_units,
+            layer,
+            min(wanted, room * _FLOOD_OVERSAMPLE),
+        )
+        if room < wanted and len(records) >= room:
+            # The samples are drawn independently of one another, so the first of them cover the surface as evenly
+            # as all of them would.
+            records = records[:room]
+            limited = True
+        if not records:
+            continue
+        omni.kit.commands.execute(
+            "ScatterFloodCommand",
+            context_name=usd_context_name,
+            layer_identifier=layer.identifier,
+            records=records,
+            materials=materials,
+            instance=settings.instance_strokes,
+        )
+        placed += len(records)
+        remaining -= len(records)
+        rendered_prims += len(records) * replicas
+    return FloodOutcome(placed=placed, rendered_prims=rendered_prims, limited=limited, prim_limit=prim_limit)
 
 
 _DRIVERS: dict[str, ReapplyDriver] = {}

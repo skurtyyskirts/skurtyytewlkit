@@ -15,15 +15,18 @@
 * limitations under the License.
 """
 
+import dataclasses
 import json
 import math
 import os
 import pathlib
 import tempfile
+from unittest.mock import patch
 
 import numpy as np
 import omni.kit.test
 from lightspeed.common.constants import IS_REMIX_REF_ATTR
+from lightspeed.trex.scatter.core import placement as placement_module
 from lightspeed.trex.scatter.core.constants import (
     CONTAINER_PREFIX,
     IS_REMIX_SCATTER_ATTR,
@@ -35,17 +38,23 @@ from lightspeed.trex.scatter.core.geometry import MeshSurfaceCache, SurfaceSampl
 from lightspeed.trex.scatter.core.placement import (
     PlacementPool,
     PlacementRecord,
+    SceneScatterCost,
     author_placements,
     container_path_for,
     erase_candidates,
     existing_placement_points,
+    flood_sample_count,
     generate_flood,
     generate_stamp,
     make_relative_asset_path,
     new_placement_name,
+    placement_pool,
+    prune_inert_overs,
     remove_placements,
     restore_prims,
+    scene_scatter_cost,
     snapshot_prims,
+    to_world_points,
 )
 from lightspeed.trex.scatter.core.sampling import PaddingIndex
 from lightspeed.trex.scatter.core.settings import (
@@ -56,7 +65,7 @@ from lightspeed.trex.scatter.core.settings import (
     ScatterBrushSettings,
     UpAxis,
 )
-from lightspeed.trex.scatter.core.targets import ScatterTarget
+from lightspeed.trex.scatter.core.targets import ScatterTarget, reset_instance_index
 from pxr import Gf, Sdf, Usd, UsdGeom
 
 _PROTOTYPE_ROOT = "/RootNode/meshes/mesh_0123456789ABCDEF"
@@ -68,6 +77,7 @@ _OTHER_CONTAINER_PATH = f"{_OTHER_PROTOTYPE_ROOT}/{CONTAINER_PREFIX}default"
 _PARENT_OFFSET = Gf.Vec3d(100.0, 0.0, 0.0)
 _CENTER_WORLD = np.array([100.0, 0.0, 0.0])
 _FLOOR_NORMAL = (0.0, 0.0, 1.0)
+_DOWN_NORMAL = (0.0, 0.0, -1.0)
 _WALL_NORMAL = (-1.0, 0.0, 0.0)
 _HALF_SIZE = 500.0
 _XFORM_OP_ORDER = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
@@ -245,6 +255,7 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         stage_meters_per_unit: float = 1.0,
         cache=None,
         center: SurfaceSample | None = None,
+        view_point: Gf.Vec3d | None = None,
     ) -> list[PlacementRecord]:
         return generate_stamp(
             self._cache if cache is None else cache,
@@ -258,6 +269,7 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
             UpAxis.Z,
             stage_meters_per_unit,
             self._layer,
+            view_point=view_point,
         )
 
     def _flood(
@@ -372,6 +384,35 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         self.assertEqual(points.shape, (2, 3))
         np.testing.assert_allclose(points[np.argsort(points[:, 0])], [[100.0, 0.0, 0.0], [110.0, 20.0, 30.0]])
 
+    async def test_scene_scatter_cost_counts_every_placement_once_per_instance_of_its_prototype(self):
+        # Arrange - two placements on a prototype with two instances, one on a prototype with none
+        self.addCleanup(reset_instance_index)
+        UsdGeom.Xform.Define(self._stage, "/RootNode/instances/inst_0123456789ABCDEF_1")
+        self._stage.DefinePrim(_OTHER_PROTOTYPE_ROOT, "Xform")
+        self._author(
+            _make_record("s_000000000001", self._asset_a),
+            _make_record("s_000000000002", self._asset_a),
+            _make_record("s_000000000003", self._asset_a, container_path=_OTHER_CONTAINER_PATH),
+        )
+        # A plain child without the placement name must not count as a placement.
+        UsdGeom.Xform.Define(self._stage, f"{_CONTAINER_PATH}/helper")
+
+        # Act
+        cost = scene_scatter_cost(self._stage)
+
+        # Assert
+        self.assertEqual(cost, SceneScatterCost(placements=3, rendered_prims=2 * 2 + 1, prototypes=2))
+
+    async def test_scene_scatter_cost_without_a_capture_returns_zero(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+
+        # Act
+        cost = scene_scatter_cost(stage)
+
+        # Assert
+        self.assertEqual(cost, SceneScatterCost())
+
     async def test_existing_placement_points_without_container_returns_empty_array(self):
         # Arrange
         target = self._target
@@ -382,6 +423,67 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(points.shape, (0, 3))
 
+    async def test_existing_placement_points_of_a_raised_placement_returns_the_surface_point_it_recorded(self):
+        # Arrange - a placement lifted 500 off the floor by a vertical offset, standing on the point it recorded
+        raised = dataclasses.replace(
+            _make_record("s_000000000001", self._asset_a, translate=(10.0, 20.0, 500.0)),
+            origin=(10.0, 20.0, 0.0, 0.0, 0.0, 1.0),
+        )
+        self._author(raised)
+
+        # Act
+        points = existing_placement_points(self._stage, self._target)
+
+        # Assert
+        np.testing.assert_allclose(points, [[110.0, 20.0, 0.0]])
+
+    async def test_placement_pool_take_within_reaches_a_raised_placement_from_the_surface_under_it(self):
+        # Arrange - the brush sits on the floor under a placement raised by more than its radius
+        raised = dataclasses.replace(
+            _make_record("s_000000000001", self._asset_a, translate=(10.0, 20.0, 500.0)),
+            origin=(10.0, 20.0, 0.0, 0.0, 0.0, 1.0),
+        )
+        self._author(raised)
+        pool = placement_pool(self._stage, self._target)
+
+        # Act
+        taken = pool.take_within(Gf.Vec3d(110.0, 20.0, 0.0), 5.0)
+
+        # Assert
+        self.assertEqual(taken, [Sdf.Path(raised.prim_path)])
+
+    async def test_to_world_points_applies_the_parent_transform_to_every_point(self):
+        # Arrange
+        parent_world = Gf.Matrix4d().SetScale(Gf.Vec3d(2.0, 2.0, 2.0)) * Gf.Matrix4d().SetTranslate(_PARENT_OFFSET)
+        points = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
+
+        # Act
+        world = to_world_points(points, parent_world)
+
+        # Assert
+        np.testing.assert_allclose(world, [[100.0, 0.0, 0.0], [102.0, 4.0, 6.0]])
+
+    async def test_flood_sample_count_scales_the_density_from_the_brush_disk_to_the_mesh_area(self):
+        # Arrange - the quad is 1000 x 1000, and a brush of radius 50 covers pi * 50 * 50 of it
+        settings = self._settings.model_copy(update={"density": 2.0, "radius": 50.0})
+        expected = math.ceil(2.0 * 1000.0 * 1000.0 / (math.pi * 50.0 * 50.0))
+
+        # Act
+        count = flood_sample_count(self._cache, self._target, settings)
+
+        # Assert
+        self.assertEqual(count, expected)
+
+    async def test_flood_sample_count_of_a_mesh_that_is_not_there_returns_zero(self):
+        # Arrange
+        target = dataclasses.replace(self._target, mesh_path=Sdf.Path(f"{_INSTANCE_ROOT}/missing"))
+
+        # Act
+        count = flood_sample_count(self._cache, target, self._settings)
+
+        # Assert
+        self.assertEqual(count, 0)
+
     async def test_generate_stamp_density_eight_yields_eight_records(self):
         # Arrange
         padding_index = PaddingIndex(1.0)
@@ -391,6 +493,28 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(len(records), 8)
+
+    async def test_generate_stamp_density_one_half_places_one_candidate_on_about_half_the_stamps(self):
+        # Arrange
+        settings = self._settings.model_copy(update={"density": 0.5})
+        stamp_count = 400
+
+        # Act
+        counts = [len(self._stamp(settings=settings, seed=seed)) for seed in range(stamp_count)]
+
+        # Assert - never more than the one candidate, and close to one stamp in two (within five standard deviations)
+        self.assertEqual(set(counts), {0, 1})
+        self.assertAlmostEqual(sum(counts), stamp_count / 2, delta=50)
+
+    async def test_generate_stamp_density_two_and_a_half_places_two_or_three_candidates(self):
+        # Arrange
+        settings = self._settings.model_copy(update={"density": 2.5})
+
+        # Act
+        counts = {len(self._stamp(settings=settings, seed=seed)) for seed in range(60)}
+
+        # Assert
+        self.assertEqual(counts, {2, 3})
 
     async def test_generate_stamp_with_padding_records_every_placement_in_the_padding_index(self):
         # Arrange
@@ -694,6 +818,63 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertTrue(any(abs(record.origin[5]) < 1e-9 for record in records))
+
+    async def test_generate_stamp_on_a_floor_wound_upside_down_records_normals_facing_the_viewer(self):
+        # A captured floor is often wound the other way round, so its normals point down into the ground; standing
+        # assets on them would hang every one of them upside down under the floor.
+        # Arrange
+        cache = _AngledSurfaceCache([_DOWN_NORMAL])
+        above = Gf.Vec3d(100.0, 0.0, 500.0)
+
+        # Act
+        records = self._stamp(cache=cache, center=_center_sample(_DOWN_NORMAL), view_point=above)
+
+        # Assert
+        self.assertEqual([_recorded_normal(record) for record in records], [_FLOOR_NORMAL] * 8)
+
+    async def test_generate_stamp_on_a_ceiling_seen_from_below_records_normals_facing_down(self):
+        # Arrange
+        cache = _AngledSurfaceCache([_FLOOR_NORMAL])
+        below = Gf.Vec3d(100.0, 0.0, -500.0)
+
+        # Act
+        records = self._stamp(cache=cache, center=_center_sample(_FLOOR_NORMAL), view_point=below)
+
+        # Assert
+        self.assertEqual([_recorded_normal(record) for record in records], [_DOWN_NORMAL] * 8)
+
+    async def test_generate_stamp_without_a_view_point_turns_a_downward_floor_up(self):
+        # Arrange
+        cache = _AngledSurfaceCache([_DOWN_NORMAL])
+
+        # Act
+        records = self._stamp(cache=cache, center=_center_sample(_DOWN_NORMAL))
+
+        # Assert
+        self.assertEqual([_recorded_normal(record) for record in records], [_FLOOR_NORMAL] * 8)
+
+    async def test_generate_stamp_on_a_floor_wound_upside_down_passes_a_45_degree_max_surface_angle(self):
+        # Arrange
+        cache = _AngledSurfaceCache([_DOWN_NORMAL])
+        settings = self._settings.model_copy(update={"max_surface_angle": 45.0})
+
+        # Act
+        records = self._stamp(
+            settings=settings, cache=cache, center=_center_sample(_DOWN_NORMAL), view_point=Gf.Vec3d(100, 0, 500)
+        )
+
+        # Assert
+        self.assertEqual(len(records), 8)
+
+    async def test_generate_flood_on_a_floor_wound_upside_down_records_normals_facing_up(self):
+        # Arrange
+        UsdGeom.Mesh(self._stage.GetPrimAtPath(_MESH_PATH)).GetFaceVertexIndicesAttr().Set([0, 3, 2, 1])
+
+        # Act
+        records = self._flood(20)
+
+        # Assert
+        self.assertEqual({_recorded_normal(record) for record in records}, {_FLOOR_NORMAL})
 
     async def test_generate_flood_caps_at_max_count_and_stays_within_mesh_bbox(self):
         # Arrange
@@ -1176,6 +1357,111 @@ class TestPlacementFunctions(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(self._child_names(self._layer, group_path), [])
 
+    async def test_remove_placements_of_most_of_a_large_container_rebuilds_it_from_the_children_it_keeps(self):
+        # Arrange - enough children leave that deleting them one by one would cost more than copying the two that stay
+        records = self._author_patch(202)
+        kept = [records[0], records[-1]]
+        nested_path = Sdf.Path(kept[0].prim_path).AppendChild("Looks")
+        Sdf.CreatePrimInLayer(self._layer, nested_path).customData = {"kept": True}
+        removed = [record.prim_path for record in records[1:-1]]
+
+        # Act
+        with patch.object(placement_module, "_rebuild_without", wraps=placement_module._rebuild_without) as rebuild:
+            remove_placements(self._layer, removed)
+
+        # Assert
+        rebuild.assert_called_once()
+        self._assert_is_scatter_container(self._layer, _CONTAINER_PATH)
+        self.assertEqual(
+            list(self._layer.GetPrimAtPath(_CONTAINER_PATH).nameChildren.keys()),
+            [record.prim_name for record in kept],
+        )
+        for record in kept:
+            spec = self._layer.GetPrimAtPath(record.prim_path)
+            self.assertEqual(spec.attributes["xformOp:translate"].default, Gf.Vec3d(*record.translate))
+            self.assertTrue(self._stage.GetPrimAtPath(record.prim_path).IsDefined())
+        self.assertEqual(dict(self._layer.GetPrimAtPath(nested_path).customData), {"kept": True})
+
+    async def test_remove_placements_of_a_few_of_a_large_container_deletes_them_child_by_child(self):
+        # Arrange
+        records = self._author_patch(202)
+        removed = [record.prim_path for record in records[:3]]
+
+        # Act
+        with patch.object(placement_module, "_rebuild_without", wraps=placement_module._rebuild_without) as rebuild:
+            remove_placements(self._layer, removed)
+
+        # Assert
+        rebuild.assert_not_called()
+        self.assertEqual(
+            self._child_names(self._layer, _CONTAINER_PATH), sorted(record.prim_name for record in records[3:])
+        )
+
+    async def test_remove_placements_of_a_whole_container_removes_the_overs_authoring_it_created(self):
+        # Arrange - a mod layer that never touched the mesh: painting on it creates every ancestor as an empty over
+        layer = Sdf.Layer.CreateAnonymous()
+        record = _make_record("s_000000000001", self._asset_a)
+        author_placements(layer, [record])
+        self.assertEqual(layer.GetPrimAtPath(_PROTOTYPE_ROOT).specifier, Sdf.SpecifierOver)
+
+        # Act
+        remove_placements(layer, [record.prim_path])
+
+        # Assert
+        self.assertEqual(len(layer.rootPrims), 0)
+
+    async def test_remove_placements_of_the_last_child_removes_the_overs_authoring_it_created(self):
+        # Arrange - an erase stroke: the container empties over two stamps, and the second also names a path long gone
+        layer = Sdf.Layer.CreateAnonymous()
+        records = [_make_record(f"s_00000000000{index}", self._asset_a) for index in range(2)]
+        author_placements(layer, records)
+        remove_placements(layer, [records[0].prim_path])
+
+        # Act
+        remove_placements(layer, [records[1].prim_path, f"{_CONTAINER_PATH}/s_00000missing"])
+
+        # Assert
+        self.assertEqual(len(layer.rootPrims), 0)
+
+    async def test_remove_placements_of_a_whole_container_keeps_a_prototype_over_holding_an_opinion(self):
+        # Arrange - the mod already overrides something on the mesh the scatter was painted on
+        layer = Sdf.Layer.CreateAnonymous()
+        record = _make_record("s_000000000001", self._asset_a)
+        author_placements(layer, [record])
+        layer.GetPrimAtPath(_PROTOTYPE_ROOT).customData = {"edited": True}
+
+        # Act
+        remove_placements(layer, [record.prim_path])
+
+        # Assert
+        self.assertIsNone(layer.GetPrimAtPath(_CONTAINER_PATH))
+        self.assertEqual(dict(layer.GetPrimAtPath(_PROTOTYPE_ROOT).customData), {"edited": True})
+
+    async def test_prune_inert_overs_stops_at_the_first_ancestor_that_is_defined(self):
+        # Arrange
+        layer = Sdf.Layer.CreateAnonymous()
+        Sdf.CreatePrimInLayer(layer, "/World/group/leaf")
+        layer.GetPrimAtPath("/World").specifier = Sdf.SpecifierDef
+
+        # Act
+        prune_inert_overs(layer, Sdf.Path("/World/group/leaf"))
+
+        # Assert
+        self.assertIsNotNone(layer.GetPrimAtPath("/World"))
+        self.assertEqual(len(layer.GetPrimAtPath("/World").nameChildren), 0)
+
+    async def test_prune_inert_overs_keeps_an_over_that_still_has_a_child(self):
+        # Arrange
+        layer = Sdf.Layer.CreateAnonymous()
+        Sdf.CreatePrimInLayer(layer, "/World/group/leaf")
+        Sdf.CreatePrimInLayer(layer, "/World/group/other").customData = {"edited": True}
+
+        # Act
+        prune_inert_overs(layer, Sdf.Path("/World/group/leaf"))
+
+        # Assert
+        self.assertEqual(self._child_names(layer, "/World/group"), ["other"])
+
     async def test_snapshot_prims_of_every_child_copies_the_container_definition_and_children(self):
         # Arrange
         records = self._author_patch(3)
@@ -1307,3 +1593,16 @@ class TestPlacementPool(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(taken, [])
+
+    async def test_take_within_reaches_a_placement_through_the_surface_point_it_stands_on(self):
+        # Arrange - two placements raised 500 above the surface points at 0 and at 100
+        paths = [Sdf.Path(f"{_CONTAINER_PATH}/s_00000000000{index}") for index in range(2)]
+        positions = np.array([[0.0, 0.0, 500.0], [100.0, 0.0, 500.0]])
+        surface_positions = np.array([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]])
+        pool = PlacementPool(paths, positions, surface_positions)
+
+        # Act
+        taken = pool.take_within((0.0, 0.0, 0.0), 10.0)
+
+        # Assert
+        self.assertEqual(taken, [paths[0]])

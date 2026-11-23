@@ -33,7 +33,7 @@ from lightspeed.common.constants import WindowNames as _WindowNames
 from lightspeed.events_manager import get_instance as _get_event_manager_instance
 from lightspeed.layer_manager.core import LayerManagerCore as _LayerManagerCore
 from lightspeed.layer_manager.core import LayerType as _LayerType
-from lightspeed.trex.control.stagecraft.commands import SwitchCaptureCommand as _SwitchCaptureCommand
+from lightspeed.trex.control.stagecraft.commands import get_lighting_mode_setting_key as _get_lighting_mode_setting_key
 from lightspeed.trex.contexts.extension import get_instance as _get_context_manager
 from lightspeed.trex.contexts.setup import Contexts as _Contexts
 from lightspeed.trex.viewports.shared.widget import get_instance as _get_viewport_instance
@@ -110,7 +110,7 @@ class TestCaptureSwapUndo(AsyncTestCase):
                 self.fail(f"Initial capture layer did not resolve to {original_capture_path.resolve()}")
 
             # Apply a real viewport light rig and assert the rig authored actual USD lights before the swap.
-            lighting_mode_setting = _SwitchCaptureCommand._make_lighting_mode_setting_key(self._usd_context)
+            lighting_mode_setting = _get_lighting_mode_setting_key(self._usd_context)
             carb.settings.get_settings().set(lighting_mode_setting, "")
             omni.kit.commands.execute(
                 "SetLightingMenuModeCommand",

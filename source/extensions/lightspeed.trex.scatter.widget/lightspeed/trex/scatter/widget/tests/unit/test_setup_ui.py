@@ -54,6 +54,7 @@ _EXPECTED_CONTROLS = (
     ("ToolButton", "scatter_mode_paint"),
     ("ToolButton", "scatter_mode_erase"),
     ("Button", "scatter_flood"),
+    ("Button", "scatter_reset_defaults"),
     ("Label", "scatter_status"),
     ("FloatBoundedDrag", "scatter_radius"),
     ("ComboBox", "scatter_falloff"),
@@ -104,6 +105,10 @@ _EXPECTED_CONTROLS = (
     ("Label", "scatter_flood_estimate"),
     ("IntBoundedDrag", "scatter_prim_budget"),
     ("Label", "scatter_instance_warning"),
+    ("CheckBox", "scatter_instance_strokes"),
+    ("Button", "scatter_instance_all"),
+    ("Button", "scatter_split_selection"),
+    ("Label", "scatter_instancing_summary"),
     ("CheckBox", "scatter_assign_textures"),
 )
 
@@ -142,6 +147,7 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         _patch_controller_environment(self._stack)
         self.asset_list_class = self._stack.enter_context(mock.patch.object(_setup_ui_module, "ScatterAssetListWidget"))
         self.presets_class = self._stack.enter_context(mock.patch.object(_setup_ui_module, "PresetsWidget"))
+        self.up_axis_class = self._stack.enter_context(mock.patch.object(_setup_ui_module, "AssetUpAxisWidget"))
         self._previous_instance = _controller_module._CONTROLLER_INSTANCE
         _controller_module._CONTROLLER_INSTANCE = None
         self.controller = _controller_module.get_scatter_brush_controller()
@@ -429,6 +435,43 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
         # Assert
         flood_mock.assert_called_once_with(_CONTEXT_NAME, self.pane._surface_cache)
 
+    async def test_click_reset_asks_for_confirmation_before_resetting(self):
+        # Arrange - settings changes are not undo steps, so throwing the user's tuning away has to be confirmed
+        self.controller.update_settings(radius=500.0)
+
+        with mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class:
+            # Act
+            self._find("Button", "scatter_reset_defaults").widget.call_clicked_fn()
+
+        # Assert
+        dialog_class.assert_called_once()
+        self.assertEqual(self.controller.settings.radius, 500.0)
+
+    async def test_confirm_reset_dialog_puts_every_setting_back_to_its_default(self):
+        # Arrange
+        self.controller.update_settings(radius=500.0, conform_to_surface=True)
+
+        with mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class:
+            self._find("Button", "scatter_reset_defaults").widget.call_clicked_fn()
+            ok_handler = dialog_class.call_args.kwargs["ok_handler"]
+
+            # Act
+            ok_handler()
+
+        # Assert
+        self.assertEqual(self.controller.settings, ScatterBrushSettings())
+        self.assertEqual(self._model("radius").as_float, ScatterBrushSettings().radius)
+
+    async def test_build_pane_hosts_the_asset_up_axis_rows_in_the_label_column(self):
+        # Arrange
+        up_axis_class = self.up_axis_class
+
+        # Act
+        hosted = up_axis_class.call_args
+
+        # Assert
+        self.assertEqual(hosted, mock.call(label_width=_setup_ui_module.ScatterPane._LABEL_WIDTH))
+
     async def test_build_pane_in_absolute_size_mode_shows_size_rows_and_hides_the_multiplier_rows(self):
         # Arrange - Absolute Size is the default, so this is what a freshly built pane shows.
 
@@ -492,6 +535,164 @@ class TestScatterPane(omni.kit.test.AsyncTestCase):
 
         # Assert
         anchor_mock.assert_called_once_with(_CONTEXT_NAME)
+
+    async def test_click_instance_all_forwards_pane_context(self):
+        # Arrange
+        with mock.patch.object(self.controller, "instance_all", return_value=3) as instance_mock:
+            # Act
+            self.pane._instance_all_button.call_clicked_fn()
+
+        # Assert
+        instance_mock.assert_called_once_with(_CONTEXT_NAME)
+
+    async def test_click_split_selection_forwards_pane_context(self):
+        # Arrange
+        with mock.patch.object(self.controller, "split_selection", return_value=2) as split_mock:
+            # Act
+            self.pane._split_button.call_clicked_fn()
+
+        # Assert
+        split_mock.assert_called_once_with(_CONTEXT_NAME)
+
+    async def test_instance_strokes_checkbox_writes_the_setting(self):
+        # Arrange
+        model = self._model("instance_strokes")
+
+        # Act
+        model.set_value(False)
+
+        # Assert
+        self.assertFalse(self.controller.settings.instance_strokes)
+
+    async def test_instancing_summary_counts_loose_and_instanced_placements_and_the_prims_they_render(self):
+        # Arrange
+        summary = SimpleNamespace(placements=1450, prototypes=8, instanced=1200, rendered_prims=4350)
+        with mock.patch.object(_setup_ui_module, "scene_scatter_cost", return_value=summary):
+            # Act
+            self.controller.notify_stroke_committed(10, False)
+
+        # Assert
+        self.assertEqual(
+            self.pane._instancing_label.text,
+            "1,450 placements on 8 meshes, rendering 4,350 prims: 1,200 instanced, 250 loose",
+        )
+
+    async def test_undo_recounts_the_instancing_summary(self):
+        # Arrange - an undo adds or removes scatter without any stroke committing
+        summary = SimpleNamespace(placements=3, prototypes=1, instanced=0, rendered_prims=3)
+        with mock.patch.object(_setup_ui_module, "scene_scatter_cost", return_value=summary):
+            # Act
+            omni.kit.undo.undo()
+
+        # Assert
+        self.assertEqual(
+            self.pane._instancing_label.text, "3 placements on 1 meshes, rendering 3 prims: 0 instanced, 3 loose"
+        )
+
+    async def test_settings_change_from_outside_the_fields_hands_it_to_the_driver_before_finishing_the_edit(self):
+        # Arrange - the driver hears the same event in no particular order, so the pane cannot rely on going second
+        calls: list[str] = []
+        driver = self.pane._reapply_driver
+
+        with (
+            mock.patch.object(driver, "follow_settings", side_effect=lambda _settings: calls.append("follow")),
+            mock.patch.object(driver, "edit_finished", side_effect=lambda: calls.append("finish")),
+        ):
+            # Act
+            self.controller.update_settings(seed=5)
+
+        # Assert
+        self.assertEqual(calls, ["follow", "finish"])
+
+    async def test_uncheck_random_scale_greys_out_everything_that_shapes_the_range(self):
+        # Arrange
+        model = self._model("scale_enabled")
+
+        # Act
+        model.set_value(False)
+
+        # Assert
+        enabled = {name: self.pane._field_widgets[name].enabled for name in _setup_ui_module._RANDOM_SCALE_FIELDS}
+        self.assertEqual(enabled, dict.fromkeys(_setup_ui_module._RANDOM_SCALE_FIELDS, False))
+        self.assertTrue(self.pane._field_widgets["size_min"].enabled)
+
+    async def test_uncheck_scale_uniform_hides_the_single_range_rows(self):
+        # Arrange
+        model = self._model("scale_uniform")
+
+        # Act
+        model.set_value(False)
+
+        # Assert
+        self.assertFalse(self.pane._uniform_scale_stack.visible)
+
+    async def test_click_flood_at_default_cap_on_a_replicated_anchor_asks_for_confirmation(self):
+        # Arrange - 300 placements on 50 instances render 15,000 prims, more than the budget of 10,000
+        stage = _make_anchor_stage(50)
+        usd_context = SimpleNamespace(get_stage=lambda: stage)
+        with mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context):
+            self.controller.update_settings(target_mode=TargetMode.ANCHOR, anchor_prototype_path=_ANCHOR_PROTOTYPE)
+
+        with (
+            mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
+            mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class,
+        ):
+            # Act
+            self.pane._flood_button.call_clicked_fn()
+
+        # Assert
+        flood_mock.assert_not_called()
+        self.assertIn("15,000 prims", dialog_class.call_args.kwargs["message"])
+
+    async def test_click_flood_at_default_cap_on_a_replicated_selection_asks_for_confirmation(self):
+        # Arrange - nothing is anchored, and the selected mesh has 50 instances: 300 placements render 15,000 prims
+        stage = _make_anchor_stage(50)
+        usd_context = SimpleNamespace(get_stage=lambda: stage)
+
+        with (
+            mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context),
+            mock.patch.object(_setup_ui_module, "selected_prototypes", return_value={Sdf.Path(_ANCHOR_PROTOTYPE)}),
+            mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
+            mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class,
+        ):
+            # Act
+            self.pane._flood_button.call_clicked_fn()
+
+        # Assert
+        flood_mock.assert_not_called()
+        self.assertIn("15,000 prims", dialog_class.call_args.kwargs["message"])
+
+    async def test_click_flood_at_default_cap_on_a_selection_of_one_instance_floods_without_asking(self):
+        # Arrange
+        stage = _make_anchor_stage(1)
+        usd_context = SimpleNamespace(get_stage=lambda: stage)
+
+        with (
+            mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context),
+            mock.patch.object(_setup_ui_module, "selected_prototypes", return_value={Sdf.Path(_ANCHOR_PROTOTYPE)}),
+            mock.patch.object(self.controller, "flood", return_value=0) as flood_mock,
+            mock.patch.object(_setup_ui_module, "_TrexMessageDialog") as dialog_class,
+        ):
+            # Act
+            self.pane._flood_button.call_clicked_fn()
+
+        # Assert
+        flood_mock.assert_called_once_with(_CONTEXT_NAME, self.pane._surface_cache)
+        dialog_class.assert_not_called()
+
+    async def test_flood_estimate_on_a_replicated_anchor_stops_at_the_prim_limit(self):
+        # Arrange - 300 placements on 50 instances would render 15,000 prims, but a budget of 2 limits a flood to 10
+        stage = _make_anchor_stage(50)
+        usd_context = SimpleNamespace(get_stage=lambda: stage)
+
+        with mock.patch.object(_setup_ui_module.omni.usd, "get_context", return_value=usd_context):
+            # Act
+            self.controller.update_settings(
+                target_mode=TargetMode.ANCHOR, anchor_prototype_path=_ANCHOR_PROTOTYPE, prim_budget=2
+            )
+
+        # Assert
+        self.assertEqual(self.pane._flood_estimate_label.text, "Up to 10 prims")
 
     async def test_build_pane_without_anchor_shows_none_placeholder(self):
         # Arrange

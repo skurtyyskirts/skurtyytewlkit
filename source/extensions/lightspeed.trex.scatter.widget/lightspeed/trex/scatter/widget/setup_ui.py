@@ -40,6 +40,9 @@ from lightspeed.trex.scatter.core import (
     get_reapply_driver,
     get_scatter_brush_controller,
     instance_count,
+    scene_scatter_cost,
+    selected_prototypes,
+    stroke_prim_limit,
     turn_matrix,
     validated_anchor_prototype,
 )
@@ -54,6 +57,7 @@ from omni.flux.utils.widget.drag_field import FloatBoundedDrag as _FloatBoundedD
 from omni.flux.utils.widget.drag_field import IntBoundedDrag as _IntBoundedDrag
 
 from .asset_list import ScatterAssetListWidget
+from .asset_up_axis import AssetUpAxisWidget
 from .presets_ui import PresetsWidget
 from .value_model import DragValueModel as _DragValueModel
 from .value_model import field_bounds
@@ -65,14 +69,15 @@ _LIVE_EDIT_TOOLTIP = (
     "changed on it while the settings stay as you left them\n"
     "- Selecting anything ends that, and changes then apply to the selection, each as an undo step of its own\n"
     "- Select painted placements or a scatter container to edit exactly those\n"
-    "- Select a mesh or an instance to edit what the current preset painted on it\n"
+    "- With Apply To set to All, select a mesh or an instance to edit what the current preset painted on it; with "
+    "Selected, the selected mesh is only where the next stroke goes\n"
     "- Brush and density settings always apply to the next stroke only, never to what is already painted"
 )
 _TURN_TOOLTIP = (
     "Degrees the selected scatter has been turned by since it was selected, about the stage axes.\n\n"
     "- The viewport's rotate rings write these, and typing here turns the selection the same way\n"
     "- Every placement turns where it stands; the patch is not carried around a pivot\n"
-    "- A new selection has not been turned yet, so these read zero again\n"
+    "- A new selection has not been turned yet, so these read zero again, as they do after an undo or a redo\n"
     "- A turn stays with the scatter it was given to; use Base Rotation to change every stroke painted from now on"
 )
 _BASE_ROTATION_TOOLTIP = (
@@ -82,11 +87,55 @@ _BASE_ROTATION_TOOLTIP = (
     "- Right after a stroke, the viewport's rotate rings set these and the stroke follows live\n"
     "- Saved with the preset"
 )
+_SECOND_LEAN_TOOLTIP = (
+    "{bound} random lean about the other horizontal axis, in degrees: Y on a Z-up stage, Z on a Y-up stage."
+)
 _TURN_LIMIT = 360.0
 _STATUS_STYLE = "PropertiesPaneSectionTreeItem"
 _STATUS_ERROR_STYLE = "PropertiesPaneSectionTreeItemError"
+_RESET_TOOLTIP = (
+    "Put every brush setting back to its default: paint on the selected mesh, assets standing straight up.\n\n"
+    "- The asset list, the saved presets, the current preset name and Edit Selection Live are kept\n"
+    "- Right after a stroke, that stroke follows the reset the way it follows a preset; one undo still removes it"
+)
+_UP_AXIS_TOOLTIP = (
+    "Which axis each asset was modelled standing along, as its file says, and the axis the brush stands it up by.\n\n"
+    "- Match the file and the asset stands straight up\n"
+    "- A choice that disagrees with the file scatters the asset lying on its side and is flagged\n"
+    "- Same setting as the Up column of the asset list"
+)
+_INSTANCE_STROKES_TOOLTIP = (
+    "Merge painted placements into one PointInstancer per patch, which the game draws from one copy of each asset's "
+    "geometry instead of one replacement per blade.\n\n"
+    "- The stroke just painted stays as prims, so it can be tuned and undone in one step\n"
+    "- Painting the next stroke, or flooding, merges everything else; undoing that stroke gives it back as prims\n"
+    "- Off, every placement stays a prim of its own"
+)
+_INSTANCE_ALL_TOOLTIP = (
+    "Merge every loose placement of the edit layer now, including the stroke just painted: the last stroke of a "
+    "session, scatter painted before instancing existed, or a patch that was split. One undo step."
+)
+_SPLIT_TOOLTIP = (
+    "Turn the selected instanced scatter back into placements the brush and the gizmo can edit, and select them. "
+    "Select the instancer, or the mesh it is painted on. Painting the next stroke merges them again."
+)
 # Floods above the default cap can take a while to author and render, so they ask for confirmation first.
 _FLOOD_CONFIRM_THRESHOLD = ScatterBrushSettings.model_fields["flood_max_instances"].default
+# Settings that shape the range a random size is drawn from, and so do nothing while Random Scale is off.
+_RANDOM_SCALE_FIELDS = (
+    "size_max",
+    "scale_uniform",
+    "scale_min",
+    "scale_max",
+    "scale_x_min",
+    "scale_x_max",
+    "scale_y_min",
+    "scale_y_max",
+    "scale_z_min",
+    "scale_z_max",
+    "scale_bias",
+    "scale_weight",
+)
 
 
 def _enum_labels(members: tuple[Enum, ...]) -> list[str]:
@@ -160,10 +209,14 @@ class ScatterPane(_WorkspaceWidget):
         self._paint_button: ui.ToolButton | None = None
         self._erase_button: ui.ToolButton | None = None
         self._flood_button: ui.Button | None = None
+        self._reset_button: ui.Button | None = None
         self._status_label: ui.Label | None = None
         self._size_stack: ui.VStack | None = None
         self._multiplier_scale_stack: ui.VStack | None = None
+        self._uniform_scale_stack: ui.VStack | None = None
         self._per_axis_scale_stack: ui.VStack | None = None
+        # Controls by the settings field they edit, for the ones that are greyed out while they have no effect.
+        self._field_widgets: dict[str, ui.Widget] = {}
         self._seed_field: _IntBoundedDrag | None = None
         self._reroll_button: ui.Button | None = None
         self._anchor_path_label: ui.Label | None = None
@@ -171,7 +224,12 @@ class ScatterPane(_WorkspaceWidget):
         self._flood_estimate_label: ui.Label | None = None
         self._instance_warning_label: ui.Label | None = None
         self._live_edit_label: ui.Label | None = None
+        self._instancing_label: ui.Label | None = None
+        self._instancing_scope: ReapplyScope | None = None
+        self._instance_all_button: ui.Button | None = None
+        self._split_button: ui.Button | None = None
         self._asset_list_widget: ScatterAssetListWidget | None = None
+        self._up_axis_widget: AssetUpAxisWidget | None = None
         self._presets_widget: PresetsWidget | None = None
 
         self.__create_ui()
@@ -189,6 +247,16 @@ class ScatterPane(_WorkspaceWidget):
         self._status_message_sub = self._controller.subscribe_status_message(self._on_status_message)
         self._scope_changed_sub = self._reapply_driver.subscribe_scope_changed(self._on_scope_changed)
         self._selection_turn_sub = self._controller.subscribe_selection_turn_changed(self._on_selection_turn_changed)
+        self._stroke_committed_sub = self._controller.subscribe_stroke_committed(self._on_stroke_committed)
+        self._history_stepped_sub = self._controller.subscribe_history_stepped(self._on_history_stepped)
+        usd_context = omni.usd.get_context(context_name)
+        self._stage_event_sub = (
+            None
+            if usd_context is None
+            else usd_context.get_stage_event_stream().create_subscription_to_pop(
+                self._on_stage_event, name="lightspeed.trex.scatter.widget pane"
+            )
+        )
 
     def __create_ui(self):
         settings = self._controller.settings
@@ -198,6 +266,7 @@ class ScatterPane(_WorkspaceWidget):
             self.__build_scale_section,
             self.__build_random_section,
             self.__build_target_section,
+            self.__build_output_section,
             self.__build_assets_section,
             self.__build_presets_section,
         )
@@ -227,7 +296,10 @@ class ScatterPane(_WorkspaceWidget):
                 model=self._paint_model,
                 text="Paint",
                 identifier="scatter_mode_paint",
-                tooltip="Paint the brush assets onto the surface under the cursor. Shift+drag erases instead.",
+                tooltip=(
+                    "Paint the enabled assets onto the selected meshes, or onto whatever is under the cursor when "
+                    "Apply To is set to All. Hold Shift while dragging to erase instead."
+                ),
             )
             self._erase_button = ui.ToolButton(
                 model=self._erase_model,
@@ -238,8 +310,17 @@ class ScatterPane(_WorkspaceWidget):
             self._flood_button = ui.Button(
                 "Flood",
                 identifier="scatter_flood",
-                tooltip="Fill the anchor prototype or the selected captured meshes with placements in one undo step.",
+                tooltip=(
+                    "Fill the selected captured meshes, or the anchor mesh in Anchor mode, with up to Flood Cap "
+                    "placements in one undo step. Padding is kept to what is already painted there."
+                ),
                 clicked_fn=self._on_flood_clicked,
+            )
+            self._reset_button = ui.Button(
+                "Reset to Defaults",
+                identifier="scatter_reset_defaults",
+                tooltip=_RESET_TOOLTIP,
+                clicked_fn=self._on_reset_clicked,
             )
         ui.Spacer(height=self._SPACING_XS)
         self._status_label = ui.Label(
@@ -262,26 +343,51 @@ class ScatterPane(_WorkspaceWidget):
             "- Radius is in stage units\n"
             "- Density is the number of candidates per stamp and Strength the share of them that is kept\n"
             "- Spacing is the distance between stamps along a stroke\n"
-            "- Padding keeps placements apart from each other\n"
+            "- Padding keeps placements apart from each other, and is what stops a stroke painted over another from "
+            "doubling it\n"
             "- Max Surface Angle skips surfaces steeper than that, such as the wall beside a floor",
         )
         with frame:
             with ui.VStack(height=0, spacing=self._SPACING_XS):
-                self.__build_float_row("Radius", "radius", "scatter_radius", 1.0, "Brush radius in stage units.")
+                self.__build_float_row(
+                    "Radius",
+                    "radius",
+                    "scatter_radius",
+                    1.0,
+                    "Brush radius in stage units. Hold B and scroll over the viewport to resize it.",
+                )
                 self.__build_enum_row(
-                    "Falloff", "falloff", "scatter_falloff", Falloff, "Acceptance curve from the center to the edge."
+                    "Falloff",
+                    "falloff",
+                    "scatter_falloff",
+                    Falloff,
+                    "How the chance of keeping a candidate drops from the center of the brush to its edge.",
                 )
                 self.__build_float_row(
-                    "Density", "density", "scatter_density", 0.5, "Candidates drawn in the brush disk per stamp."
+                    "Density",
+                    "density",
+                    "scatter_density",
+                    0.5,
+                    "Candidates drawn in the brush disk per stamp; Strength and Falloff decide how many are kept.\n\n"
+                    "A fraction is a chance: 0.5 draws one candidate every other stamp.",
                 )
                 self.__build_float_row(
-                    "Strength", "strength", "scatter_strength", 0.01, "Share of the candidates that is accepted."
+                    "Strength",
+                    "strength",
+                    "scatter_strength",
+                    0.01,
+                    "Share of the candidates that is kept, from 0 (none) to 1 (all).",
                 )
                 self.__build_float_row(
                     "Spacing", "stamp_spacing", "scatter_spacing", 1.0, "Distance between two stamps along a stroke."
                 )
                 self.__build_float_row(
-                    "Padding", "padding", "scatter_padding", 0.5, "Minimum distance between two placements."
+                    "Padding",
+                    "padding",
+                    "scatter_padding",
+                    0.5,
+                    "Minimum distance between two placements, in stage units.\n\n"
+                    "At 0 nothing keeps placements apart, so painting over an area again adds a full layer to it.",
                 )
                 self.__build_float_row(
                     "Max Surface Angle",
@@ -298,13 +404,16 @@ class ScatterPane(_WorkspaceWidget):
         frame = self.__build_section(
             "PLACEMENT",
             "How each placement sits on the surface.\n\n"
-            "- Conform aligns the asset up axis with the surface normal\n"
-            "- Align to stroke turns the asset along the stroke direction\n"
+            "- Asset Up Axis says which way each asset was modelled; match its file and it stands straight up\n"
+            "- Off by default, Conform tilts the asset to follow the slope of the surface\n"
+            "- Align to Stroke turns the asset along the stroke direction\n"
             "- Base Rotation stands up or leans every placement the same way, before its random rotation\n"
-            "- Rotation ranges are in degrees; the advanced ranges tilt the asset around X and Y",
+            "- Rotation ranges are in degrees; the advanced ranges lean the asset over",
         )
         with frame:
             with ui.VStack(height=0, spacing=self._SPACING_XS):
+                self.__build_row("Asset Up Axis", _UP_AXIS_TOOLTIP, ui.Spacer)
+                self._up_axis_widget = AssetUpAxisWidget(label_width=self._LABEL_WIDTH)
                 self.__build_row("Edit Selection Live", _LIVE_EDIT_TOOLTIP, self.__build_live_edit_control)
                 for axis, identifier in enumerate(("scatter_turn_x", "scatter_turn_y", "scatter_turn_z")):
                     self.__build_row(
@@ -323,13 +432,13 @@ class ScatterPane(_WorkspaceWidget):
                     "Conform to Surface",
                     "conform_to_surface",
                     "scatter_conform",
-                    "Align the asset up axis with the surface normal.",
+                    "Tilt the asset to follow the slope of the surface; off, every asset stands straight up.",
                 )
                 self.__build_bool_row(
                     "Align to Stroke",
                     "align_to_stroke",
                     "scatter_align_stroke",
-                    "Turn the asset to face the stroke direction.",
+                    "Turn the asset to face the stroke direction. A flood has no direction, so it ignores this.",
                 )
                 for axis in ("x", "y", "z"):
                     self.__build_float_row(
@@ -340,26 +449,50 @@ class ScatterPane(_WorkspaceWidget):
                         _BASE_ROTATION_TOOLTIP.format(axis=axis.upper()),
                     )
                 self.__build_float_row(
-                    "Rotation Z Min", "rotation_z_min", "scatter_rot_z_min", 1.0, "Lowest random yaw in degrees."
+                    "Rotation Z Min",
+                    "rotation_z_min",
+                    "scatter_rot_z_min",
+                    1.0,
+                    "Lowest random turn about the stage up axis, in degrees.",
                 )
                 self.__build_float_row(
-                    "Rotation Z Max", "rotation_z_max", "scatter_rot_z_max", 1.0, "Highest random yaw in degrees."
+                    "Rotation Z Max",
+                    "rotation_z_max",
+                    "scatter_rot_z_max",
+                    1.0,
+                    "Highest random turn about the stage up axis, in degrees.",
                 )
                 advanced_frame = _PropertyCollapsableFrame("ADVANCED ROTATION", collapsed=True)
                 self._section_frames.append(advanced_frame)
                 with advanced_frame:
                     with ui.VStack(height=0, spacing=self._SPACING_XS):
                         self.__build_float_row(
-                            "Rotation X Min", "rotation_x_min", "scatter_rot_x_min", 1.0, "Lowest tilt around X."
+                            "Rotation X Min",
+                            "rotation_x_min",
+                            "scatter_rot_x_min",
+                            1.0,
+                            "Lowest random lean about the X axis, in degrees.",
                         )
                         self.__build_float_row(
-                            "Rotation X Max", "rotation_x_max", "scatter_rot_x_max", 1.0, "Highest tilt around X."
+                            "Rotation X Max",
+                            "rotation_x_max",
+                            "scatter_rot_x_max",
+                            1.0,
+                            "Highest random lean about the X axis, in degrees.",
                         )
                         self.__build_float_row(
-                            "Rotation Y Min", "rotation_y_min", "scatter_rot_y_min", 1.0, "Lowest tilt around Y."
+                            "Rotation Y Min",
+                            "rotation_y_min",
+                            "scatter_rot_y_min",
+                            1.0,
+                            _SECOND_LEAN_TOOLTIP.format(bound="Lowest"),
                         )
                         self.__build_float_row(
-                            "Rotation Y Max", "rotation_y_max", "scatter_rot_y_max", 1.0, "Highest tilt around Y."
+                            "Rotation Y Max",
+                            "rotation_y_max",
+                            "scatter_rot_y_max",
+                            1.0,
+                            _SECOND_LEAN_TOOLTIP.format(bound="Highest"),
                         )
 
     def __build_live_edit_control(self):
@@ -400,12 +533,18 @@ class ScatterPane(_WorkspaceWidget):
                     "Random Scale",
                     "scale_enabled",
                     "scatter_scale_enabled",
-                    "Vary the size within the range below; off pins every placement to the minimum.",
+                    "Vary the size within the range below.\n\n"
+                    "Off, every placement is exactly Size Min tall in Absolute Size mode, and keeps the size it was "
+                    "modelled at in Multiplier mode.",
                 )
                 self._size_stack = ui.VStack(height=0, spacing=self._SPACING_XS)
                 with self._size_stack:
                     self.__build_float_row(
-                        "Size Min", "size_min", "scatter_size_min", 1.0, "Lowest height in stage units."
+                        "Size Min",
+                        "size_min",
+                        "scatter_size_min",
+                        1.0,
+                        "Lowest height in stage units, and the height of every placement when Random Scale is off.",
                     )
                     self.__build_float_row(
                         "Size Max", "size_max", "scatter_size_max", 1.0, "Highest height in stage units."
@@ -415,8 +554,14 @@ class ScatterPane(_WorkspaceWidget):
                     self.__build_bool_row(
                         "Uniform", "scale_uniform", "scatter_scale_uniform", "Use one range for all three axes."
                     )
-                    self.__build_float_row("Scale Min", "scale_min", "scatter_scale_min", 0.01, "Lowest scale factor.")
-                    self.__build_float_row("Scale Max", "scale_max", "scatter_scale_max", 0.01, "Highest scale factor.")
+                    self._uniform_scale_stack = ui.VStack(height=0, spacing=self._SPACING_XS)
+                    with self._uniform_scale_stack:
+                        self.__build_float_row(
+                            "Scale Min", "scale_min", "scatter_scale_min", 0.01, "Lowest scale factor."
+                        )
+                        self.__build_float_row(
+                            "Scale Max", "scale_max", "scatter_scale_max", 0.01, "Highest scale factor."
+                        )
                     self._per_axis_scale_stack = ui.VStack(height=0, spacing=self._SPACING_XS)
                     with self._per_axis_scale_stack:
                         for axis in ("x", "y", "z"):
@@ -436,10 +581,19 @@ class ScatterPane(_WorkspaceWidget):
                                 f"Highest scale along {axis_label}.",
                             )
                 self.__build_float_row(
-                    "Bias", "scale_bias", "scatter_scale_bias", 0.01, "Skew toward the minimum (-1) or maximum (1)."
+                    "Bias",
+                    "scale_bias",
+                    "scatter_scale_bias",
+                    0.01,
+                    "Skew the sizes toward the minimum (-1) or the maximum (1) of the range; 0 leaves them even.",
                 )
                 self.__build_float_row(
-                    "Weight", "scale_weight", "scatter_scale_weight", 0.1, "Sharpness of the scale distribution."
+                    "Weight",
+                    "scale_weight",
+                    "scatter_scale_weight",
+                    0.1,
+                    "How sizes spread over the range: above 1 gathers them toward the middle, below 1 pushes them "
+                    "toward the two ends, and 1 spreads them evenly.",
                 )
 
     def __build_random_section(self, settings: ScatterBrushSettings):
@@ -470,6 +624,8 @@ class ScatterPane(_WorkspaceWidget):
         frame = self.__build_section(
             "TARGET",
             "Which captured meshes receive placements.\n\n"
+            "- Apply To Selected, the default, paints only on the selected meshes, straight through anything in front "
+            "of them; select the ground first. All paints whatever is under the cursor\n"
             "- Hit Surface authors under the mesh under the cursor\n"
             "- Anchor always authors under the anchor prototype; Use Selection sets it from the viewport selection\n"
             "- Flood fills the anchor or the selected meshes up to the cap\n\n"
@@ -478,7 +634,12 @@ class ScatterPane(_WorkspaceWidget):
         with frame:
             with ui.VStack(height=0, spacing=self._SPACING_XS):
                 self.__build_enum_row(
-                    "Apply To", "apply_to", "scatter_apply_to", ApplyTo, "Paint on every mesh or only on the selection."
+                    "Apply To",
+                    "apply_to",
+                    "scatter_apply_to",
+                    ApplyTo,
+                    "Paint only on the selected meshes, looking through whatever stands in front of them, or on "
+                    "whatever mesh is under the cursor.",
                 )
                 self.__build_enum_row(
                     "Target Mode",
@@ -499,7 +660,10 @@ class ScatterPane(_WorkspaceWidget):
                         "Use Selection",
                         width=0,
                         identifier="scatter_anchor_use_selection",
-                        tooltip="Use the first selected captured mesh or instance as the anchor.",
+                        tooltip=(
+                            "Use the selected captured mesh or instance as the anchor. With several selected, the "
+                            "one whose path comes first is used."
+                        ),
                         clicked_fn=self._on_anchor_use_selection_clicked,
                     )
                 self.__build_enum_row(
@@ -507,7 +671,8 @@ class ScatterPane(_WorkspaceWidget):
                     "erase_scope",
                     "scatter_erase_scope",
                     EraseScope,
-                    "Erase every scattered placement or only the brush assets.",
+                    "Erase any scattered placement under the brush, or only placements of the assets in the ASSETS "
+                    "list.",
                 )
                 with ui.HStack(height=self._ROW_HEIGHT, spacing=self._SPACING_MD):
                     ui.Label("Flood Cap", width=self._LABEL_WIDTH, tooltip="Maximum placements created by one flood.")
@@ -520,12 +685,17 @@ class ScatterPane(_WorkspaceWidget):
                         identifier="scatter_flood_estimate",
                         tooltip=(
                             "Most prims one flood adds: the flood cap, multiplied in Anchor mode by the number of "
-                            "instances that show the anchor prototype."
+                            "instances that show the anchor prototype, and never more than five times the Prim "
+                            "Budget."
                         ),
                     )
                 budget_tooltip = (
-                    "Prims a single stroke is expected to render before the counter on the brush turns amber, and "
-                    "five times that before it turns red. The counter only reports; it never stops a stroke."
+                    "Prims a single stroke is expected to render.\n\n"
+                    "- The counter on the brush turns amber at this number\n"
+                    "- At five times it the stroke stops adding placements and the counter turns red; a flood stops "
+                    "at the same limit\n"
+                    "- A placement on a mesh with several instances counts once per instance\n"
+                    "- Raise it to paint more in one stroke"
                 )
                 with ui.HStack(height=self._ROW_HEIGHT, spacing=self._SPACING_MD):
                     ui.Label("Prim Budget", width=self._LABEL_WIDTH, tooltip=budget_tooltip)
@@ -537,6 +707,42 @@ class ScatterPane(_WorkspaceWidget):
                     height=0,
                     word_wrap=True,
                     visible=False,
+                )
+
+    def __build_output_section(self, settings: ScatterBrushSettings):
+        frame = self.__build_section(
+            "OUTPUT",
+            "How painted placements are stored.\n\n"
+            "- Instanced placements live in one PointInstancer per patch, drawn from one copy of each asset\n"
+            "- The stroke just painted stays as prims until the next one, so it can be tuned and undone\n"
+            "- Split turns instanced scatter back into prims to edit it with the brush settings and the gizmo",
+        )
+        with frame:
+            with ui.VStack(height=0, spacing=self._SPACING_XS):
+                self.__build_bool_row(
+                    "Instance Strokes", "instance_strokes", "scatter_instance_strokes", _INSTANCE_STROKES_TOOLTIP
+                )
+                with ui.HStack(height=self._ROW_HEIGHT, spacing=self._SPACING_MD):
+                    ui.Spacer(width=self._LABEL_WIDTH)
+                    self._instance_all_button = ui.Button(
+                        "Instance All",
+                        identifier="scatter_instance_all",
+                        tooltip=_INSTANCE_ALL_TOOLTIP,
+                        clicked_fn=self._on_instance_all_clicked,
+                    )
+                    self._split_button = ui.Button(
+                        "Split Selection",
+                        identifier="scatter_split_selection",
+                        tooltip=_SPLIT_TOOLTIP,
+                        clicked_fn=self._on_split_clicked,
+                    )
+                self._instancing_label = ui.Label(
+                    "",
+                    name=_STATUS_STYLE,
+                    identifier="scatter_instancing_summary",
+                    height=0,
+                    word_wrap=True,
+                    tooltip="Placements painted on the stage, and how many of them are instanced.",
                 )
 
     def __build_assets_section(self, settings: ScatterBrushSettings):
@@ -600,6 +806,7 @@ class ScatterPane(_WorkspaceWidget):
             enable_batch_edit=False,
         )
         self._drag_fields.append(field)
+        self._field_widgets[field_name] = field
         self.__bind(field_name, model, lambda m: m.as_float, lambda m, value: m.set_value(float(value)), end_edit=True)
         return field
 
@@ -722,6 +929,7 @@ class ScatterPane(_WorkspaceWidget):
         model = ui.SimpleBoolModel(getattr(self._controller.settings, field_name))
         checkbox = ui.CheckBox(model=model, width=0, identifier=identifier, tooltip=tooltip)
         ui.Spacer()
+        self._field_widgets[field_name] = checkbox
         self.__bind(field_name, model, lambda m: m.as_bool, lambda m, value: m.set_value(bool(value)))
         return checkbox
 
@@ -809,7 +1017,10 @@ class ScatterPane(_WorkspaceWidget):
             self.__push_settings(settings)
         if not self._in_field_edit:
             # The change came from outside this pane's controls, from a preset or the reroll button, so no field
-            # will report the end of an edit and the live edit it opened has to be committed here.
+            # will report the end of an edit and the live edit it opened has to be committed here. The driver hears
+            # of the change through the same event, before or after this pane, so it is handed the change first:
+            # finishing an edit it had not opened yet would leave that edit open, with no undo step.
+            self._reapply_driver.follow_settings(settings)
             self._reapply_driver.edit_finished()
 
     def _on_edit_finished(self, _model: ui.AbstractValueModel):
@@ -830,6 +1041,47 @@ class ScatterPane(_WorkspaceWidget):
         """
         self.__refresh_live_edit_label()
         self.__refresh_turn_fields()
+        # A new scope follows an undo or a selection, either of which can change what is instanced. A live edit
+        # reports the same scope at every step of a drag, and recounting the stage at every step would cost a frame.
+        if _scope != self._instancing_scope:
+            self._instancing_scope = _scope
+            self.__refresh_instancing_label()
+
+    def _on_stroke_committed(self, _count: int, _erase: bool):
+        """Recount what is painted once a stroke or a flood has committed, since that is when the brush merges.
+
+        Args:
+            _count: Placements the stroke changed; the readout counts the whole stage instead.
+            _erase: Whether the stroke erased.
+        """
+        self.__refresh_instancing_label()
+
+    def _on_history_stepped(self):
+        """Recount what is painted after an undo or a redo, which adds or removes scatter without a stroke."""
+        self.__refresh_instancing_label()
+
+    def _on_stage_event(self, event):
+        """Follow a project opening or closing, which changes everything the pane derives from the stage.
+
+        Args:
+            event: Stage event of the pane's USD context.
+        """
+        if event.type not in (int(omni.usd.StageEventType.OPENED), int(omni.usd.StageEventType.CLOSED)):
+            return
+        self._on_status_message("", False)
+        self.__refresh_instancing_label()
+        if self.window_visible:
+            self.__refresh_derived(self._controller.settings, force_instance_warning=True)
+
+    def _on_instance_all_clicked(self):
+        """Merge every loose placement of the edit layer into its patch's instancer."""
+        self._controller.instance_all(self._context_name)
+        self.__refresh_instancing_label()
+
+    def _on_split_clicked(self):
+        """Turn the selected instanced scatter back into placements; the controller reports an empty selection."""
+        self._controller.split_selection(self._context_name)
+        self.__refresh_instancing_label()
 
     def _on_mode_changed(self, mode: ScatterMode):
         """Reflect a controller mode change on the header buttons while the pane is visible.
@@ -861,20 +1113,42 @@ class ScatterPane(_WorkspaceWidget):
         self._status_label.style_type_name_override = _STATUS_ERROR_STYLE if is_error else _STATUS_STYLE
 
     def _on_flood_clicked(self):
-        """Flood the default targets, after a confirmation when the cap exceeds the default."""
-        cap = self._controller.settings.flood_max_instances
+        """Flood the default targets, after a confirmation when the flood is a large one.
+
+        Large is a cap above the default, or more prims than the Prim Budget once the instances of the anchor are
+        counted: a modest cap on a mesh with many instances renders as much as a large cap on a mesh with one.
+        """
+        settings = self._controller.settings
+        cap = settings.flood_max_instances
+        prims = self.__flood_prims(settings, self.__flood_target_instances(settings))
         flood = functools.partial(self._controller.flood, self._context_name, self._surface_cache)
-        if cap <= _FLOOD_CONFIRM_THRESHOLD:
+        if cap <= _FLOOD_CONFIRM_THRESHOLD and prims <= settings.prim_budget:
             flood()
             return
         _TrexMessageDialog(
             message=(
-                f"Flooding can create up to {cap} placements, which may take a while to author and to render.\n\n"
+                f"Flooding can create up to {cap:,} placements and render up to {prims:,} prims, which may take a "
+                "while to author and to render.\n\n"
                 "Continue with the flood?"
             ),
             title="Flood Surfaces",
             ok_label="Flood",
             ok_handler=flood,
+        )
+
+    def _on_reset_clicked(self):
+        """Put every brush setting back to its default once the user confirms; settings changes cannot be undone."""
+        _TrexMessageDialog(
+            message=(
+                "Reset every brush setting to its default?\n\n"
+                "The asset list, the saved presets, the current preset name and Edit Selection Live are kept. "
+                "Settings changes cannot be undone.\n\n"
+                "With Edit Selection Live on, the stroke just painted or the selected scatter follows the reset; "
+                "that update can be undone."
+            ),
+            title="Reset Brush Settings",
+            ok_label="Reset",
+            ok_handler=self._controller.reset_settings,
         )
 
     def _on_reroll_clicked(self):
@@ -898,6 +1172,7 @@ class ScatterPane(_WorkspaceWidget):
             self.__push_settings(self._controller.settings, force_instance_warning=True)
             self.__push_mode(self._controller.mode)
             self.__refresh_turn_fields()
+            self.__refresh_instancing_label()
 
     def destroy(self):
         """Commit any open live edit, then release the subscriptions, the surface cache and the child widgets."""
@@ -910,10 +1185,14 @@ class ScatterPane(_WorkspaceWidget):
         self._status_message_sub = None
         self._scope_changed_sub = None
         self._selection_turn_sub = None
+        self._stroke_committed_sub = None
+        self._history_stepped_sub = None
+        self._stage_event_sub = None
         self._paint_sub = None
         self._erase_sub = None
         self._field_subs.clear()
         self._bindings.clear()
+        self._field_widgets.clear()
         for field in self._drag_fields:
             field.destroy()
         self._drag_fields.clear()
@@ -922,11 +1201,12 @@ class ScatterPane(_WorkspaceWidget):
         for frame in self._section_frames:
             frame.destroy()
         self._section_frames.clear()
-        for widget in (self._asset_list_widget, self._presets_widget):
+        for widget in (self._asset_list_widget, self._presets_widget, self._up_axis_widget):
             if widget is not None:
                 widget.destroy()
         self._asset_list_widget = None
         self._presets_widget = None
+        self._up_axis_widget = None
         if self._reapply_driver is not None:
             # Shared with the viewport gizmo, so it outlives the pane; only the edit this pane opened is closed.
             self._reapply_driver.edit_finished()
@@ -960,6 +1240,20 @@ class ScatterPane(_WorkspaceWidget):
         if self._live_edit_label is not None:
             self._live_edit_label.text = self._reapply_driver.summary()
 
+    def __refresh_instancing_label(self):
+        # Counted only while the pane shows it: the count walks every prototype of the capture.
+        if self._instancing_label is None or not self.window_visible:
+            return
+        cost = scene_scatter_cost(self._get_stage())
+        if not cost.placements:
+            self._instancing_label.text = "Nothing painted yet"
+            return
+        loose = cost.placements - cost.instanced
+        self._instancing_label.text = (
+            f"{cost.placements:,} placements on {cost.prototypes:,} meshes, rendering {cost.rendered_prims:,} prims: "
+            f"{cost.instanced:,} instanced, {loose:,} loose"
+        )
+
     def __push_mode(self, mode: ScatterMode):
         self._syncing = True
         try:
@@ -974,7 +1268,12 @@ class ScatterPane(_WorkspaceWidget):
         absolute_size = settings.scale_mode == ScaleMode.ABSOLUTE_SIZE
         self._size_stack.visible = absolute_size
         self._multiplier_scale_stack.visible = not absolute_size
+        # One range or three, never both: the range that is not sampled would be a control that does nothing.
+        self._uniform_scale_stack.visible = settings.scale_uniform
         self._per_axis_scale_stack.visible = not settings.scale_uniform
+        # With Random Scale off nothing is drawn from a range, so everything that shapes one is greyed out.
+        for field_name in _RANDOM_SCALE_FIELDS:
+            self._field_widgets[field_name].enabled = settings.scale_enabled
         seed_editable = not settings.randomize_seed
         self._seed_field.enabled = seed_editable
         self._reroll_button.enabled = seed_editable
@@ -983,10 +1282,30 @@ class ScatterPane(_WorkspaceWidget):
         # Every placement authored under a prototype renders under each instance of that prototype's hash. Only the
         # anchor is known ahead of the flood; in hit-surface mode the multiplier is whatever is selected when it runs.
         if settings.target_mode == TargetMode.ANCHOR and self._anchor_instance_count:
-            prims = settings.flood_max_instances * self._anchor_instance_count
-            self._flood_estimate_label.text = f"Up to {prims} prims"
+            prims = self.__flood_prims(settings, self._anchor_instance_count)
+            self._flood_estimate_label.text = f"Up to {prims:,} prims"
         else:
-            self._flood_estimate_label.text = f"Up to {settings.flood_max_instances} prims per instance"
+            self._flood_estimate_label.text = f"Up to {self.__flood_prims(settings, 1):,} prims per instance"
+
+    @staticmethod
+    def __flood_prims(settings: ScatterBrushSettings, instances: int) -> int:
+        """Return the most prims one flood can render on meshes of ``instances`` instances, within the prim limit."""
+        return min(settings.flood_max_instances * max(instances, 1), stroke_prim_limit(settings.prim_budget))
+
+    def __flood_target_instances(self, settings: ScatterBrushSettings) -> int:
+        """Return the most instances any mesh a flood started now would fill has, which multiplies what it renders.
+
+        The anchor's count is the one the estimate already shows. Without an anchor a flood fills the selected
+        meshes, which are counted here, when the flood is asked for, rather than at every change of the selection.
+        """
+        if settings.target_mode == TargetMode.ANCHOR:
+            return max(self._anchor_instance_count, 1)
+        stage = self._get_stage()
+        usd_context = omni.usd.get_context(self._context_name)
+        if stage is None or usd_context is None:
+            return 1
+        counts = [instance_count(stage, prototype) for prototype in selected_prototypes(usd_context)]
+        return max(counts, default=1) or 1
 
     def __refresh_instance_warning(self, settings: ScatterBrushSettings, force: bool):
         # Counting instances walks /RootNode/instances, so only redo it when the anchor inputs change.

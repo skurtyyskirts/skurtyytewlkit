@@ -26,8 +26,8 @@ __all__ = [
     "scatter_brush_factory",
 ]
 
-from typing import TYPE_CHECKING, Any
 from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any
 
 import carb
 import carb.input
@@ -45,10 +45,13 @@ from lightspeed.trex.scatter.core import (
     PrimBudgetStatus,
     ScatterMode,
     StrokeSession,
+    SurfaceHit,
     SurfaceSample,
+    camera_ray_from_ndc,
     get_scatter_brush_controller,
     prim_budget_status,
     resolve_target,
+    selected_capture_meshes,
     selected_prototypes,
     stage_up_axis,
     tangent_basis,
@@ -64,7 +67,7 @@ from ..events import register_mouse_wheel_interceptor
 from ..scene.utils import flatten_matrix
 
 if TYPE_CHECKING:
-    from lightspeed.trex.scatter.core import ScatterBrushSettings, ScatterTarget, SurfaceHit, SurfacePicker
+    from lightspeed.trex.scatter.core import ScatterBrushSettings, ScatterTarget, SurfacePicker
     from omni.kit.widget.viewport.api import ViewportAPI
     from pxr import Sdf, Usd
 
@@ -73,6 +76,28 @@ _TOOLTIP = (
     "Scatter brush: paint ingested assets onto meshes. Ctrl+B toggles, Shift+drag erases, hold B and scroll to resize."
 )
 _NO_ASSETS_MESSAGE = "Add at least one ingested asset to the scatter brush"
+_NO_SELECTION_MESSAGE = "Select the mesh to paint on, or set Target > Apply To to All to paint on any mesh"
+_NOTHING_PAINTED_MESSAGE = (
+    "The stroke painted nothing: the surface under it may already be filled at this Padding or be steeper than Max "
+    "Surface Angle, or Density or Strength may be too low to place anything along a stroke this short"
+)
+_LIMIT_REACHED_MESSAGE = (
+    "The stroke stopped at its limit of {limit:,} rendered prims. Paint another stroke to continue, raise Brush > "
+    "Padding to spread placements out, or raise Target > Prim Budget to allow more in one stroke"
+)
+_LIMIT_BLOCKED_MESSAGE = (
+    "Nothing was painted on {name}: one placement on it renders on {count:,} instances, more than this stroke could "
+    "still add under its limit of {limit:,} rendered prims. Raise Target > Prim Budget to paint on this mesh"
+)
+_CUT_SHORT_MESSAGE = (
+    "The stroke ended before the brush caught up with the cursor, so the end of the path was left as it was. Keep "
+    "the mouse button held until the brush has caught up, or lower Brush > Density or raise Brush > Spacing so a "
+    "stroke costs less"
+)
+_FAILED_MESSAGE = (
+    "The stroke stopped on an error before the brush caught up with the cursor, so the end of the path was left as "
+    "it was. What it had painted is kept as one undo step; the log has the error"
+)
 _HOVER_SUBSCRIPTION_NAME = "ScatterBrushHover"
 
 _PAINT_COLOR = (0.25, 0.9, 0.35, 1.0)
@@ -83,6 +108,12 @@ _NORMAL_TICK_LENGTH = 0.35
 # Live stroke counter, drawn just outside the cursor ring in cursor-local units so it tracks the brush radius.
 _COUNTER_OFFSET = 1.2
 _COUNTER_TEXT_SIZE = 16
+# Appended to the stroke counter while the stroke is behind the cursor and catching up frame by frame.
+_CATCHING_UP_SUFFIX = "(catching up)"
+# Appended to the stroke counter once the stroke has reached its prim limit and places nothing more.
+_LIMIT_REACHED_SUFFIX = "(limit reached)"
+# Appended while the cursor is on a mesh one placement on which renders more than the stroke has room left for.
+_LIMIT_BLOCKED_SUFFIX = "(too many instances here)"
 _BUDGET_COLORS = {
     PrimBudgetStatus.OK: (0.8, 0.88, 0.8, 1.0),
     PrimBudgetStatus.WARNING: (0.96, 0.75, 0.2, 1.0),
@@ -306,8 +337,16 @@ class ScatterBrushTool:
         self._last_pick_ndc: tuple[float, float] | None = None
         self._last_pick_camera: Gf.Matrix4d | None = None
         self._force_pick = False
+        self._shift_down = False
         self._stroke_prototypes: dict[Sdf.Path, int] = {}
         self._warned_prototypes: set[Sdf.Path] = set()
+        # Reasons a stroke was stopped or cut that were already shown as a notification since the brush was turned on:
+        # the status line repeats them for every such stroke, and a notification each time would bury the viewport.
+        self._notified_messages: set[str] = set()
+        # The capture meshes the selection names, kept with the stage and selection they were read from: reading them
+        # walks the instances, and the hover poll asks for them on every mouse move.
+        self._selection_key: tuple | None = None
+        self._selection_meshes: list[Sdf.Path] = []
 
         # Created in the factory context, so it overlays the viewport and gives the screen-to-NDC mapping.
         self._frame: ui.Frame | None = ui.Frame()
@@ -426,6 +465,7 @@ class ScatterBrushTool:
             if self._picker is None:
                 self._picker = get_scatter_brush_controller().create_picker(self._viewport_api, self._cache)
             self._force_pick = True
+            self._notified_messages.clear()
             self._update_subscription = (
                 omni.kit.app.get_app()
                 .get_update_event_stream()
@@ -471,7 +511,13 @@ class ScatterBrushTool:
 
         The picker alone decides whether a request goes out: it refuses one while another is in flight and drops a
         request whose completion never arrived, so the poll keeps asking instead of gating on ``in_flight`` itself.
+
+        A stroke that fell behind the cursor, because its stamps cost more than a frame allows, is walked on first,
+        whatever the mouse is doing, so it catches up while the mouse rests.
         """
+        session = self._session
+        if session is not None and session.pending:
+            self._resume_stroke(session)
         if self._picker is None or not self._is_viewport_active():
             self._hide_cursor()
             return
@@ -480,14 +526,71 @@ class ScatterBrushTool:
             self._last_pick_ndc = None
             self._hide_cursor()
             return
+        shift_down = _any_key_down(_SHIFT_KEYS)
+        if shift_down != self._shift_down:
+            # The cursor colour says whether a press would erase, so it follows the key without waiting for the mouse.
+            self._shift_down = shift_down
+            self._force_pick = True
         camera = self._viewport_api.transform
         camera_unchanged = self._last_pick_camera is not None and camera == self._last_pick_camera
         if not self._force_pick and ndc == self._last_pick_ndc and camera_unchanged:
+            return
+        selection_hit = self._pick_selection(ndc)
+        if selection_hit is not None:
+            # A renderer pick still on its way would report what stands in front of the selected mesh and move the
+            # cursor off it again.
+            self._picker.cancel()
+            self._force_pick = False
+            self._last_pick_ndc = ndc
+            self._last_pick_camera = Gf.Matrix4d(camera)
+            self._on_hit(selection_hit)
             return
         if self._picker.pick(ndc, self._on_hit):
             self._force_pick = False
             self._last_pick_ndc = ndc
             self._last_pick_camera = Gf.Matrix4d(camera)
+
+    def _pick_selection(self, ndc: tuple[float, float]) -> SurfaceHit | None:
+        """Cast the camera ray at the selected meshes alone when the brush paints on the selection.
+
+        The renderer reports the first thing under the cursor, which on a captured ground is as often a foliage card,
+        a prop or earlier scatter as the ground itself. Testing the selected meshes directly is what lets the brush
+        paint the ground through all of that.
+
+        Args:
+            ndc: Mouse position in normalized device coordinates.
+
+        Returns:
+            The nearest hit on a selected mesh, or None when the brush paints on every mesh, nothing usable is
+            selected or the ray misses the selection; the renderer pick then decides what the cursor shows.
+        """
+        if get_scatter_brush_controller().settings.apply_to != ApplyTo.SELECTED:
+            return None
+        stage = self._viewport_api.stage
+        if stage is None:
+            return None
+        meshes = self._selected_meshes(stage)
+        if not meshes:
+            return None
+        origin, direction = camera_ray_from_ndc(self._viewport_api, ndc)
+        nearest: tuple[float, Sdf.Path, Any] | None = None
+        for mesh_path in meshes:
+            sample = self._cache.raycast(mesh_path, origin, direction)
+            if sample is not None and (nearest is None or sample.distance < nearest[0]):
+                nearest = (sample.distance, mesh_path, sample.position)
+        if nearest is None:
+            return None
+        _distance, mesh_path, position = nearest
+        return SurfaceHit(mesh_path, Gf.Vec3d(float(position[0]), float(position[1]), float(position[2])))
+
+    def _selected_meshes(self, stage: Usd.Stage) -> list[Sdf.Path]:
+        """Return the capture meshes the current selection names, read again only when the selection changed."""
+        selected = tuple(omni.usd.get_context(self._usd_context_name).get_selection().get_selected_prim_paths())
+        key = (stage.GetRootLayer().identifier, selected)
+        if key != self._selection_key:
+            self._selection_key = key
+            self._selection_meshes = selected_capture_meshes(stage, selected)
+        return self._selection_meshes
 
     def _on_hit(self, hit: SurfaceHit | None) -> None:
         """Handle a pick result, degrading to a hidden cursor when the handling fails.
@@ -518,12 +621,18 @@ class ScatterBrushTool:
         applicable = settings.apply_to != ApplyTo.SELECTED or target.prototype_root in selected_prototypes(
             omni.usd.get_context(self._usd_context_name)
         )
-        sample = self._cache.closest_point(target.mesh_path, hit.world_position, settings.radius)
+        session = self._session
+        # A stroke keeps the settings it started with, so while one is open the cursor shows the radius it stamps.
+        radius = session.settings.radius if session is not None else settings.radius
+        sample = self._cache.closest_point(target.mesh_path, hit.world_position, radius)
         if sample is None:
             sample = self._fallback_sample(stage, hit)
-        session = self._session
+        sample = self._facing_camera(sample)
         erase = session.erase if session is not None else self._erase_intent(controller.mode)
-        self._show_cursor(sample, settings.radius, self._cursor_color_for(applicable, erase))
+        # A stroke at its prim limit places nothing more, and one with less room left than a placement on this mesh
+        # renders places nothing here, which the cursor shows the way it shows an excluded mesh.
+        painting = applicable and (session is None or session.erase or session.can_place_on(target))
+        self._show_cursor(sample, radius, self._cursor_color_for(painting, erase))
         if not applicable:
             self._last_hover = None
             return
@@ -543,6 +652,9 @@ class ScatterBrushTool:
         if not erase and not controller.enabled_assets():
             controller.post_status(_NO_ASSETS_MESSAGE, True)
             return
+        if controller.settings.apply_to == ApplyTo.SELECTED and not self._selected_meshes(stage):
+            controller.post_status(_NO_SELECTION_MESSAGE, True)
+            return
         self._end_stroke()
         seed, stroke_index = controller.next_stroke()
         self._session = StrokeSession(
@@ -554,6 +666,7 @@ class ScatterBrushTool:
             stage_up_axis(stage),
             seed,
             stroke_index,
+            view_point=self._camera_position(),
         )
         self._layer_guard = disable_other_drag_gestures(self._layer_provider)
         self._force_pick = True
@@ -585,6 +698,16 @@ class ScatterBrushTool:
             return
         self._update_counter(session)
 
+    def _resume_stroke(self, session: StrokeSession) -> None:
+        """Walk a stroke that fell behind on for another frame; a failure ends the stroke."""
+        try:
+            session.resume()
+        except Exception as exc:  # noqa: BLE001 - runs from the per-frame poll; the stroke must end, not repeat.
+            carb.log_error(f"{_LOG_PREFIX} Scatter stroke failed and was ended: {exc}")
+            self._end_stroke()
+            return
+        self._update_counter(session)
+
     def _end_stroke(self) -> None:
         """Commit whatever the current stroke authored, release the layer guard and notify listeners."""
         session, self._session = self._session, None
@@ -605,7 +728,60 @@ class ScatterBrushTool:
             controller.begin_preview(self._usd_context_name)
         controller.notify_stroke_committed(count, session.erase)
         if count and not session.erase:
-            self._warn_replicated_prototypes(touched)
+            # A mesh the stroke had no room to paint on is reported for that instead, not for replicating.
+            blocked = session.blocked_prototypes
+            self._warn_replicated_prototypes(
+                {path: instances for path, instances in touched.items() if path not in blocked}
+            )
+        self._report_stroke(session, count)
+
+    def _report_stroke(self, session: StrokeSession, count: int) -> None:
+        """Say in the status line what a stroke did, and why when it did less than the path that was drawn.
+
+        A stroke stops at its prim limit, skips a mesh with more instances than it has room left for, and stops
+        catching up a moment after mouse-up; each leaves part of the drawn path unpainted, which would look like a
+        fault of the brush if nothing said so. The status line says it for every such stroke, after what the stroke
+        did paint, and a notification the first time for each reason while the brush stays on. Any other stroke
+        reports what it placed or erased, which also takes an earlier stroke's message off the status line.
+
+        Args:
+            session: The stroke that just ended.
+            count: Placements the stroke authored or removed.
+        """
+        if not session.stamp_count:
+            # A press that never found a surface made no stroke, so there is nothing to say about one.
+            return
+        placements = f"{count:,} placement{'s' if count != 1 else ''}"
+        if session.erase:
+            summary = f"Erased {placements}"
+        elif count:
+            prims = f"{session.rendered_prims:,} prim{'s' if session.rendered_prims != 1 else ''}"
+            summary = f"Painted {placements}, rendering {prims}"
+        else:
+            summary = ""
+        blocked = session.blocked_prototypes
+        if session.failed:
+            reason = message = _FAILED_MESSAGE
+        elif session.limit_reached:
+            reason = _LIMIT_REACHED_MESSAGE
+            message = reason.format(limit=session.prim_limit)
+        elif blocked:
+            reason = _LIMIT_BLOCKED_MESSAGE
+            prototype_root, instances = max(blocked.items(), key=lambda item: item[1])
+            message = reason.format(name=prototype_root.name, count=instances, limit=session.prim_limit)
+        elif session.cut_short:
+            reason = message = _CUT_SHORT_MESSAGE
+        else:
+            get_scatter_brush_controller().post_stroke_summary(summary or _NOTHING_PAINTED_MESSAGE)
+            return
+        if summary:
+            message = f"{summary}. {message}"
+        # Through the summary rather than as a plain status, so an up-axis warning the stroke started with stays.
+        get_scatter_brush_controller().post_stroke_summary(message, True)
+        if reason in self._notified_messages:
+            return
+        self._notified_messages.add(reason)
+        post_notification(f"Scatter: {message}", status=NotificationStatus.WARNING)
 
     def _warn_replicated_prototypes(self, touched: dict[Sdf.Path, int]) -> None:
         """Tell the user once per prototype that placements under it show up on every instance of its hash."""
@@ -626,6 +802,24 @@ class ScatterBrushTool:
             normal=np.array(up, dtype=np.float64),
             triangle_index=-1,
             distance=0.0,
+        )
+
+    def _camera_position(self) -> Gf.Vec3d:
+        """Return where the viewport camera sits in the world."""
+        return Gf.Matrix4d(self._viewport_api.transform).ExtractTranslation()
+
+    def _facing_camera(self, sample: SurfaceSample) -> SurfaceSample:
+        """Return the sample with its normal turned toward the camera.
+
+        A captured mesh is often wound the other way round, so its normal points into the surface; the cursor tick
+        would then point into the ground, and the stroke paints the side the camera sees in any case.
+        """
+        normal = np.asarray(sample.normal, dtype=np.float64)
+        to_camera = np.asarray(self._camera_position(), dtype=np.float64) - np.asarray(sample.position)
+        if float(normal @ to_camera) >= 0.0:
+            return sample
+        return SurfaceSample(
+            position=sample.position, normal=-normal, triangle_index=sample.triangle_index, distance=sample.distance
         )
 
     def _erase_intent(self, mode: ScatterMode) -> bool:
@@ -658,19 +852,33 @@ class ScatterBrushTool:
     def _update_counter(self, session: StrokeSession) -> None:
         """Show what the stroke has cost so far, coloured by how it compares with the brush prim budget.
 
-        An erase stroke removes prims rather than adding them, so it shows no counter.
+        An erase stroke removes prims rather than adding them, so it shows no counter. While the stroke trails the
+        cursor the counter says so, which is the sign that the brush settings cost more than a frame per stamp. Once
+        the stroke has reached its prim limit the counter says that instead, and over a mesh with more instances
+        than the stroke has room left for it says so, even when that left the stroke nothing to place at all.
         """
         if self._counter_label is None or session.erase:
             return
         rendered = session.rendered_prims
-        if not rendered:
+        hover = self._last_hover
+        blocked_here = hover is not None and hover[1].prototype_root in session.blocked_prototypes
+        stopped = session.limit_reached or blocked_here
+        if not rendered and not stopped:
+            # Nothing to count yet, which also takes away what was said over a mesh the cursor has since left.
+            self._hide_counter()
             return
         placed = session.placed_count
         # Showing both makes the instance multiplier visible; they only differ on a replicated prototype.
-        self._counter_label.text = (
-            f"{rendered:,} prims" if rendered == placed else f"{placed:,} placed  ->  {rendered:,} prims"
-        )
-        status = prim_budget_status(rendered, session.settings.prim_budget)
+        text = f"{rendered:,} prims" if rendered == placed else f"{placed:,} placed  ->  {rendered:,} prims"
+        if session.limit_reached:
+            text = f"{text}  {_LIMIT_REACHED_SUFFIX}"
+        elif blocked_here:
+            text = f"{text}  {_LIMIT_BLOCKED_SUFFIX}"
+        elif session.pending:
+            text = f"{text}  {_CATCHING_UP_SUFFIX}"
+        self._counter_label.text = text
+        # A stroke the limit keeps from placing is an alert whatever it managed to place before that.
+        status = PrimBudgetStatus.ALERT if stopped else prim_budget_status(rendered, session.settings.prim_budget)
         if status != self._counter_status:
             self._counter_status = status
             self._counter_label.color = list(_BUDGET_COLORS[status])

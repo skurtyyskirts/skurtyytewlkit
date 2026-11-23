@@ -18,6 +18,7 @@
 __all__ = ["TestPresetsWidget"]
 
 import contextlib
+import os
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -192,6 +193,107 @@ class TestPresetsWidget(omni.kit.test.AsyncTestCase):
         self.assertEqual(self.controller.settings.preset_name, "Pebbles")
         self.assertEqual(widget.names_model.current_choice, "Pebbles")
         self.assertIsNone(prompt._window)
+
+    async def test_save_as_under_the_name_of_another_preset_asks_before_replacing_it(self):
+        # Arrange - "Rocks" holds a radius of 77, and the current preset is "Grass"
+        self.controller.update_settings(radius=77.0)
+        self._store_presets("Rocks")
+        self.controller.update_settings(radius=10.0)
+        self._store_presets("Grass")
+        widget = await self._build_widget()
+
+        with mock.patch.object(presets_ui_module, "TrexMessageDialog") as dialog_mock:
+            # Act
+            widget._save_as_named("Rocks")
+
+        # Assert - nothing is written until the dialog is confirmed
+        dialog_mock.assert_called_once()
+        self.assertEqual(dialog_mock.call_args.kwargs["title"], "Replace Preset")
+        self.assertIn("Rocks", dialog_mock.call_args.kwargs["message"])
+        self.assertEqual(self.controller.settings.preset_name, "Grass")
+        self.assertEqual(self.controller._presets.load("Rocks").radius, 77.0)
+
+    async def test_save_as_replace_confirmed_stores_the_settings_under_the_other_presets_name(self):
+        # Arrange
+        self.controller.update_settings(radius=77.0)
+        self._store_presets("Rocks")
+        self.controller.update_settings(radius=10.0)
+        self._store_presets("Grass")
+        widget = await self._build_widget()
+        with mock.patch.object(presets_ui_module, "TrexMessageDialog") as dialog_mock:
+            widget._save_as_named("Rocks")
+
+        # Act
+        dialog_mock.call_args.kwargs["ok_handler"]()
+
+        # Assert
+        self.assertEqual(self.controller._presets.load("Rocks").radius, 10.0)
+        self.assertEqual(self.controller.settings.preset_name, "Rocks")
+        self.assertEqual(widget.names_model.current_choice, "Rocks")
+
+    async def test_save_as_under_the_current_presets_own_name_saves_without_asking(self):
+        # Arrange
+        self._store_presets("Rocks")
+        self.controller.update_settings(radius=33.0)
+        widget = await self._build_widget()
+
+        with mock.patch.object(presets_ui_module, "TrexMessageDialog") as dialog_mock:
+            # Act
+            widget._save_as_named("Rocks")
+
+        # Assert
+        dialog_mock.assert_not_called()
+        self.assertEqual(self.controller._presets.load("Rocks").radius, 33.0)
+
+    async def test_save_as_under_another_presets_name_in_a_different_case_asks_and_keeps_the_stored_spelling(self):
+        # Arrange - on a file system that ignores case "Rocks" is the file of "rocks"
+        self.controller.update_settings(radius=77.0)
+        self._store_presets("rocks")
+        self.controller.update_settings(radius=10.0)
+        self._store_presets("Grass")
+        widget = await self._build_widget()
+        with (
+            mock.patch.object(os.path, "normcase", side_effect=str.lower),
+            mock.patch.object(presets_ui_module, "TrexMessageDialog") as dialog_mock,
+        ):
+            widget._save_as_named("Rocks")
+
+        # Act
+        dialog_mock.call_args.kwargs["ok_handler"]()
+
+        # Assert - one preset under one spelling, rather than two names for one file
+        self.assertIn("'rocks'", dialog_mock.call_args.kwargs["message"])
+        self.assertEqual(self.controller.preset_names(), ["Grass", "rocks"])
+        self.assertEqual(self.controller.settings.preset_name, "rocks")
+        self.assertEqual(self.controller._presets.load("rocks").radius, 10.0)
+
+    async def test_save_as_under_an_invalid_name_saves_nothing_and_posts_why(self):
+        # Arrange
+        widget = await self._build_widget()
+        status = mock.Mock()
+        status_sub = self.controller.subscribe_status_message(status)
+
+        # Act
+        widget._save_as_named("bad/name")
+
+        # Assert
+        self.assertEqual(self.controller.preset_names(), [])
+        self.assertTrue(status.call_args.args[1])
+        self.assertIsNotNone(status_sub)
+
+    async def test_select_preset_after_one_that_was_never_saved_drops_it_from_the_list_and_enables_file_actions(self):
+        # Arrange - "Scratch" has no file, so it is listed only while it is the current preset
+        self._store_presets("Rocks")
+        self.controller.update_settings(preset_name="Scratch")
+        widget = await self._build_widget()
+
+        # Act
+        widget.names_model.index_model.set_value(widget.names_model.choices.index("Rocks"))
+
+        # Assert
+        self.assertEqual(widget.names_model.choices, ["Rocks"])
+        self.assertTrue(widget._rename_button.enabled)
+        self.assertTrue(widget._delete_button.enabled)
 
     async def test_save_as_prompt_accepted_hides_window_now_and_destroys_it_next_frame(self):
         # Arrange

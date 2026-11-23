@@ -79,12 +79,21 @@ class TestAssetReplacementsService(AsyncTestCase):
 
     async def test_get_available_ingested_assets_returns_expected_response(self):
         # Arrange
-        texture_path = Path(get_test_data("usd/project_example")) / "assets" / "ingested" / "16px_Diffuse.dds"
-        model_path = Path(get_test_data("usd/project_example")) / "assets" / "ingested" / "cube.usda"
+        ingested = Path(get_test_data("usd/project_example")) / "assets" / "ingested"
+        textures = [
+            (ingested / name).as_posix()
+            for name in (
+                "16px_Diffuse.dds",
+                "cube_textured_albedo.a.rtex.dds",
+                "cube_textured_normal.n.rtex.dds",
+                "cube_textured_rough.r.rtex.dds",
+            )
+        ]
+        models = [(ingested / name).as_posix() for name in ("cube.usda", "cube_textured.usda")]
         for test_data in [
-            ("?asset_type=textures", [texture_path.as_posix()]),
-            ("?asset_type=models", [model_path.as_posix()]),
-            ("", [texture_path.as_posix(), model_path.as_posix()]),
+            ("?asset_type=textures", textures),
+            ("?asset_type=models", models),
+            ("", [textures[0], *models, *textures[1:]]),
         ]:
             query_params, expected_value = test_data
             with self.subTest(name=f"query_params_{query_params or 'None'}"):

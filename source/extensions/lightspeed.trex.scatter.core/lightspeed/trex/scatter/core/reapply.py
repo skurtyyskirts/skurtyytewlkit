@@ -26,6 +26,7 @@ __all__ = [
     "changed_reappliable_fields",
     "changed_recompose_assets",
     "is_hand_edited",
+    "is_inside_instancer",
     "prepare_reapply",
     "read_placement_origin",
     "read_placement_turn",
@@ -59,10 +60,12 @@ from .constants import (
     SCATTER_ASSET_ATTR,
     SCATTER_KEY_ATTR,
     SCATTER_ORIGIN_ATTR,
+    SCATTER_PREVIEW_OF_ATTR,
     SCATTER_TRANSFORM_KEY_ATTR,
     SCATTER_TURN_ATTR,
     SCATTER_YAW_ATTR,
 )
+from .instancing import is_scatter_instancer
 from .placement import PlacementTransform, asset_scale_factor, author_placement_transforms, transform_key
 from .sampling import (
     ParentSpaceOrigin,
@@ -73,7 +76,14 @@ from .sampling import (
     to_parent_space_origin,
     turn_matrix,
 )
-from .settings import LIVE_EDIT_SOFT_LIMIT, REAPPLIABLE_FIELDS, ScatterAssetEntry, ScatterBrushSettings, UpAxis
+from .settings import (
+    LIVE_EDIT_SOFT_LIMIT,
+    REAPPLIABLE_FIELDS,
+    ApplyTo,
+    ScatterAssetEntry,
+    ScatterBrushSettings,
+    UpAxis,
+)
 from .targets import build_prototype_target, get_prototype_root, is_scatter_prim, prototype_side_path
 
 if TYPE_CHECKING:
@@ -224,7 +234,9 @@ def resolve_scope(
     The narrowest selection wins. Selecting placements or a scatter container scopes the edit to exactly those
     placements. Selecting anything else inside the capture topology, such as a mesh or an instance, scopes it to the
     container of the current preset on that prototype, which is what keeps two patches painted with two presets on
-    one mesh independent.
+    one mesh independent. That last rule only holds while the brush paints on every mesh: when it paints on the
+    selection, a selected mesh is where the next stroke goes, and editing everything already on it would make every
+    setting changed between two strokes rewrite the whole field.
 
     Args:
         stage: Stage the selection belongs to, or None when no project is open.
@@ -249,6 +261,8 @@ def resolve_scope(
             explicit.setdefault(prototype, set()).update(placements)
     if explicit:
         return _build_scope(explicit)
+    if settings.apply_to == ApplyTo.SELECTED:
+        return ReapplyScope()
     container_name = f"{CONTAINER_PREFIX}{settings.slug()}"
     by_prototype: dict[Sdf.Path, set[Sdf.Path]] = {}
     for prototype in prototypes:
@@ -550,6 +564,8 @@ class ReapplyDriver:
         self._known_assets = controller.assets
         self._scope = ReapplyScope()
         self._previewing = False
+        # Whether the empty scope is empty because the selection is instanced scatter, which Split makes editable.
+        self._instanced_selected = False
         self._outcome = ReapplyOutcome()
         self._layer: Sdf.Layer | None = None
         self._interaction_token = None
@@ -559,7 +575,7 @@ class ReapplyDriver:
         self._holds = 0
 
         self.__on_scope_changed = Event(copy=True)
-        self._settings_sub = controller.subscribe_settings_changed(self._on_settings_changed)
+        self._settings_sub = controller.subscribe_settings_changed(self.follow_settings)
         self._assets_sub = controller.subscribe_assets_changed(self._on_assets_changed)
         self._preview_sub = controller.subscribe_preview_changed(self._on_preview_changed)
         usd_context = omni.usd.get_context(usd_context_name)
@@ -597,6 +613,8 @@ class ReapplyDriver:
         if not self._controller.settings.edit_selection_live:
             return ""
         if self._scope.is_empty:
+            if self._instanced_selected:
+                return "Instanced scatter selected - Split it to edit it"
             return "Select painted scatter to edit it"
         notes = self._outcome.describe()
         summary = self._scope.describe()
@@ -611,14 +629,21 @@ class ReapplyDriver:
         usd_context = omni.usd.get_context(self._usd_context_name)
         settings = self._controller.settings
         preview = self._controller.preview_scope(self._usd_context_name) if settings.edit_selection_live else None
+        instanced_selected = False
         if preview is not None:
             scope, previewing = preview, True
         elif usd_context is None:
             # The context this driver edits is gone, so there is nothing left to select.
             scope, previewing = ReapplyScope(), False
         else:
-            scope, previewing = resolve_scope(usd_context.get_stage(), usd_context, settings), False
+            stage = usd_context.get_stage()
+            scope, previewing = resolve_scope(stage, usd_context, settings), False
+            instanced_selected = scope.is_empty and _selection_inside_instancer(stage, usd_context)
+        changed_hint = instanced_selected != self._instanced_selected
+        self._instanced_selected = instanced_selected
         if scope == self._scope and previewing == self._previewing:
+            if changed_hint:
+                self.__on_scope_changed(scope)
             return
         self._scope = scope
         self._previewing = previewing
@@ -684,11 +709,22 @@ class ReapplyDriver:
             self._cache.destroy()
         self._cache = None
 
-    def _on_settings_changed(self, settings: ScatterBrushSettings) -> None:
-        """Re-apply the change to the scope when it is one a placement that already exists can follow."""
+    def follow_settings(self, settings: ScatterBrushSettings) -> None:
+        """Re-apply a settings change to the scope when it is one a placement that already exists can follow.
+
+        Subscribed to the controller, and also called by whoever is about to finish the edit the change opened. The
+        controller notifies its subscribers in no particular order, so a caller that finishes the edit from its own
+        handler would otherwise do so, some of the time, before this had opened it: the edit would then stay open
+        with no undo step until something else happened to close it. A second call with the same settings changes
+        nothing.
+
+        Args:
+            settings: Settings the controller adopted.
+        """
         previous, self._known_settings = self._known_settings, settings
-        if previous.edit_selection_live != settings.edit_selection_live:
-            # The preview only counts while live editing is on, so turning it on or off changes the scope.
+        if previous.edit_selection_live != settings.edit_selection_live or previous.apply_to != settings.apply_to:
+            # The preview only counts while live editing is on, and a selected mesh only counts while the brush paints
+            # on every mesh, so either change moves the scope.
             self.edit_finished()
             self.refresh_scope()
         if not settings.edit_selection_live:
@@ -707,6 +743,9 @@ class ReapplyDriver:
         Setting an asset's up axis is the fix for one scattered on its side, and it is a palette field rather than a
         brush setting, so without this the patch the user is looking at would keep its old orientation until they
         happened to nudge a slider.
+
+        The edit is finished here as well. A palette change is one click, never a drag, and no control reports the
+        end of one, so an edit left open would have no undo step until a new selection happened to close it.
         """
         previous, self._known_assets = self._known_assets, list(assets)
         if not self._controller.settings.edit_selection_live:
@@ -718,6 +757,7 @@ class ReapplyDriver:
             return
         if self._scope.placement_count <= LIVE_EDIT_SOFT_LIMIT:
             self._apply()
+        self.edit_finished()
 
     def _on_preview_changed(self) -> None:
         """Commit what was done to the old scope, then follow the stroke the brush painted or stopped previewing."""
@@ -809,7 +849,7 @@ class _AssetResolver:
         entry = self.resolve(spec)
         if entry is None:
             return None
-        return asset_comparison_key(self._layer.ComputeAbsolutePath(str(attribute.default))), entry
+        return (asset_comparison_key(self._layer.ComputeAbsolutePath(str(attribute.default))), entry)
 
     def resolve(self, spec: Sdf.PrimSpec) -> ScatterAssetEntry | None:
         """Return the asset entry a placement spec references, or None when it names no asset.
@@ -845,17 +885,40 @@ def _selected_placements(stage: Usd.Stage, selected: Sdf.Path | str) -> list[Sdf
     """Return the placements a selected path names directly, or None when it names no scatter prim.
 
     None is what makes the selection fall back to the prototype, so it is deliberately different from an empty list,
-    which means an empty scatter container was selected and nothing should be edited.
+    which means an empty scatter container or instanced scatter was selected and nothing should be edited: an
+    instancer entry is not a prim a live edit can write to until the instancer is split.
     """
     path = prototype_side_path(selected)
     if path is None:
         return None
     prim = stage.GetPrimAtPath(path)
+    if is_inside_instancer(prim):
+        return []
     if not is_scatter_prim(prim):
         return None
     if prim.GetName().startswith(CONTAINER_PREFIX):
         return _placements_of(prim)
     return [path]
+
+
+def _selection_inside_instancer(stage: Usd.Stage | None, usd_context: omni.usd.UsdContext) -> bool:
+    """Whether anything selected is instanced scatter, so the readout can say how to make it editable."""
+    if stage is None:
+        return False
+    for selected in usd_context.get_selection().get_selected_prim_paths():
+        path = prototype_side_path(selected)
+        if path is not None and is_inside_instancer(stage.GetPrimAtPath(path)):
+            return True
+    return False
+
+
+def is_inside_instancer(prim: Usd.Prim) -> bool:
+    """Whether ``prim`` is instanced scatter: an instancer, one of its prototypes, or the viewport stand-in of one."""
+    while prim and not prim.IsPseudoRoot():
+        if is_scatter_instancer(prim) or prim.HasAttribute(SCATTER_PREVIEW_OF_ATTR):
+            return True
+        prim = prim.GetParent()
+    return False
 
 
 def _placements_of(container: Usd.Prim) -> list[Sdf.Path]:

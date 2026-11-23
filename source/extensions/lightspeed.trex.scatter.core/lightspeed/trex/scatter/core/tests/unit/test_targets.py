@@ -108,6 +108,10 @@ def _translation_matrix(translate: Gf.Vec3d) -> Gf.Matrix4d:
 
 
 class TestTargets(omni.kit.test.AsyncTestCase):
+    async def tearDown(self):
+        # The instance index follows one stage at a time; releasing it keeps a test's stage from outliving the test.
+        targets.reset_instance_index()
+
     async def test_get_prototype_root_with_instance_child_path_returns_prototype(self):
         # Arrange
         path = f"{_INSTANCE_1}/mesh"
@@ -369,6 +373,69 @@ class TestTargets(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(result, 0)
 
+    async def test_instance_count_after_an_instance_is_added_counts_it(self):
+        # Arrange
+        stage = _build_capture_stage()
+        targets.instance_count(stage, _PROTOTYPE)
+        UsdGeom.Xform.Define(stage, Sdf.Path(f"{INSTANCE_PATH}{_HASH}_2"))
+
+        # Act
+        result = targets.instance_count(stage, _PROTOTYPE)
+
+        # Assert
+        self.assertEqual(result, 3)
+
+    async def test_canonical_instance_after_the_lowest_instance_is_removed_returns_the_next_one(self):
+        # Arrange
+        stage = _build_capture_stage()
+        targets.canonical_instance(stage, _PROTOTYPE)
+        stage.RemovePrim(_INSTANCE_0)
+
+        # Act
+        result = targets.canonical_instance(stage, _PROTOTYPE)
+
+        # Assert
+        self.assertEqual(result, _INSTANCE_1)
+
+    async def test_instance_count_after_scatter_is_painted_reads_the_instances_only_once(self):
+        # Arrange
+        stage = _build_capture_stage()
+        with mock.patch.object(targets, "_read_instances", wraps=targets._read_instances) as read_instances:
+            targets.instance_count(stage, _PROTOTYPE)
+            _author_scatter_placement(stage, _PROTOTYPE)
+
+            # Act
+            result = targets.instance_count(stage, _PROTOTYPE)
+
+        # Assert
+        self.assertEqual(result, 2)
+        read_instances.assert_called_once_with(stage)
+
+    async def test_instance_count_on_another_stage_reads_that_stage(self):
+        # Arrange
+        targets.instance_count(_build_capture_stage(instance_indices=(0, 1)), _PROTOTYPE)
+        other_stage = _build_capture_stage(instance_indices=(0, 1, 2, 3))
+
+        # Act
+        result = targets.instance_count(other_stage, _PROTOTYPE)
+
+        # Assert
+        self.assertEqual(result, 4)
+
+    async def test_resolve_target_hit_on_one_of_two_overlapping_meshes_uses_the_picked_mesh(self):
+        # Arrange - a second capture mesh whose bounds also contain the hit, authored after the first
+        stage = _build_capture_stage()
+        _author_quad(stage, _PROTOTYPE.AppendChild("mesh_overlay"), offset=Gf.Vec3f(2.0, 2.0, 0.0))
+        picked = _INSTANCE_1.AppendChild("mesh_overlay")
+        hit = SurfaceHit(path=picked, world_position=_INSTANCE_TRANSLATES[1])
+
+        # Act
+        target = targets.resolve_target(stage, hit, TargetMode.HIT_SURFACE, None)
+
+        # Assert
+        self.assertEqual(target.mesh_path, picked)
+        self.assertEqual(target.parent_instance_root, _INSTANCE_1)
+
     async def test_resolve_target_hit_surface_under_instance_uses_that_instance(self):
         # Arrange
         stage = _build_capture_stage()
@@ -558,6 +625,38 @@ class TestTargets(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(result, set())
+
+    async def test_selected_capture_meshes_maps_each_kind_of_selection_to_an_instance_side_mesh(self):
+        cases = [
+            ("instance", [str(_INSTANCE_1)], [_INSTANCE_1.AppendChild("mesh")]),
+            ("instance mesh", [f"{_INSTANCE_1}/mesh"], [_INSTANCE_1.AppendChild("mesh")]),
+            ("prototype", [str(_PROTOTYPE)], [_INSTANCE_0.AppendChild("mesh")]),
+            ("prototype mesh", [f"{_PROTOTYPE}/mesh"], [_INSTANCE_0.AppendChild("mesh")]),
+            ("outside the capture", ["/World/Other"], []),
+            ("one mesh twice", [str(_INSTANCE_0), f"{_INSTANCE_0}/mesh"], [_INSTANCE_0.AppendChild("mesh")]),
+        ]
+        for title, selected, expected in cases:
+            with self.subTest(title=title):
+                # Arrange
+                stage = _build_capture_stage(instance_indices=(0, 1))
+
+                # Act
+                result = targets.selected_capture_meshes(stage, selected)
+
+                # Assert
+                self.assertEqual(result, expected)
+                targets.reset_instance_index()
+
+    async def test_selected_capture_meshes_with_a_placement_selected_returns_the_surface_it_stands_on(self):
+        # Arrange
+        stage = _build_capture_stage(instance_indices=(0,), with_scatter=True)
+        placement = _PROTOTYPE.AppendChild(_CONTAINER_NAME).AppendChild(_PLACEMENT_NAME)
+
+        # Act
+        result = targets.selected_capture_meshes(stage, [str(placement)])
+
+        # Assert
+        self.assertEqual(result, [_INSTANCE_0.AppendChild("mesh")])
 
     async def test_build_prototype_target_uses_the_canonical_instance_for_geometry_and_transform(self):
         # Arrange

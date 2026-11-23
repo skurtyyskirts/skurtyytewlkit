@@ -23,17 +23,26 @@ import omni.kit.commands
 
 from . import commands as _commands
 from .controller import destroy_scatter_brush_controller, get_scatter_brush_controller
+from .preview import InstancerViewportPreview
+from .targets import reset_instance_index
 
 
 class ScatterCoreExtension(omni.ext.IExt):
-    """Registers the scatter commands and owns the brush controller singleton."""
+    """Registers the scatter commands, owns the brush controller singleton and the viewport stand-in of instanced
+    scatter in the StageCraft context."""
 
     def on_startup(self, ext_id: str):
         carb.log_info("[lightspeed.trex.scatter.core] Startup")
         omni.kit.commands.register_all_commands_in_module(_commands)
         get_scatter_brush_controller()
+        # The StageCraft context is the default one, which is where the toolkit viewport paints and shows scatter.
+        self._preview = InstancerViewportPreview("")
 
     def on_shutdown(self):
         carb.log_info("[lightspeed.trex.scatter.core] Shutdown")
+        if self._preview is not None:
+            self._preview.destroy()
+            self._preview = None
         destroy_scatter_brush_controller()
+        reset_instance_index()
         omni.kit.commands.unregister_module_commands(_commands)

@@ -21,21 +21,27 @@ __all__ = [
     "PlacementPool",
     "PlacementRecord",
     "PlacementTransform",
+    "SceneScatterCost",
     "asset_scale_factor",
     "author_placement_transforms",
     "author_placements",
     "container_path_for",
     "erase_candidates",
     "existing_placement_points",
+    "flood_sample_count",
     "generate_flood",
     "generate_stamp",
     "make_relative_asset_path",
     "new_placement_name",
     "placement_pool",
+    "prune_inert_overs",
     "remove_placements",
     "restore_prims",
+    "scene_scatter_cost",
     "snapshot_prims",
+    "to_world_points",
     "transform_key",
+    "within_radius",
 ]
 
 import hashlib
@@ -49,7 +55,7 @@ from typing import Any
 import carb
 import numpy as np
 import omni.client
-from lightspeed.common.constants import IS_REMIX_REF_ATTR
+from lightspeed.common.constants import IS_REMIX_REF_ATTR, ROOTNODE_MESHES
 from pxr import Gf, Sdf, Usd, UsdGeom, Vt
 
 from .constants import (
@@ -77,7 +83,7 @@ from .sampling import (
     up_axis_vector,
 )
 from .settings import EraseScope, ScaleMode, ScatterAssetEntry, ScatterBrushSettings, UpAxis
-from .targets import ScatterTarget
+from .targets import ScatterTarget, instance_count
 
 _LOG_PREFIX = "[lightspeed.trex.scatter.core]"
 _XFORM_TYPE_NAME = "Xform"
@@ -93,6 +99,13 @@ _PLACEMENT_KEY_LIMIT = 2**63
 _TRANSFORM_PACK_FORMAT = "<3d6f"
 # Tolerance on the cosine a surface angle is compared against, for the rounding of cos() at the limit itself.
 _ANGLE_COSINE_SLACK = 1e-12
+# Name of the field holding a prim spec's child prims, as ``Sdf.CopySpec`` hands it to its children callback.
+_PRIM_CHILDREN_FIELD = "primChildren"
+# Removing one child costs Sdf about 23 ns per sibling, and rebuilding a spec from the children it keeps costs about
+# 50 us per child kept (measured on USD 25.11). A spec is rebuilt once removing its children one by one would cost
+# several times that: (children removed x siblings) above this many per child kept. Rebuilding also makes the stage
+# compose the children it keeps again, which the margin leaves room for.
+_REBUILD_COST_RATIO = 8000
 
 
 @dataclass
@@ -297,14 +310,17 @@ class PlacementPool:
     this and takes them out as it erases them.
     """
 
-    def __init__(self, paths: list[Sdf.Path], positions: np.ndarray):
+    def __init__(self, paths: list[Sdf.Path], positions: np.ndarray, surface_positions: np.ndarray | None = None):
         """
         Args:
             paths: Placement paths.
             positions: ``(N, 3)`` world positions in the order of ``paths``.
+            surface_positions: ``(N, 3)`` world positions of the surface point each placement stands on, which a
+                vertical offset moves it away from; None when they are the positions themselves.
         """
         self._paths = paths
         self._positions = positions.reshape(-1, 3)
+        self._surface_positions = None if surface_positions is None else surface_positions.reshape(-1, 3)
         self._alive = np.ones(len(paths), dtype=bool)
 
     def __len__(self) -> int:
@@ -312,6 +328,9 @@ class PlacementPool:
 
     def take_within(self, center_world: Gf.Vec3d | Sequence[float], radius: float) -> list[Sdf.Path]:
         """Return the placements still in the pool within ``radius`` of a world point, and take them out of it.
+
+        A placement is in reach when either it or the surface point it stands on is: the brush sits on the surface,
+        so a placement raised or sunk by more than the radius would otherwise be out of reach of the brush under it.
 
         Args:
             center_world: World point to measure from.
@@ -323,8 +342,7 @@ class PlacementPool:
         if not self._paths:
             return []
         center = np.array([float(center_world[0]), float(center_world[1]), float(center_world[2])])
-        deltas = self._positions - center
-        within = self._alive & (np.einsum("ij,ij->i", deltas, deltas) <= radius * radius)
+        within = self._alive & within_radius(center, radius, self._positions, self._surface_positions)
         indices = np.flatnonzero(within)
         self._alive[indices] = False
         return [self._paths[index] for index in indices]
@@ -350,6 +368,7 @@ def placement_pool(
     wanted = {_normalized_url(path) for path in brush_asset_paths} if scope == EraseScope.BRUSH_ASSETS else None
     paths: list[Sdf.Path] = []
     positions: list[np.ndarray] = []
+    surface_positions: list[np.ndarray] = []
     for prim in _iter_placement_prims(stage, target.prototype_root):
         if wanted is not None:
             asset_path = _resolve_placement_asset(prim)
@@ -357,27 +376,124 @@ def placement_pool(
                 continue
         paths.append(prim.GetPath())
         positions.append(_placement_world_position(prim, target.parent_world))
-    stacked = np.vstack(positions) if positions else np.empty((0, 3), dtype=np.float64)
-    return PlacementPool(paths, stacked)
+        surface_positions.append(_placement_surface_position(prim, target.parent_world))
+    if not paths:
+        return PlacementPool(paths, np.empty((0, 3), dtype=np.float64))
+    return PlacementPool(paths, np.vstack(positions), np.vstack(surface_positions))
 
 
 def existing_placement_points(stage: Usd.Stage, target: ScatterTarget) -> np.ndarray:
-    """World positions of every placement authored under the scatter containers of ``target.prototype_root``.
+    """World surface points of every placement authored under the scatter containers of ``target.prototype_root``.
+
+    The point is where each placement was painted on the surface, which is what padding is measured between: a
+    vertical offset moves a placement off that point, so measuring from where it stands would let a stroke painted
+    over it ignore the padding by as much as the offset.
 
     Args:
         stage: Stage to inspect.
-        target: Target whose prototype is scanned and whose ``parent_world`` composes the local translations.
+        target: Target whose prototype is scanned and whose ``parent_world`` places the points.
 
     Returns:
         A ``(K, 3)`` float64 array, empty when no placement exists.
     """
     points = [
-        _placement_world_position(prim, target.parent_world)
+        _placement_surface_position(prim, target.parent_world)
         for prim in _iter_placement_prims(stage, target.prototype_root)
     ]
     if not points:
         return np.empty((0, 3), dtype=np.float64)
     return np.vstack(points)
+
+
+def within_radius(
+    center: np.ndarray, radius: float, positions: np.ndarray, surface_positions: np.ndarray | None = None
+) -> np.ndarray:
+    """Return which placements a brush of ``radius`` at ``center`` reaches.
+
+    Args:
+        center: ``(3,)`` world point the brush sits on.
+        radius: Brush radius.
+        positions: ``(N, 3)`` world positions of the placements.
+        surface_positions: ``(N, 3)`` world positions of the surface point each one stands on, or None.
+
+    Returns:
+        ``(N,)`` boolean mask; a placement is reached when it, or the surface point it stands on, is in the radius.
+    """
+    limit = radius * radius
+    deltas = positions - center
+    reached = np.einsum("ij,ij->i", deltas, deltas) <= limit
+    if surface_positions is not None:
+        deltas = surface_positions - center
+        reached |= np.einsum("ij,ij->i", deltas, deltas) <= limit
+    return reached
+
+
+def to_world_points(points: np.ndarray, parent_world: Gf.Matrix4d) -> np.ndarray:
+    """Return parent-space points as world points.
+
+    Args:
+        points: ``(N, 3)`` points in the space of the instance that parents them.
+        parent_world: Local-to-world transform of that instance.
+
+    Returns:
+        ``(N, 3)`` float64 world points.
+    """
+    matrix = np.array([[parent_world[row][column] for column in range(4)] for row in range(4)], dtype=np.float64)
+    return np.asarray(points, dtype=np.float64).reshape(-1, 3) @ matrix[:3, :3] + matrix[3, :3]
+
+
+@dataclass(frozen=True)
+class SceneScatterCost:
+    """What all the scatter painted on a stage costs.
+
+    Attributes:
+        placements: Placements authored under every prototype, loose or instanced.
+        rendered_prims: Prims they add to the rendered stage: a placement under a prototype renders once per instance
+            of its hash, and once when the hash has no instance.
+        prototypes: Prototypes holding at least one placement.
+        instanced: How many of the placements are instancer entries rather than prims of their own.
+    """
+
+    placements: int = 0
+    rendered_prims: int = 0
+    prototypes: int = 0
+    instanced: int = 0
+
+
+def scene_scatter_cost(stage: Usd.Stage | None) -> SceneScatterCost:
+    """Count every placement on the stage and the prims it renders, which no single stroke can see.
+
+    The brush reports what one stroke adds; this is what every stroke so far adds up to. Loose placements are counted
+    by name and instanced ones by the length of their instancer's positions, never by reading each placement, so it is
+    meant to be called when something was painted or undone, not every frame.
+
+    Args:
+        stage: Stage to inspect.
+
+    Returns:
+        The totals; all zero without a stage or a capture.
+    """
+    meshes = stage.GetPrimAtPath(ROOTNODE_MESHES) if stage is not None else None
+    if not meshes:
+        return SceneScatterCost()
+    placements = rendered_prims = prototypes = instanced = 0
+    for prototype in meshes.GetChildren():
+        count = 0
+        for child in prototype.GetChildren():
+            if not child.HasAttribute(IS_REMIX_SCATTER_ATTR):
+                continue
+            if child.IsA(UsdGeom.PointInstancer):
+                entries = len(UsdGeom.PointInstancer(child).GetPositionsAttr().Get() or ())
+                instanced += entries
+                count += entries
+            elif child.GetName().startswith(CONTAINER_PREFIX):
+                # Placements are told apart by the name the brush gives them, so nothing but names is read.
+                count += sum(1 for name in child.GetChildrenNames() if name.startswith(PLACEMENT_PREFIX))
+        if count:
+            prototypes += 1
+            placements += count
+            rendered_prims += count * max(instance_count(stage, prototype.GetPath()), 1)
+    return SceneScatterCost(placements, rendered_prims, prototypes, instanced)
 
 
 def generate_stamp(
@@ -392,12 +508,18 @@ def generate_stamp(
     stage_up: UpAxis,
     stage_meters_per_unit: float,
     layer: Sdf.Layer,
+    view_point: Gf.Vec3d | Sequence[float] | None = None,
 ) -> list[PlacementRecord]:
     """Generate the placements of one brush stamp centered on ``center``.
 
-    ``ceil(density)`` candidates are drawn in the brush disk, accepted against the falloff curve scaled by the brush
+    ``density`` candidates are drawn in the brush disk, accepted against the falloff curve scaled by the brush
     strength, projected back onto the capture mesh, filtered by surface angle and padding and finally turned into
-    parent-space records.
+    parent-space records. A fractional density draws its whole part and one more candidate with the probability of
+    its fraction, so 0.5 is a candidate every other stamp rather than one per stamp, as a flood already treats it.
+
+    Every normal is first turned to face the side the stroke is painted from. A captured mesh is often wound the other
+    way round, so its normals point into the surface; taken as they are, they would stand conformed assets upside
+    down under a floor and make every floor fail the surface angle limit.
 
     Args:
         cache: Mesh cache used to project candidates onto ``target.mesh_path``.
@@ -411,11 +533,17 @@ def generate_stamp(
         stage_up: Up axis of the stage.
         stage_meters_per_unit: Meters per stage unit, used to convert each asset's own size into stage units.
         layer: Layer the placements will be authored in (used to relativize asset paths).
+        view_point: World point the stroke is seen from, normally the camera. None turns the normals toward the stage
+            up axis instead, which is right for ground and wrong only for a ceiling.
 
     Returns:
         The placement records of the stamp, possibly empty.
     """
-    count = math.ceil(settings.density)
+    count = int(settings.density)
+    fraction = settings.density - count
+    # Drawn only for a fractional density, so a whole one keeps the random stream, and the strokes, it always had.
+    if fraction > 0.0 and rng.random() < fraction:
+        count += 1
     if count <= 0:
         return []
     disk = sample_disk(rng, count)
@@ -424,14 +552,19 @@ def generate_stamp(
     accepted = rng.random(count) < weights * settings.strength
     if not np.any(accepted):
         return []
-    tangent, bitangent = tangent_basis(np.asarray(center.normal, dtype=np.float64), _as_array(heading_world))
-    offsets = disk[accepted] * settings.radius
-    candidates = (
-        np.asarray(center.position, dtype=np.float64)[None, :]
-        + offsets[:, :1] * tangent[None, :]
-        + offsets[:, 1:] * bitangent[None, :]
+    center_position = np.asarray(center.position, dtype=np.float64)
+    facing = (
+        np.asarray(up_axis_vector(stage_up), dtype=np.float64)
+        if view_point is None
+        else np.asarray(view_point, dtype=np.float64) - center_position
     )
+    center_normal = _face_towards(np.asarray(center.normal, dtype=np.float64)[None, :], facing)[0]
+    tangent, bitangent = tangent_basis(center_normal, _as_array(heading_world))
+    offsets = disk[accepted] * settings.radius
+    candidates = center_position[None, :] + offsets[:, :1] * tangent[None, :] + offsets[:, 1:] * bitangent[None, :]
     positions, normals, valid = cache.closest_points(target.mesh_path, candidates, settings.radius)
+    # Each candidate faces the same side as the centre, which the camera sees; the mesh's own winding cannot say.
+    normals = _face_towards(normals, center_normal)
     # Measured from the stage up axis rather than from the surface under the cursor: the cursor itself often lands on
     # a bevel or a slope beside a floor, and measured from there, blades on that slope would all count as in range.
     valid &= _within_surface_angle(normals, up_axis_vector(stage_up), settings.max_surface_angle)
@@ -449,6 +582,27 @@ def generate_stamp(
         stage_meters_per_unit,
         layer,
     )
+
+
+def flood_sample_count(cache: MeshSurfaceCache, target: ScatterTarget, settings: ScatterBrushSettings) -> int:
+    """Return how many samples a flood draws to cover a target at the brush density, before any cap.
+
+    The count is ``density`` per brush-disk area scaled to the area of the mesh, so a flood is as dense as a surface
+    stamped all over would be.
+
+    Args:
+        cache: Mesh cache providing the geometry of ``target.mesh_path``.
+        target: Resolved scatter target.
+        settings: Brush settings providing the density and the radius.
+
+    Returns:
+        At least 1 for a mesh with a surface, and 0 for one without.
+    """
+    geometry = cache.get(target.mesh_path)
+    if geometry is None or geometry.triangle_count == 0 or geometry.area <= 0.0:
+        return 0
+    disk_area = math.pi * settings.radius * settings.radius
+    return max(1, math.ceil(settings.density * geometry.area / disk_area))
 
 
 def generate_flood(
@@ -485,14 +639,14 @@ def generate_flood(
     """
     if max_count <= 0:
         return []
-    geometry = cache.get(target.mesh_path)
-    if geometry is None or geometry.triangle_count == 0 or geometry.area <= 0.0:
+    wanted = flood_sample_count(cache, target, settings)
+    if not wanted:
         return []
-    disk_area = math.pi * settings.radius * settings.radius
-    estimated = math.ceil(settings.density * geometry.area / disk_area)
-    count = max(1, min(max_count, estimated))
-    positions, normals = area_weighted_triangle_samples(rng, geometry, count)
-    valid = _within_surface_angle(normals, up_axis_vector(stage_up), settings.max_surface_angle)
+    positions, normals = area_weighted_triangle_samples(rng, cache.get(target.mesh_path), min(max_count, wanted))
+    # A flood has no camera to say which side of the mesh is painted, so it paints the side facing up.
+    up = up_axis_vector(stage_up)
+    normals = _face_towards(normals, np.asarray(up, dtype=np.float64))
+    valid = _within_surface_angle(normals, up, settings.max_surface_angle)
     return _build_records(
         positions,
         normals,
@@ -558,15 +712,22 @@ def author_placements(
         The paths of the prims that were created.
     """
     created: list[str] = []
+    container_paths: dict[str, Sdf.Path] = {}
     with Sdf.ChangeBlock():
         for record in records:
             if not Sdf.Path.IsValidIdentifier(record.prim_name):
                 carb.log_warn(f"{_LOG_PREFIX} Skipping scatter placement with invalid prim name '{record.prim_name}'")
                 continue
-            container = _ensure_container_spec(layer, Sdf.Path(record.container_path), record.brush_id)
-            if record.prim_name in container.nameChildren:
+            container_path = container_paths.get(record.container_path)
+            if container_path is None:
+                container_path = _ensure_container_spec(layer, Sdf.Path(record.container_path), record.brush_id).path
+                container_paths[record.container_path] = container_path
+            path = container_path.AppendChild(record.prim_name)
+            # Asked of the layer, which looks a path up directly. Asking the container's children instead scans
+            # every one of them, once per placement, which costs more than authoring the placement does.
+            if layer.GetPrimAtPath(path) is not None:
                 continue
-            spec = Sdf.CreatePrimInLayer(layer, container.path.AppendChild(record.prim_name))
+            spec = Sdf.CreatePrimInLayer(layer, path)
             spec.specifier = Sdf.SpecifierDef
             spec.typeName = _XFORM_TYPE_NAME
             spec.referenceList.prependedItems = [Sdf.Reference(assetPath=record.asset_rel_path)]
@@ -697,7 +858,12 @@ def remove_placements(layer: Sdf.Layer, prim_paths: Sequence[str], remove_empty_
 
     A container whose every child is being removed is deleted in one edit rather than child by child. Sdf removes a
     child by searching and rewriting its parent's list of children, so deleting a large stroke one child at a time
-    costs time proportional to the stroke times the container, which is seconds for a stroke of thousands.
+    costs time proportional to the stroke times the container, which is seconds for a stroke of thousands. A
+    container that keeps some children is rebuilt from those when that is the cheaper of the two, which is what a
+    stroke merged into its instancer needs: the stroke painted after it shares its container.
+
+    A container that is removed takes with it every ancestor it leaves as an ``over`` holding nothing, so painting
+    on a mesh the layer never touched and undoing it leaves the layer as it was.
 
     Args:
         layer: Layer to edit.
@@ -711,12 +877,38 @@ def remove_placements(layer: Sdf.Layer, prim_paths: Sequence[str], remove_empty_
                 continue
             if remove_empty_containers and _is_removable_container(parent) and _covers_children(parent, names):
                 _delete_spec(layer, parent)
+                prune_inert_overs(layer, parent_path.GetParentPath())
                 continue
-            for name in names:
-                if name in parent.nameChildren:
-                    del parent.nameChildren[name]
-            if remove_empty_containers and _is_removable_container(parent) and len(parent.nameChildren) == 0:
-                _delete_spec(layer, parent)
+            present = [
+                name for name in dict.fromkeys(names) if layer.GetPrimAtPath(parent_path.AppendChild(name)) is not None
+            ]
+            children = parent.nameChildren
+            child_count = len(children)
+            survivors = child_count - len(present)
+            if survivors and len(present) * (child_count - len(present) / 2) > _REBUILD_COST_RATIO * survivors:
+                _rebuild_without(layer, parent, present)
+                continue
+            for name in present:
+                del children[name]
+
+
+def prune_inert_overs(layer: Sdf.Layer, path: Sdf.Path) -> None:
+    """Delete the spec at ``path``, then each ancestor in turn, for as long as it is an ``over`` that holds nothing.
+
+    ``Sdf.CreatePrimInLayer`` creates every missing ancestor of the scatter it authors as such an over, and nothing
+    removes them again when the scatter goes. They change nothing on the stage, but they stay in the saved layer and
+    make a mesh the mod never changed look like one it overrides.
+
+    Args:
+        layer: Layer to edit.
+        path: Path to start at, normally the prototype a removed container or instancer was a child of.
+    """
+    while not path.IsAbsoluteRootPath():
+        spec = layer.GetPrimAtPath(path)
+        if spec is None or spec.specifier != Sdf.SpecifierOver or not spec.IsInert():
+            return
+        _delete_spec(layer, spec)
+        path = path.GetParentPath()
 
 
 def snapshot_prims(layer: Sdf.Layer, prim_paths: Sequence[str], into: Sdf.Layer | None = None) -> Sdf.Layer:
@@ -803,6 +995,21 @@ def asset_scale_factor(
     return 1.0 / height if height > _MIN_NATURAL_HEIGHT else None
 
 
+def _face_towards(normals: np.ndarray, direction: np.ndarray) -> np.ndarray:
+    """Return the normals, each flipped when it points away from ``direction``.
+
+    Args:
+        normals: (N, 3) unit normals.
+        direction: Direction the normals should face; it need not be normalized.
+
+    Returns:
+        A new (N, 3) array. A normal perpendicular to ``direction`` is left as it is, having no side to choose.
+    """
+    normals = np.asarray(normals, dtype=np.float64)
+    away = normals @ np.asarray(direction, dtype=np.float64) < 0.0
+    return np.where(away[:, None], -normals, normals)
+
+
 def _within_surface_angle(normals: np.ndarray, reference, max_angle: float) -> np.ndarray:
     """Return which unit normals turn no more than ``max_angle`` degrees away from ``reference``.
 
@@ -862,6 +1069,20 @@ def _placement_world_position(prim: Usd.Prim, parent_world: Gf.Matrix4d) -> np.n
     """Return the world position of a placement: its local translation composed with ``parent_world``."""
     local = UsdGeom.Xformable(prim).GetLocalTransformation().ExtractTranslation()
     world = parent_world.Transform(local)
+    return np.array([world[0], world[1], world[2]], dtype=np.float64)
+
+
+def _placement_surface_position(prim: Usd.Prim, parent_world: Gf.Matrix4d) -> np.ndarray:
+    """Return the world position of the surface point a placement stands on.
+
+    That is the point it recorded when it was painted, which a move keeps current. A placement that recorded none,
+    because it was painted before the brush recorded surfaces, counts as standing where it is.
+    """
+    attribute = prim.GetAttribute(SCATTER_ORIGIN_ATTR)
+    origin = attribute.Get() if attribute else None
+    if origin is None or len(origin) < 3:
+        return _placement_world_position(prim, parent_world)
+    world = parent_world.Transform(Gf.Vec3d(origin[0], origin[1], origin[2]))
     return np.array([world[0], world[1], world[2]], dtype=np.float64)
 
 
@@ -1019,6 +1240,37 @@ def _delete_spec(layer: Sdf.Layer, spec: Sdf.PrimSpec) -> None:
     """Delete one prim spec, with everything beneath it, from its parent."""
     parent = spec.nameParent or layer.pseudoRoot
     del parent.nameChildren[spec.name]
+
+
+def _rebuild_without(layer: Sdf.Layer, spec: Sdf.PrimSpec, names: Sequence[str]) -> None:
+    """Remove the children ``names`` of a spec by copying it out with the children it keeps, and back.
+
+    The copy, the removal of the whole spec and the copy back are each one edit, so the cost follows the children
+    kept rather than the children removed times their siblings. Everything else the spec holds is copied with it.
+
+    Args:
+        layer: Layer holding the spec.
+        spec: Spec to remove children from; the handle is expired afterwards, because the spec is a new one.
+        names: Names of the children to remove.
+    """
+    path = spec.path
+    dropped = set(names)
+
+    def copy_every_value(*_args) -> bool:
+        return True
+
+    def keep_children(children_field, source, source_path, *_args) -> bool | tuple[bool, list[str], list[str]]:
+        if source_path != path or children_field != _PRIM_CHILDREN_FIELD:
+            return True
+        # keys(): iterating an Sdf children view yields the child specs, not their names.
+        kept = [name for name in source.GetPrimAtPath(path).nameChildren.keys() if name not in dropped]  # noqa: SIM118
+        return True, kept, kept
+
+    scratch = Sdf.Layer.CreateAnonymous("scatter_rebuild")
+    Sdf.CreatePrimInLayer(scratch, path.GetParentPath())
+    Sdf.CopySpec(layer, path, scratch, path, copy_every_value, keep_children)
+    _delete_spec(layer, spec)
+    Sdf.CopySpec(scratch, path, layer, path)
 
 
 def _copy_spec(src_layer: Sdf.Layer, dst_layer: Sdf.Layer, path: Sdf.Path) -> None:

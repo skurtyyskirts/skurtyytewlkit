@@ -399,7 +399,10 @@ class ScatterAssetDelegate(ui.AbstractItemDelegate):
                 case 3:
                     ui.ComboBox(
                         item.up_axis_model,
-                        tooltip="Up axis authored in the asset file; placements are uprighted on the stage",
+                        tooltip=(
+                            "Axis the asset was modelled standing along. Match the asset file and the asset stands "
+                            "straight up. Same setting as Placement > Asset Up Axis"
+                        ),
                         identifier=f"{identifier_prefix}_up_axis",
                     )
                 case 4:

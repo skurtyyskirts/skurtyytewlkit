@@ -162,6 +162,26 @@ class TestCpuRaySurfacePicker(AsyncTestCase):
         self.assertEqual(hit.path, Sdf.Path(f"{_INSTANCE_ROOT}/upper_floor"))
         _assert_vec3_close(self, hit.world_position, (0.0, 0.0, 0.0))
 
+    async def test_pick_through_scattered_placement_skips_it_and_hits_the_floor_beneath(self):
+        # Arrange - a painted placement standing over the floor, between it and the camera
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.Xform.Define(stage, _INSTANCE_ROOT)
+        _define_floor(stage, _FLOOR_PATH)
+        placement = UsdGeom.Xform.Define(stage, f"{_INSTANCE_ROOT}/scatter_default/s_0123456789ab").GetPrim()
+        placement.CreateAttribute(constants.IS_REMIX_SCATTER_ATTR, Sdf.ValueTypeNames.Bool, custom=True).Set(True)
+        _define_floor(stage, f"{placement.GetPath()}/blade", height=5.0)
+        viewport_api = _make_viewport(stage)
+        picker = picking.CpuRaySurfacePicker(viewport_api, self._make_cache(stage))
+        callback = mock.Mock()
+
+        # Act
+        picker.pick((0.0, 0.0), callback)
+
+        # Assert
+        hit = callback.call_args.args[0]
+        self.assertEqual(hit.path, Sdf.Path(_FLOOR_PATH))
+        _assert_vec3_close(self, hit.world_position, (0.0, 0.0, 0.0))
+
     async def test_pick_without_any_mesh_calls_callback_with_none(self):
         # Arrange
         stage = Usd.Stage.CreateInMemory()

@@ -26,6 +26,7 @@ import omni.usd
 from lightspeed.trex.scatter.core import reapply as reapply_module
 from lightspeed.trex.scatter.core.constants import CONTAINER_PREFIX, SCATTER_ORIGIN_ATTR, SCATTER_TRANSFORM_KEY_ATTR
 from lightspeed.trex.scatter.core.geometry import MeshSurfaceCache
+from lightspeed.trex.scatter.core.instancing import is_scatter_instancer, merge_loose_placements
 from lightspeed.trex.scatter.core.placement import (
     PlacementTransform,
     author_placement_transforms,
@@ -47,7 +48,7 @@ from lightspeed.trex.scatter.core.reapply import (
     scope_of_placements,
 )
 from lightspeed.trex.scatter.core.sampling import PaddingIndex, ParentSpaceOrigin, placement_rng
-from lightspeed.trex.scatter.core.settings import ScatterAssetEntry, ScatterBrushSettings, UpAxis
+from lightspeed.trex.scatter.core.settings import ApplyTo, ScatterAssetEntry, ScatterBrushSettings, UpAxis
 from lightspeed.trex.scatter.core.targets import ScatterTarget
 from pxr import Gf, Sdf, Usd, UsdGeom
 
@@ -63,8 +64,14 @@ _HALF_SIZE = 500.0
 
 
 def _settings(**overrides) -> ScatterBrushSettings:
-    """Brush settings with the randomness pinned, so a test can change one thing at a time."""
+    """Brush settings with the randomness pinned, so a test can change one thing at a time.
+
+    Painted on every mesh and conformed to it, so a selected mesh is a live-edit scope and the recorded normal shapes
+    the placement; the Selected mode cases override ``apply_to`` themselves.
+    """
     values = {
+        "apply_to": ApplyTo.ALL,
+        "conform_to_surface": True,
         "preset_name": "Grass",
         "radius": 50.0,
         "density": 6.0,
@@ -226,6 +233,19 @@ class TestResolveScope(_ScatterStageTestCase):
         # Assert
         self.assertEqual([str(path) for path in scope.entries[0].placement_paths], sorted(self.glass))
 
+    async def test_selecting_instanced_scatter_scopes_to_nothing_rather_than_the_preset_container(self):
+        # Arrange
+        layer = self.stage.GetRootLayer()
+        merge_loose_placements(layer, self.stage, prototype_roots=[_PROTOTYPE_ROOT], exclude=self.glass)
+        instancer = f"{_PROTOTYPE_ROOT}/instanced_grass"
+
+        # Act
+        scope = resolve_scope(self.stage, _usd_context([instancer]), _settings(preset_name="Glass"))
+
+        # Assert
+        self.assertTrue(is_scatter_instancer(self.stage.GetPrimAtPath(instancer)))
+        self.assertTrue(scope.is_empty)
+
     async def test_selecting_one_placement_scopes_to_that_placement_only(self):
         # Arrange
         selected = self.grass[0]
@@ -265,6 +285,28 @@ class TestResolveScope(_ScatterStageTestCase):
 
         # Assert
         self.assertTrue(scope.is_empty)
+
+    async def test_selecting_a_mesh_while_painting_on_the_selection_yields_an_empty_scope(self):
+        # The selected mesh is where the next stroke goes, so editing everything already on it would make every
+        # setting changed between two strokes rewrite the whole field.
+        # Arrange
+        settings = _settings(apply_to=ApplyTo.SELECTED)
+
+        # Act
+        scope = resolve_scope(self.stage, _usd_context([_INSTANCE_ROOT]), settings)
+
+        # Assert
+        self.assertTrue(scope.is_empty)
+
+    async def test_selecting_a_container_while_painting_on_the_selection_scopes_to_its_placements(self):
+        # Arrange
+        settings = _settings(apply_to=ApplyTo.SELECTED)
+
+        # Act
+        scope = resolve_scope(self.stage, _usd_context([_GLASS_CONTAINER]), settings)
+
+        # Assert
+        self.assertEqual([str(path) for path in scope.entries[0].placement_paths], sorted(self.glass))
 
     async def test_selecting_a_mesh_with_no_container_for_the_preset_yields_an_empty_scope(self):
         # Arrange
@@ -519,7 +561,7 @@ class TestReapplyHelpers(omni.kit.test.AsyncTestCase):
 
     async def test_transform_key_matches_after_the_transform_is_read_back_from_a_layer(self):
         # Arrange
-        translate, rotate, scale = (1.25, -2.5, 3.75), (10.1, 20.2, 30.3), (1.1, 2.2, 3.3)
+        translate, rotate, scale = ((1.25, -2.5, 3.75), (10.1, 20.2, 30.3), (1.1, 2.2, 3.3))
         stage = Usd.Stage.CreateInMemory()
         placement = UsdGeom.Xform.Define(stage, "/Placement")
         placement.AddTranslateOp().Set(Gf.Vec3d(*translate))
@@ -819,12 +861,80 @@ class TestReapplyDriver(_ScatterStageTestCase):
         self.brush.settings = self.brush.settings.model_copy(update=updates)
         self.brush.subscribe_settings_changed.call_args.args[0](self.brush.settings)
 
+    def change_asset(self, **updates) -> None:
+        """Change the palette's one asset and tell the driver, as the controller does."""
+        self.brush.assets = [self.brush.assets[0].model_copy(update=updates)]
+        self.brush.subscribe_assets_changed.call_args.args[0](self.brush.assets)
+
     def preview(self, paths: list[str], container_name: str = f"{CONTAINER_PREFIX}grass") -> ReapplyScope:
         """Make the controller report a stroke preview over the given placements and let the driver follow it."""
         scope = _scope_of(sorted(paths), container_name)
         self.brush.preview_scope.return_value = scope
         self.driver.refresh_scope()
         return scope
+
+    async def test_follow_settings_called_again_with_the_same_settings_changes_nothing_more(self):
+        # Arrange - the Scatter window calls it as well as the controller, in whichever order the two are notified
+        self.change_settings(size_min=40.0, size_max=40.0)
+        authored = [self.authored(path) for path in self.grass]
+
+        # Act
+        with mock.patch.object(reapply_module, "author_placement_transforms") as author:
+            self.driver.follow_settings(self.brush.settings)
+
+        # Assert
+        author.assert_not_called()
+        self.assertEqual([self.authored(path) for path in self.grass], authored)
+        self.assertTrue(self.driver.active)
+
+    async def test_edit_finished_after_follow_settings_commits_a_change_the_controller_has_not_notified_yet(self):
+        # Arrange - the window's handler ran first: it follows the change itself before finishing the edit
+        self.brush.settings = self.brush.settings.model_copy(update={"size_min": 40.0, "size_max": 40.0})
+        self.driver.follow_settings(self.brush.settings)
+
+        # Act
+        self.driver.edit_finished()
+
+        # Assert
+        self.execute.assert_called_once()
+        self.assertEqual(self.execute.call_args.args[0], "ScatterReapplyCommand")
+        self.assertFalse(self.driver.active)
+
+    async def test_an_asset_up_axis_change_recomposes_the_scope_and_commits_it_as_one_command(self):
+        # Arrange
+        original = [self.authored(path) for path in self.grass]
+
+        # Act
+        self.change_asset(up_axis=UpAxis.Y)
+
+        # Assert - no control reports the end of a palette edit, so the change has to commit itself
+        self.assertNotEqual([self.authored(path) for path in self.grass], original)
+        self.execute.assert_called_once()
+        self.assertEqual(self.execute.call_args.args[0], "ScatterReapplyCommand")
+        self.assertFalse(self.driver.active)
+
+    async def test_an_asset_change_no_placement_can_follow_opens_no_edit(self):
+        # Arrange
+        original = [self.authored(path) for path in self.grass]
+
+        # Act
+        self.change_asset(weight=9.0)
+
+        # Assert
+        self.assertEqual([self.authored(path) for path in self.grass], original)
+        self.execute.assert_not_called()
+        self.assertFalse(self.driver.active)
+
+    async def test_an_asset_change_during_a_held_edit_stays_part_of_that_edit(self):
+        # Arrange - a gizmo drag holds the edit open
+        self.driver.hold()
+
+        # Act
+        self.change_asset(up_axis=UpAxis.Y)
+
+        # Assert
+        self.execute.assert_not_called()
+        self.assertTrue(self.driver.active)
 
     async def test_hold_keeps_edit_finished_from_committing_the_open_edit(self):
         # Arrange
@@ -950,6 +1060,17 @@ class TestReapplyDriver(_ScatterStageTestCase):
         # Assert
         self.assertFalse(self.driver.previewing)
         self.assertEqual([str(path) for path in self.driver.scope.entries[0].placement_paths], sorted(self.grass))
+
+    async def test_switching_to_paint_on_the_selection_drops_a_selected_mesh_from_the_scope(self):
+        # Arrange
+        self.usd_context.get_selection.return_value.get_selected_prim_paths.return_value = [_INSTANCE_ROOT]
+        self.driver.refresh_scope()
+
+        # Act
+        self.change_settings(apply_to=ApplyTo.SELECTED)
+
+        # Assert
+        self.assertTrue(self.driver.scope.is_empty)
 
     async def test_a_preview_change_commits_the_edit_opened_on_the_old_scope(self):
         # Arrange

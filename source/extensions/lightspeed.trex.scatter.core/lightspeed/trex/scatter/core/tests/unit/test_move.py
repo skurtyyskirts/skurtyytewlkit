@@ -18,6 +18,7 @@
 import contextlib
 from unittest import mock
 
+import numpy as np
 import omni.kit.test
 from lightspeed.trex.scatter.core import move as move_module
 from lightspeed.trex.scatter.core.constants import (
@@ -328,6 +329,26 @@ class TestMoveScope(_MoveTestCase):
         # Assert
         self.assertEqual(outcome.recovered, 1)
         self.assertEqual(len(self.attribute(legacy, SCATTER_ORIGIN_ATTR)), 6)
+
+    async def test_dragging_a_placement_no_surface_can_be_found_for_on_a_y_up_stage_stands_it_on_the_y_axis(self):
+        # Arrange - no surface recorded and none in reach, so the stage up axis stands in for the surface normal
+        UsdGeom.SetStageUpAxis(self.stage, UsdGeom.Tokens.y)
+        legacy = self.grass[0]
+        spec = self.layer.GetPrimAtPath(Sdf.Path(legacy))
+        spec.RemoveProperty(spec.attributes[SCATTER_ORIGIN_ATTR])
+        cache = mock.Mock()
+        cache.get.return_value = None
+        cache.closest_point.return_value = None
+        cache.closest_points.return_value = (np.zeros((1, 3)), np.zeros((1, 3)), np.zeros(1, dtype=bool))
+
+        # Act
+        _before, after, outcome = move_scope(
+            self.stage, self.layer, _scope_of([legacy]), _translate(30.0, 0.0, 0.0), cache
+        )
+
+        # Assert
+        self.assertEqual(outcome.unsettled, 1)
+        np.testing.assert_allclose(after[0].origin[3:6], [0.0, 1.0, 0.0], atol=1e-12)
 
     async def test_undoing_a_drag_restores_the_transform_the_surface_and_the_turn_together(self):
         # Arrange

@@ -15,9 +15,17 @@
 * limitations under the License.
 """
 
-__all__ = ["PresetsWidget", "ScatterAssetListWidget", "ScatterPane", "ScatterWindow", "TrexScatterWindowExtension"]
+__all__ = [
+    "AssetUpAxisWidget",
+    "PresetsWidget",
+    "ScatterAssetListWidget",
+    "ScatterPane",
+    "ScatterWindow",
+    "TrexScatterWindowExtension",
+]
 
 from .asset_list import ScatterAssetListWidget
+from .asset_up_axis import AssetUpAxisWidget
 from .extension import TrexScatterWindowExtension
 from .presets_ui import PresetsWidget
 from .setup_ui import ScatterPane

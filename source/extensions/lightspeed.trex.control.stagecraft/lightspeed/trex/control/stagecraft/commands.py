@@ -24,6 +24,22 @@ from lightspeed.trex.capture.core.shared import Setup as _CaptureCoreSetup
 from pxr import UsdUtils
 
 
+def get_lighting_mode_setting_key(usd_context: omni.usd.UsdContext) -> str:
+    """Return the setting key under which the viewport Lighting menu stores the lighting mode of a context's stage.
+
+    Args:
+        usd_context: The USD context whose current stage the key belongs to.
+
+    Returns:
+        The per-stage lighting-mode setting path.
+    """
+    stage_id = 0
+    stage = usd_context.get_stage() if usd_context else None
+    if stage:
+        stage_id = UsdUtils.StageCache.Get().GetId(stage).ToLongInt()
+    return f"/exts/omni.kit.viewport.menubar.lighting/lightingMode/{stage_id}"
+
+
 class SwitchCaptureCommand(omni.kit.commands.Command):
     """Switch the active capture and preserve any active non-stage lighting mode as one undo item."""
 
@@ -39,19 +55,9 @@ class SwitchCaptureCommand(omni.kit.commands.Command):
         )
 
     @staticmethod
-    def _make_lighting_mode_setting_key(usd_context: omni.usd.UsdContext) -> str:
-        stage_id = 0
-        stage = usd_context.get_stage() if usd_context else None
-        if stage:
-            stage_id = UsdUtils.StageCache.Get().GetId(stage).ToLongInt()
-        return f"/exts/omni.kit.viewport.menubar.lighting/lightingMode/{stage_id}"
-
-    @staticmethod
     def _get_current_lighting_mode(usd_context: omni.usd.UsdContext) -> str:
         settings = carb.settings.get_settings()
-        return settings.get(SwitchCaptureCommand._make_lighting_mode_setting_key(usd_context)) or (
-            SwitchCaptureCommand._DEFAULT_LIGHTING_MODE
-        )
+        return settings.get(get_lighting_mode_setting_key(usd_context)) or (SwitchCaptureCommand._DEFAULT_LIGHTING_MODE)
 
     def _apply(self, capture_identifier: str):
         usd_context = omni.usd.get_context(self._context_name)
@@ -67,7 +73,7 @@ class SwitchCaptureCommand(omni.kit.commands.Command):
         # Skip the dispatch when there is nothing meaningful to set.
         if lighting_mode and lighting_mode != self._DEFAULT_LIGHTING_MODE:
             with omni.kit.undo.disabled():
-                carb.settings.get_settings().set(self._make_lighting_mode_setting_key(usd_context), "")
+                carb.settings.get_settings().set(get_lighting_mode_setting_key(usd_context), "")
                 omni.kit.commands.execute(
                     "SetLightingMenuModeCommand",
                     lighting_mode=lighting_mode,

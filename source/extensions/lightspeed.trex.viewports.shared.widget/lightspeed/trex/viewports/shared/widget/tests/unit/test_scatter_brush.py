@@ -18,6 +18,7 @@
 __all__ = ["TestBrushCursorMatrix", "TestScatterBrushButtonGroup", "TestScatterBrushTool"]
 
 import contextlib
+import itertools
 import math
 import pathlib
 import tempfile
@@ -40,11 +41,16 @@ from lightspeed.trex.scatter.core import (
     ScatterMode,
     SurfaceHit,
     UpAxis,
-    destroy_scatter_brush_controller,
-    get_scatter_brush_controller,
-    tangent_basis,
 )
 from lightspeed.trex.scatter.core import controller as controller_module
+from lightspeed.trex.scatter.core import (
+    destroy_scatter_brush_controller,
+    get_scatter_brush_controller,
+)
+from lightspeed.trex.scatter.core import stroke as stroke_module
+from lightspeed.trex.scatter.core import (
+    tangent_basis,
+)
 from lightspeed.trex.scatter.core.constants import CONTAINER_PREFIX
 from lightspeed.trex.viewports.shared.widget.scene.utils import flatten_matrix
 from lightspeed.trex.viewports.shared.widget.tools import scatter_brush as scatter_brush_module
@@ -69,6 +75,8 @@ _CONTAINER_PATH = _PROTOTYPE.AppendChild(f"{CONTAINER_PREFIX}default")
 _HALF_SIZE = 500.0
 _HIT_POSITION = Gf.Vec3d(5.0, 5.0, 0.0)
 _RADIUS = 50.0
+# Far enough from the hit that walking to it takes several stamps at the default spacing.
+_FAR_POSITION = Gf.Vec3d(205.0, 5.0, 0.0)
 _ASSET_USDA = """#usda 1.0
 (
     defaultPrim = "Root"
@@ -152,6 +160,12 @@ class _FakePicker:
     def cancel(self) -> None:
         self.cancel_calls += 1
         self._pending = None
+
+
+def _clock_out_of_time_after(reads: int):
+    """Return a stroke clock that stays at 0 for ``reads`` reads and then has passed every time budget."""
+    remaining = iter(range(reads))
+    return lambda: 0.0 if next(remaining, None) is not None else 1.0
 
 
 def _patch_brush_persistence(enter) -> None:
@@ -318,6 +332,8 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
         _build_capture_stage(self._stage)
 
         self._controller = get_scatter_brush_controller()
+        # Painting on whatever the picker reports, so a test only has to script the picker; the Selected mode cases
+        # select a mesh and switch the setting themselves.
         self._controller.replace_settings(
             ScatterBrushSettings(
                 radius=_RADIUS,
@@ -327,6 +343,7 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
                 falloff=Falloff.CONSTANT,
                 randomize_seed=False,
                 seed=3,
+                apply_to=ApplyTo.ALL,
             )
         )
         self._controller.add_asset(self._asset_path, up_axis=UpAxis.Z)
@@ -577,6 +594,29 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(self._tool._cursor_color, scatter_brush_module._ERASE_COLOR)
 
+    async def test_on_update_when_shift_is_pressed_with_the_mouse_at_rest_colours_cursor_red(self):
+        # Arrange
+        self._hover()
+        self._keys_down = {carb.input.KeyboardInput.LEFT_SHIFT}
+
+        # Act
+        self._tool._on_update(None)
+
+        # Assert
+        self.assertEqual(self._tool._cursor_color, scatter_brush_module._ERASE_COLOR)
+
+    async def test_on_update_when_shift_is_released_with_the_mouse_at_rest_colours_cursor_green_again(self):
+        # Arrange
+        self._keys_down = {carb.input.KeyboardInput.LEFT_SHIFT}
+        self._hover()
+        self._keys_down = set()
+
+        # Act
+        self._tool._on_update(None)
+
+        # Assert
+        self.assertEqual(self._tool._cursor_color, scatter_brush_module._PAINT_COLOR)
+
     async def test_on_hit_apply_to_selected_without_selection_shows_grey_cursor_and_no_hover(self):
         # Arrange
         self._controller.update_settings(apply_to=ApplyTo.SELECTED)
@@ -590,6 +630,91 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
         self.assertTrue(self._tool._cursor.visible)
         self.assertEqual(self._tool._cursor_color, scatter_brush_module._NOT_APPLICABLE_COLOR)
         self.assertIsNone(self._tool._last_hover)
+
+    def _paint_on_selection(self) -> None:
+        """Select the capture instance and switch the brush to painting on the selection only."""
+        self._usd_context.get_selection().set_selected_prim_paths([str(_INSTANCE_0)], False)
+        self._controller.update_settings(apply_to=ApplyTo.SELECTED)
+
+    async def test_on_update_apply_to_selected_paints_the_selected_mesh_through_whatever_is_in_front(self):
+        # Arrange - the picker reports a prop standing in front of the ground
+        self._paint_on_selection()
+        self._picker.hit = SurfaceHit(Sdf.Path("/World/FoliageCard"), Gf.Vec3d(0.0, 0.0, -0.5))
+
+        # Act
+        self._hover((0.25, -0.5))
+
+        # Assert
+        self.assertEqual(self._picker.picks, [])
+        self.assertEqual(self._tool._cursor_color, scatter_brush_module._PAINT_COLOR)
+        hit, target, _sample = self._tool._last_hover
+        self.assertEqual(target.mesh_path, _MESH_PATH)
+        self.assertTrue(Gf.IsClose(hit.world_position, Gf.Vec3d(0.25, -0.5, 0.0), 1e-6))
+
+    async def test_on_update_apply_to_selected_drops_a_pick_still_in_flight(self):
+        # Arrange - a slower renderer pick must not move the cursor back onto what stands in front
+        self._picker.deliver_immediately = False
+        self._hover((0.1, 0.1))
+        self._paint_on_selection()
+        self._ndc = (0.2, 0.2)
+
+        # Act
+        self._tool._on_update(None)
+
+        # Assert
+        self.assertFalse(self._picker.in_flight)
+        self.assertEqual(self._picker.cancel_calls, 1)
+
+    async def test_on_update_apply_to_selected_off_the_selected_mesh_falls_back_to_the_picker(self):
+        # Arrange - the camera ray passes beside the quad, so the picker decides what the grey cursor sits on
+        self._paint_on_selection()
+        self._viewport_api.ndc_to_world = Gf.Matrix4d().SetScale(Gf.Vec3d(1000.0, 1000.0, 1.0))
+        self._picker.hit = SurfaceHit(Sdf.Path("/World/FoliageCard"), Gf.Vec3d(900.0, 900.0, 0.0))
+
+        # Act
+        self._hover((0.9, 0.9))
+
+        # Assert
+        self.assertEqual(self._picker.picks, [(0.9, 0.9)])
+        self.assertIsNone(self._tool._last_hover)
+
+    async def test_on_hit_turns_the_cursor_normal_toward_the_camera(self):
+        # Arrange - seen from below, the quad's upward normal points away from the camera
+        self._viewport_api.transform = Gf.Matrix4d().SetTranslate(Gf.Vec3d(0.0, 0.0, -100.0))
+
+        # Act
+        self._hover()
+
+        # Assert
+        self.assertLess(self._tool._cursor.transform[10], 0.0)
+
+    async def test_drag_began_apply_to_selected_without_a_selection_posts_status_and_starts_nothing(self):
+        # Arrange
+        self._controller.update_settings(apply_to=ApplyTo.SELECTED)
+        status = mock.Mock()
+        self._status_sub = self._controller.subscribe_status_message(status)
+        self._hover()
+
+        # Act
+        self._tool._on_drag_began(self._tool._drag)
+
+        # Assert
+        self.assertIsNone(self._tool._session)
+        self.assertEqual(status.call_args.args, (scatter_brush_module._NO_SELECTION_MESSAGE, True))
+
+    async def test_drag_began_hands_the_stroke_the_camera_position(self):
+        # Arrange
+        self._viewport_api.transform = Gf.Matrix4d().SetTranslate(Gf.Vec3d(1.0, 2.0, 300.0))
+        session_class = self._stack.enter_context(
+            mock.patch.object(scatter_brush_module, "StrokeSession", wraps=scatter_brush_module.StrokeSession)
+        )
+        self._hover()
+
+        # Act
+        self._tool._on_drag_began(self._tool._drag)
+
+        # Assert
+        self.assertEqual(session_class.call_args.kwargs["view_point"], Gf.Vec3d(1.0, 2.0, 300.0))
 
     async def test_drag_began_with_hover_starts_paint_session(self):
         # Arrange
@@ -1001,6 +1126,48 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(self._tool._counter_status, PrimBudgetStatus.ALERT)
 
+    async def test_counter_while_stroke_trails_the_cursor_says_it_is_catching_up(self):
+        # Arrange
+        self._begin_stroke()
+
+        with mock.patch.object(stroke_module, "_clock", side_effect=_clock_out_of_time_after(1)):
+            # Act
+            self._tool._on_hit(SurfaceHit(_MESH_PATH, _FAR_POSITION))
+
+        # Assert
+        self.assertTrue(self._tool._session.pending)
+        self.assertTrue(self._tool._counter_label.text.endswith(scatter_brush_module._CATCHING_UP_SUFFIX))
+
+    async def test_on_update_while_stroke_trails_the_cursor_catches_it_up_without_picking(self):
+        # Arrange
+        self._begin_stroke()
+        with mock.patch.object(stroke_module, "_clock", side_effect=_clock_out_of_time_after(1)):
+            self._tool._on_hit(SurfaceHit(_MESH_PATH, _FAR_POSITION))
+        self.assertTrue(self._tool._session.pending)
+        self._tool._force_pick = False
+        picks_before = len(self._picker.picks)
+
+        with mock.patch.object(stroke_module, "_clock", return_value=0.0):
+            # Act
+            self._tool._on_update(None)
+
+        # Assert
+        self.assertFalse(self._tool._session.pending)
+        self.assertEqual(len(self._picker.picks), picks_before)
+        self.assertFalse(self._tool._counter_label.text.endswith(scatter_brush_module._CATCHING_UP_SUFFIX))
+
+    async def test_on_hit_during_stroke_draws_cursor_at_the_radius_the_stroke_stamps(self):
+        # Arrange
+        self._begin_stroke()
+        self._controller.update_settings(radius=_RADIUS * 2.0)
+
+        # Act
+        self._tool._on_hit(SurfaceHit(_MESH_PATH, _HIT_POSITION))
+
+        # Assert
+        transform = self._tool._cursor.transform
+        self.assertAlmostEqual(math.hypot(transform[0], transform[1], transform[2]), _RADIUS, places=3)
+
     async def test_drag_ended_hides_counter(self):
         # Arrange
         self._begin_stroke()
@@ -1022,6 +1189,241 @@ class TestScatterBrushTool(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertFalse(self._tool._counter_label.visible)
+
+    def _collect_statuses(self) -> list[tuple[str, bool]]:
+        """Return a list that receives every status message the controller posts from now on."""
+        statuses: list[tuple[str, bool]] = []
+        self._status_sub = self._controller.subscribe_status_message(
+            lambda text, is_error: statuses.append((text, is_error))
+        )
+        return statuses
+
+    async def test_begin_stroke_at_the_prim_limit_trims_the_stamp_and_says_so_on_the_counter(self):
+        # Arrange - a budget of 1 limits a stroke to 5 rendered prims, fewer than the 8 one stamp draws
+        self._controller.update_settings(prim_budget=1)
+
+        # Act
+        self._begin_stroke()
+
+        # Assert
+        self.assertEqual(len(self._placements()), 5)
+        self.assertTrue(self._tool._counter_label.text.endswith(scatter_brush_module._LIMIT_REACHED_SUFFIX))
+        self.assertEqual(self._tool._counter_status, PrimBudgetStatus.ALERT)
+
+    async def test_on_hit_after_the_prim_limit_was_reached_greys_the_cursor_and_paints_nothing_more(self):
+        # Arrange
+        self._controller.update_settings(prim_budget=1)
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_hit(SurfaceHit(_MESH_PATH, _FAR_POSITION))
+
+        # Assert
+        self.assertEqual(self._tool._cursor_color, scatter_brush_module._NOT_APPLICABLE_COLOR)
+        self.assertEqual(len(self._placements()), 5)
+
+    async def test_drag_ended_at_the_prim_limit_posts_status_and_a_notification(self):
+        # Arrange
+        self._controller.update_settings(prim_budget=1)
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert - what the stroke did paint, then why it stopped
+        expected = scatter_brush_module._LIMIT_REACHED_MESSAGE.format(limit=5)
+        self.assertIn((f"Painted 5 placements, rendering 5 prims. {expected}", True), statuses)
+        self._post_notification.assert_called_once()
+        self.assertIn(expected, self._post_notification.call_args.args[0])
+        self.assertEqual(self._committed, [(5, False)])
+
+    async def test_drag_ended_twice_at_the_prim_limit_notifies_only_once(self):
+        # Arrange
+        self._controller.update_settings(prim_budget=1)
+        self._begin_stroke()
+        self._tool._on_drag_ended(self._tool._drag)
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        self.assertTrue(statuses[-1][0].endswith(scatter_brush_module._LIMIT_REACHED_MESSAGE.format(limit=5)))
+        self.assertTrue(statuses[-1][1])
+        self.assertEqual(self._post_notification.call_count, 1)
+
+    async def test_begin_stroke_on_a_mesh_with_more_instances_than_the_prim_limit_shows_an_empty_counter(self):
+        # Arrange - six instances, so one placement alone renders more than the limit of 5
+        for index in range(1, 6):
+            _author_instance(self._stage, index)
+        self._controller.update_settings(prim_budget=1)
+
+        # Act
+        self._begin_stroke()
+
+        # Assert
+        self.assertEqual(self._placements(), [])
+        self.assertTrue(self._tool._counter_label.visible)
+        self.assertEqual(self._tool._counter_label.text, f"0 prims  {scatter_brush_module._LIMIT_BLOCKED_SUFFIX}")
+        self.assertEqual(self._tool._counter_status, PrimBudgetStatus.ALERT)
+
+    async def test_on_hit_over_a_mesh_with_too_many_instances_greys_the_cursor_and_keeps_the_stroke_open(self):
+        # Arrange
+        for index in range(1, 6):
+            _author_instance(self._stage, index)
+        self._controller.update_settings(prim_budget=1)
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_hit(SurfaceHit(_MESH_PATH, _FAR_POSITION))
+
+        # Assert - only this mesh is out of reach, so the stroke itself is not at its limit
+        self.assertEqual(self._tool._cursor_color, scatter_brush_module._NOT_APPLICABLE_COLOR)
+        self.assertFalse(self._tool._session.limit_reached)
+
+    async def test_drag_ended_on_a_mesh_with_more_instances_than_the_prim_limit_says_nothing_was_painted(self):
+        # Arrange
+        for index in range(1, 6):
+            _author_instance(self._stage, index)
+        self._controller.update_settings(prim_budget=1)
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        expected = scatter_brush_module._LIMIT_BLOCKED_MESSAGE.format(name=f"mesh_{_HASH}", count=6, limit=5)
+        self.assertIn((expected, True), statuses)
+        self.assertEqual(self._committed, [(0, False)])
+
+    async def test_drag_ended_before_the_stroke_caught_up_reports_the_path_left_unpainted(self):
+        # Arrange
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+        with mock.patch.object(stroke_module, "_clock", side_effect=_clock_out_of_time_after(1)):
+            self._tool._on_hit(SurfaceHit(_MESH_PATH, _FAR_POSITION))
+        self.assertTrue(self._tool._session.pending)
+        # The end reads the clock once for its deadline; every later read finds its whole budget spent.
+        out_of_time = itertools.chain([0.0], itertools.repeat(stroke_module._END_DRAIN_BUDGET))
+
+        with mock.patch.object(stroke_module, "_clock", side_effect=out_of_time):
+            # Act
+            self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        text, is_error = statuses[-1]
+        self.assertTrue(text.endswith(scatter_brush_module._CUT_SHORT_MESSAGE))
+        self.assertTrue(is_error)
+        self._post_notification.assert_called_once()
+        self.assertIsNone(self._tool._session)
+
+    async def test_drag_ended_when_catching_up_fails_reports_the_error_and_keeps_what_was_painted(self):
+        # Arrange - the stroke is behind the cursor, and the stamp the end catches up with fails
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+        with mock.patch.object(stroke_module, "_clock", side_effect=_clock_out_of_time_after(1)):
+            self._tool._on_hit(SurfaceHit(_MESH_PATH, _FAR_POSITION))
+        self.assertTrue(self._tool._session.pending)
+        painted = len(self._placements())
+
+        with (
+            mock.patch.object(stroke_module, "generate_stamp", side_effect=RuntimeError("stamp failed")),
+            mock.patch.object(stroke_module.carb, "log_error"),
+        ):
+            # Act
+            self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        text, is_error = statuses[-1]
+        self.assertTrue(text.endswith(scatter_brush_module._FAILED_MESSAGE))
+        self.assertTrue(is_error)
+        self.assertEqual(self._committed, [(painted, False)])
+
+    async def test_drag_ended_after_the_stroke_caught_up_reports_nothing(self):
+        # Arrange
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+        self._tool._on_hit(SurfaceHit(_MESH_PATH, _FAR_POSITION))
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        self.assertNotIn(scatter_brush_module._CUT_SHORT_MESSAGE, [text for text, _is_error in statuses])
+        self._post_notification.assert_not_called()
+
+    async def test_drag_ended_posts_what_the_stroke_painted(self):
+        # Arrange
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert - one instance of the mesh, so every placement renders once
+        count = len(self._placements())
+        self.assertGreater(count, 1)
+        self.assertEqual(statuses[-1], (f"Painted {count} placements, rendering {count} prims", False))
+
+    async def test_drag_ended_keeps_the_up_axis_warning_the_stroke_started_with_in_front_of_what_it_painted(self):
+        # Arrange - the asset's file says Y-up while the palette says Z-up, which a stroke reports as it starts
+        statuses = self._collect_statuses()
+        with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Y):
+            self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert - the summary would otherwise take the warning off the status line as soon as the mouse is released
+        count = len(self._placements())
+        text, is_error = statuses[-1]
+        self.assertIn("is authored Y-up but the brush is set to Z-up", text)
+        self.assertTrue(text.endswith(f". Painted {count} placements, rendering {count} prims"))
+        self.assertFalse(is_error)
+
+    async def test_drag_ended_on_a_replicated_prototype_posts_the_prims_every_instance_renders(self):
+        # Arrange
+        _author_instance(self._stage, 1)
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        count = len(self._placements())
+        self.assertEqual(statuses[-1], (f"Painted {count} placements, rendering {count * 2} prims", False))
+
+    async def test_drag_ended_erase_posts_how_many_placements_it_erased(self):
+        # Arrange
+        self._begin_stroke()
+        self._tool._on_drag_ended(self._tool._drag)
+        self._keys_down = {carb.input.KeyboardInput.LEFT_SHIFT}
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        erased_count, _erase = self._committed[-1]
+        self.assertGreater(erased_count, 1)
+        self.assertEqual(statuses[-1], (f"Erased {erased_count} placements", False))
+
+    async def test_drag_ended_with_nothing_placed_posts_what_can_keep_a_stroke_from_painting(self):
+        # Arrange
+        self._controller.update_settings(strength=0.0)
+        statuses = self._collect_statuses()
+        self._begin_stroke()
+
+        # Act
+        self._tool._on_drag_ended(self._tool._drag)
+
+        # Assert
+        self.assertEqual(statuses[-1], (scatter_brush_module._NOTHING_PAINTED_MESSAGE, False))
 
 
 class TestBrushCursorMatrix(omni.kit.test.AsyncTestCase):

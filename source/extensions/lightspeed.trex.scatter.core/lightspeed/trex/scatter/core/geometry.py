@@ -32,6 +32,7 @@ __all__ = [
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 import carb
@@ -56,11 +57,20 @@ _RAY_EPSILON = 1e-6
 _PARALLEL_EPSILON = 1e-12
 _BARYCENTRIC_EPSILON = 1e-9
 _DEGENERATE_CROSS_LENGTH = 1e-12
-# Upper bound on the (points x triangles) boolean mask evaluated in one numpy chunk during candidate search.
-_PAIR_CHUNK_BUDGET = 1 << 22
+# Upper bound on the (point, triangle) pairs whose closest points are computed at once. Each pair costs a few hundred
+# bytes of temporaries, so this is what keeps a wide search to tens of megabytes instead of gigabytes.
+_PAIR_EVAL_BUDGET = 1 << 17
 # Query points searched against the triangles near them as one group. A batch larger than this is split into groups of
 # neighbouring points first, so that points spread over a whole mesh are not each tested against all of it.
-_LOCAL_GROUP_SIZE = 256
+_LOCAL_GROUP_SIZE = 32
+# Triangles per block of the search index. A query tests the bounds of every block, then of the triangles in the
+# blocks it overlaps, so it never visits each triangle of a large mesh.
+_SEARCH_BLOCK_SIZE = 64
+# Factor the reach of a closest-point search grows by for the points an earlier, shorter reach did not settle.
+_REACH_GROWTH = 4.0
+# Average candidates per point above which the pairs are first pruned by cheap distance bounds; below it the exact test
+# costs no more than the bounds would.
+_PRUNE_PAIRS_PER_POINT = 64
 # Bits per axis of the Morton code that orders points into neighbourhoods; three of them fit an unsigned 64-bit key.
 _MORTON_BITS = 21
 
@@ -102,6 +112,32 @@ class MeshGeometry:
     def triangle_count(self) -> int:
         """Number of triangles in the geometry."""
         return int(self.triangles.shape[0])
+
+    @cached_property
+    def search_index(self) -> _TriangleBlocks:
+        """Blocks of neighbouring triangles with their bounds, built on the first query that needs them."""
+        return _build_triangle_blocks(self.tri_min, self.tri_max)
+
+
+@dataclass
+class _TriangleBlocks:
+    """Triangles of one mesh sorted along a Z-order curve and packed into fixed-size blocks.
+
+    Neighbouring triangles land in the same block, so a query box overlaps a few blocks and only their triangles are
+    tested one by one: a two-level hierarchy that costs one sort to build.
+
+    Attributes:
+        blocks: (B, ``_SEARCH_BLOCK_SIZE``) triangle indices per block; the last block repeats its final triangle to
+            fill up.
+        block_min: (B, 3) lower bound of each block's triangles.
+        block_max: (B, 3) upper bound of each block's triangles.
+        typical_extent: Median largest side of a triangle's bounding box, which is the reach a search starts from.
+    """
+
+    blocks: np.ndarray
+    block_min: np.ndarray
+    block_max: np.ndarray
+    typical_extent: float
 
 
 @dataclass
@@ -192,7 +228,12 @@ def build_mesh_geometry(mesh_prim: Usd.Prim | None, time_code: Usd.TimeCode | No
     if corner_slots.shape[0] == 0:
         return None
     triangles = indices[corner_slots]
-    face_of_triangle = np.repeat(np.arange(counts.size, dtype=np.int64), np.maximum(counts, 0))[corner_slots[:, 0]]
+    # The face owning each triangle's first slot, looked up in the running total of face sizes. Labelling every slot
+    # with its face instead would allocate as many labels as the counts add up to, which one corrupt count makes
+    # gigabytes of.
+    face_of_triangle = np.minimum(
+        np.searchsorted(np.cumsum(np.maximum(counts, 0)), corner_slots[:, 0], side="right"), counts.size - 1
+    )
     in_range = np.all((triangles >= 0) & (triangles < local_vertices.shape[0]), axis=1)
     if not in_range.all():
         carb.log_verbose(
@@ -284,7 +325,13 @@ def raycast(origin: np.ndarray, direction: np.ndarray, geometry: MeshGeometry) -
         return None
     unit_direction = ray_direction / length
 
-    corners = geometry.vertices[geometry.triangles]
+    # Only the triangles of blocks the ray passes through can be hit, so the full test runs on those alone.
+    index = geometry.search_index
+    crossed = _ray_crosses_boxes(ray_origin, unit_direction, index.block_min, index.block_max)
+    if not crossed.any():
+        return None
+    triangle_ids = np.unique(index.blocks[crossed])
+    corners = geometry.vertices[geometry.triangles[triangle_ids]]
     first = corners[:, 0]
     edge_ab = corners[:, 1] - first
     edge_ac = corners[:, 2] - first
@@ -308,7 +355,7 @@ def raycast(origin: np.ndarray, direction: np.ndarray, geometry: MeshGeometry) -
         return None
     candidates = np.nonzero(hits)[0]
     best = candidates[np.argmin(t[candidates])]
-    return float(t[best] / length), int(best)
+    return float(t[best] / length), int(triangle_ids[best])
 
 
 def area_weighted_triangle_samples(
@@ -351,6 +398,10 @@ class MeshSurfaceCache:
     moves the change subscription over. Entries are dropped when the mesh, one of its geometry properties, or any
     ``xformOp*`` property on the mesh or an ancestor changes; new prims appearing next to the mesh (for example
     scatter containers and placements) leave the cache untouched. Not thread-safe; use from the main thread.
+
+    The world bounds of a mesh outlive its eviction, and a ray that misses them is answered without its triangles.
+    A caller that tests one ray against more meshes than the cache holds, as painting on a large selection does,
+    would otherwise rebuild every one of them on every query.
     """
 
     def __init__(self, stage_getter: Callable[[], Usd.Stage | None], max_entries: int = 8):
@@ -363,6 +414,9 @@ class MeshSurfaceCache:
         self._stage_getter: Callable[[], Usd.Stage | None] | None = stage_getter
         self._max_entries = max(1, int(max_entries))
         self._entries: OrderedDict[Sdf.Path, MeshGeometry] = OrderedDict()
+        # World bounds of every mesh whose geometry was built, kept when the geometry is evicted and dropped only
+        # by the changes that drop the geometry itself.
+        self._bounds: dict[Sdf.Path, tuple[np.ndarray, np.ndarray]] = {}
         self._stage: Usd.Stage | None = None
         self._stage_key: tuple[str, str] | None = None
         self._subscription = None
@@ -388,6 +442,7 @@ class MeshSurfaceCache:
         if geometry is None:
             return None
         self._entries[path] = geometry
+        self._bounds[path] = (geometry.bbox_min, geometry.bbox_max)
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)
         carb.log_verbose(
@@ -434,6 +489,36 @@ class MeshSurfaceCache:
             return np.zeros((count, 3), dtype=np.float64), np.zeros((count, 3), dtype=np.float64), np.zeros(count, bool)
         return closest_points(query, geometry, max_distance)
 
+    def closest_samples(
+        self, mesh_path: Sdf.Path | str, points: np.ndarray, max_distance: float
+    ) -> list[SurfaceSample | None]:
+        """Project a batch of points onto a cached mesh, answering what :meth:`closest_point` would for each.
+
+        One batched query costs about what one point does, so a caller with several points to project at once, like a
+        stroke walking a segment, asks for all of them here instead of one at a time.
+
+        Args:
+            mesh_path: Mesh prim path.
+            points: (K, 3) world-space query points.
+            max_distance: Results farther than this from their point yield None.
+
+        Returns:
+            One sample per point, in order; None where the mesh is unavailable or the surface too far away.
+        """
+        query = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        geometry = self.get(mesh_path)
+        if geometry is None:
+            return [None] * query.shape[0]
+        positions, normals, distances, triangle_ids, valid = _nearest_on_surface(query, geometry, max_distance)
+        return [
+            (
+                SurfaceSample(positions[row].copy(), normals[row].copy(), int(triangle_ids[row]), float(distances[row]))
+                if valid[row]
+                else None
+            )
+            for row in range(query.shape[0])
+        ]
+
     def raycast(self, mesh_path: Sdf.Path | str, origin: Gf.Vec3d, direction: Gf.Vec3d) -> SurfaceSample | None:
         """Intersect a ray with a cached mesh.
 
@@ -445,11 +530,13 @@ class MeshSurfaceCache:
         Returns:
             The sample at the nearest hit (``distance`` measured from the origin), or None on a miss.
         """
+        ray_origin = _as_vector3(origin)
+        ray_direction = _as_vector3(direction)
+        if self._sync_stage() is None or self._ray_misses_known_bounds(_as_path(mesh_path), ray_origin, ray_direction):
+            return None
         geometry = self.get(mesh_path)
         if geometry is None:
             return None
-        ray_origin = _as_vector3(origin)
-        ray_direction = _as_vector3(direction)
         hit = raycast(ray_origin, ray_direction, geometry)
         if hit is None:
             return None
@@ -464,18 +551,29 @@ class MeshSurfaceCache:
         Args:
             paths: Prim (or property) paths; a property path invalidates as its owning prim.
         """
-        if not self._entries:
+        if not self._bounds:
             return
-        targets = [_as_path(path).GetPrimPath() for path in paths]
+        targets: set[Sdf.Path] = set()
+        for path in paths:
+            changed = _as_path(path)
+            if changed.IsAbsoluteRootPath():
+                # Tested before the prim path is taken: the root is not a prim, so it has no prim path to match.
+                self.clear()
+                return
+            targets.add(changed.GetPrimPath())
         if not targets:
             return
-        for key in list(self._entries):
-            if any(key.HasPrefix(target) for target in targets):
-                del self._entries[key]
+        # Every cached geometry has bounds, so the bounds name each mesh the cache knows anything about. Each mesh
+        # looks its own ancestors up in the changed paths, rather than being compared with every one of them: a
+        # stroke changes thousands of paths at once, none of which is a mesh the cache knows.
+        for key in list(self._bounds):
+            if not targets.isdisjoint(key.GetPrefixes()):
+                self._forget(key)
 
     def clear(self) -> None:
         """Drop every cached geometry but keep listening to the current stage."""
         self._entries.clear()
+        self._bounds.clear()
 
     def destroy(self) -> None:
         """Release the stage subscription and all cached data; the cache returns None afterwards."""
@@ -503,19 +601,39 @@ class MeshSurfaceCache:
         if self._subscription is not None:
             self._subscription.revoke()
             self._subscription = None
-        self._entries.clear()
+        self.clear()
         self._stage = None
         self._stage_key = None
 
+    def _forget(self, mesh_path: Sdf.Path) -> None:
+        """Drop the geometry and the bounds of one mesh, because the mesh itself changed."""
+        self._entries.pop(mesh_path, None)
+        self._bounds.pop(mesh_path, None)
+
+    def _ray_misses_known_bounds(self, mesh_path: Sdf.Path, origin: np.ndarray, direction: np.ndarray) -> bool:
+        """Return whether a ray is known to miss a mesh without looking at its triangles.
+
+        False when the bounds are not known, so the caller reads the mesh. The bounds contain every block of the
+        mesh's search index and are tested the same way, so this never drops a ray the triangles would have caught.
+        """
+        bounds = self._bounds.get(mesh_path)
+        if bounds is None:
+            return False
+        length = float(np.linalg.norm(direction))
+        if not np.isfinite(length) or length <= 0.0:
+            return False
+        bounds_min, bounds_max = bounds
+        return not _ray_crosses_boxes(origin, direction / length, bounds_min[None, :], bounds_max[None, :])[0]
+
     def _on_objects_changed(self, notice: Any, _stage: Usd.Stage) -> None:
         """Drop entries affected by a live or aggregated ObjectsChanged notice."""
-        if not self._entries:
+        if not self._bounds:
             return
         subtree_roots: set[Sdf.Path] = set()
         exact_meshes: set[Sdf.Path] = set()
         for path in notice.GetResyncedPaths():
             if path.IsAbsoluteRootPath():
-                self._entries.clear()
+                self.clear()
                 return
             if path.IsPropertyPath():
                 self._classify_property_change(path, subtree_roots, exact_meshes)
@@ -527,7 +645,7 @@ class MeshSurfaceCache:
             if path.IsPropertyPath():
                 self._classify_property_change(path, subtree_roots, exact_meshes)
         for mesh_path in exact_meshes:
-            self._entries.pop(mesh_path, None)
+            self._forget(mesh_path)
         if subtree_roots:
             self.invalidate(subtree_roots)
 
@@ -539,7 +657,7 @@ class MeshSurfaceCache:
         prim_path = property_path.GetPrimPath()
         if name.startswith(_XFORM_PROPERTY_PREFIX):
             subtree_roots.add(prim_path)
-        elif name in _GEOMETRY_PROPERTY_NAMES and prim_path in self._entries:
+        elif name in _GEOMETRY_PROPERTY_NAMES and prim_path in self._bounds:
             exact_meshes.add(prim_path)
 
 
@@ -632,7 +750,14 @@ def _authored_corner_normals(
 def _nearest_on_surface(
     points: np.ndarray, geometry: MeshGeometry, max_distance: float | None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorised closest-point query returning positions, normals, distances, triangle ids and validity."""
+    """Vectorised closest-point query returning positions, normals, distances, triangle ids and validity.
+
+    The search starts with a reach about the size of one triangle and widens only for the points it has not settled.
+    A point whose nearest candidate lies within the reach is settled exactly: any triangle closer than that would have
+    had the point inside its bounds grown by the reach, so it was a candidate too. Candidates of a stamp sit on or
+    near the surface, so nearly every point settles at the first reach and the search never pairs a point with every
+    triangle within the brush radius, which on a dense mesh is millions of pairs. Ties go to the lowest triangle index.
+    """
     count = points.shape[0]
     positions = np.zeros((count, 3), dtype=np.float64)
     normals = np.zeros((count, 3), dtype=np.float64)
@@ -641,97 +766,217 @@ def _nearest_on_surface(
     valid = np.zeros(count, dtype=bool)
     if count == 0 or geometry.triangle_count == 0:
         return positions, normals, distances, triangle_ids, valid
-    point_ids, candidate_ids = _candidate_pairs(points, geometry, max_distance)
-    if point_ids.size == 0:
+    # A point with a non-finite coordinate is near nothing; leaving it out also keeps the reach finite below.
+    pending = np.flatnonzero(np.all(np.isfinite(points), axis=1))
+    if pending.size == 0:
         return positions, normals, distances, triangle_ids, valid
-    corners = geometry.vertices[geometry.triangles[candidate_ids]]
-    queries = points[point_ids]
-    closest = _closest_points_on_triangle_pairs(queries, corners[:, 0], corners[:, 1], corners[:, 2])
-    offsets = closest - queries
-    squared = _row_dot(offsets, offsets)
-    # Sort by (point, distance) so the first row of every point run is its nearest candidate.
-    order = np.lexsort((squared, point_ids))
-    sorted_points = point_ids[order]
-    run_start = np.ones(order.size, dtype=bool)
-    run_start[1:] = sorted_points[1:] != sorted_points[:-1]
-    best = order[run_start]
-    winners = point_ids[best]
-    positions[winners] = closest[best]
-    normals[winners] = geometry.face_normals[candidate_ids[best]]
-    distances[winners] = np.sqrt(squared[best])
-    triangle_ids[winners] = candidate_ids[best]
+    # Beyond this reach every triangle is a candidate of every point, so a wider search could not change anything.
+    limit = _reach_covering_mesh(points[pending], geometry)
+    if max_distance is not None:
+        limit = min(limit, abs(float(max_distance)))
+    start = geometry.search_index.typical_extent
+    # Mesh bounds that are not finite leave nothing to widen towards, so the one pass searches every triangle.
+    reach = min(limit, max(start, limit * 1e-3)) if np.isfinite(limit) and np.isfinite(start) else limit
+    while pending.size:
+        last_pass = not reach < limit
+        squared, nearest, closest = _search_within(points[pending], geometry, reach)
+        found = nearest >= 0
+        settled = found if last_pass else found & (squared <= reach * reach)
+        done = pending[settled]
+        positions[done] = closest[settled]
+        normals[done] = geometry.face_normals[nearest[settled]]
+        distances[done] = np.sqrt(squared[settled])
+        triangle_ids[done] = nearest[settled]
+        if last_pass:
+            break
+        pending = pending[~settled]
+        reach = min(limit, reach * _REACH_GROWTH)
+    found = triangle_ids >= 0
     if max_distance is None:
-        valid[winners] = True
+        valid[found] = True
     else:
-        valid[winners] = distances[winners] <= float(max_distance)
-        rejected = winners[~valid[winners]]
+        valid[found] = distances[found] <= float(max_distance)
+        rejected = found & ~valid
         positions[rejected] = 0.0
         normals[rejected] = 0.0
     return positions, normals, distances, triangle_ids, valid
 
 
-def _candidate_pairs(
-    points: np.ndarray, geometry: MeshGeometry, max_distance: float | None
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (point index, triangle index) pairs whose expanded triangle bounds contain the point.
+def _reach_covering_mesh(points: np.ndarray, geometry: MeshGeometry) -> float:
+    """Return a reach at which every triangle of the mesh is a candidate of every point.
 
-    Triangles are first narrowed to those near the whole batch, which is enough for a brush stamp, whose points are
-    all close together. A larger batch, such as every placement of a patch being dragged, can be spread over the
-    whole mesh, so it is split into groups of neighbouring points and each group is narrowed on its own; a point gets
-    exactly the candidates it would get searched alone either way.
+    No triangle is farther from a point than the point is from the mesh bounds plus the diagonal of those bounds.
     """
-    triangle_count = geometry.triangle_count
-    point_count = points.shape[0]
-    if max_distance is None:
-        return (
-            np.repeat(np.arange(point_count, dtype=np.int64), triangle_count),
-            np.tile(np.arange(triangle_count, dtype=np.int64), point_count),
-        )
-    expand = abs(float(max_distance))
-    if point_count <= _LOCAL_GROUP_SIZE:
-        return _candidate_pairs_near(points, np.arange(point_count, dtype=np.int64), geometry, expand)
-    order = _morton_order(points)
-    point_chunks = []
-    triangle_chunks = []
-    for start in range(0, point_count, _LOCAL_GROUP_SIZE):
-        group = order[start : start + _LOCAL_GROUP_SIZE]
-        group_points, group_triangles = _candidate_pairs_near(points[group], group, geometry, expand)
-        point_chunks.append(group_points)
-        triangle_chunks.append(group_triangles)
-    return np.concatenate(point_chunks), np.concatenate(triangle_chunks)
+    outside = np.maximum(np.maximum(geometry.bbox_min - points, points - geometry.bbox_max), 0.0)
+    farthest = float(np.sqrt(_row_dot(outside, outside).max()))
+    diagonal = float(np.linalg.norm(geometry.bbox_max - geometry.bbox_min))
+    # Grown a hair so rounding in the bounds can never leave the farthest triangle just outside the reach.
+    return (farthest + diagonal) * (1.0 + 1e-9) + 1e-9
 
 
-def _candidate_pairs_near(
-    points: np.ndarray, point_ids: np.ndarray, geometry: MeshGeometry, expand: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return the candidate pairs of a group of points, narrowing the triangles to those near the group first.
+def _search_within(
+    points: np.ndarray, geometry: MeshGeometry, reach: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Find, for every point, the nearest triangle among those whose bounds grown by ``reach`` contain the point.
+
+    Points are taken in groups of neighbours. A group first narrows the blocks of the search index to those near it,
+    then every point keeps only the blocks its own box overlaps, so a point far from the rest of its group is never
+    tested against the triangles between them. Pairs are produced and reduced to the nearest one per point a slice at
+    a time, so memory stays bounded however many pairs a wide reach admits.
 
     Args:
-        points: (K, 3) query points of the group.
-        point_ids: (K,) index of each of them in the whole batch, which is what the pairs report.
+        points: (K, 3) query points.
         geometry: Mesh to search.
-        expand: Distance the triangle bounds are expanded by.
+        reach: Distance the triangle bounds are grown by.
+
+    Returns:
+        (K,) squared distance, (K,) triangle index (-1 without a candidate) and (K, 3) closest point of every point.
     """
-    query_min = points.min(axis=0) - expand
-    query_max = points.max(axis=0) + expand
-    triangle_ids = np.nonzero(
-        np.all(geometry.tri_max >= query_min, axis=1) & np.all(geometry.tri_min <= query_max, axis=1)
-    )[0]
-    if triangle_ids.size == 0:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
-    lower = geometry.tri_min[triangle_ids] - expand
-    upper = geometry.tri_max[triangle_ids] + expand
-    chunk = max(1, _PAIR_CHUNK_BUDGET // triangle_ids.size)
-    point_chunks = []
-    triangle_chunks = []
-    for start in range(0, points.shape[0], chunk):
-        block = points[start : start + chunk]
-        inside = np.all(block[:, None, :] >= lower[None, :, :], axis=2)
-        inside &= np.all(block[:, None, :] <= upper[None, :, :], axis=2)
-        block_points, block_triangles = np.nonzero(inside)
-        point_chunks.append(point_ids[block_points + start])
-        triangle_chunks.append(triangle_ids[block_triangles])
-    return np.concatenate(point_chunks), np.concatenate(triangle_chunks)
+    count = points.shape[0]
+    best_squared = np.full(count, np.inf, dtype=np.float64)
+    best_triangle = np.full(count, -1, dtype=np.int64)
+    best_point = np.zeros((count, 3), dtype=np.float64)
+    if count <= _LOCAL_GROUP_SIZE:
+        groups = [np.arange(count, dtype=np.int64)]
+    else:
+        order = _morton_order(points)
+        groups = [order[start : start + _LOCAL_GROUP_SIZE] for start in range(0, count, _LOCAL_GROUP_SIZE)]
+    index = geometry.search_index
+    blocks_per_slice = max(1, _PAIR_EVAL_BUDGET // _SEARCH_BLOCK_SIZE)
+    for group in groups:
+        low = points[group] - reach
+        high = points[group] + reach
+        near = np.flatnonzero(
+            np.all(index.block_max >= low.min(axis=0), axis=1) & np.all(index.block_min <= high.max(axis=0), axis=1)
+        )
+        if near.size == 0:
+            continue
+        overlap = np.all(index.block_max[near][None, :, :] >= low[:, None, :], axis=2)
+        overlap &= np.all(index.block_min[near][None, :, :] <= high[:, None, :], axis=2)
+        rows, columns = np.nonzero(overlap)
+        for start in range(0, rows.size, blocks_per_slice):
+            pair_rows = np.repeat(rows[start : start + blocks_per_slice], _SEARCH_BLOCK_SIZE)
+            pair_triangles = index.blocks[near[columns[start : start + blocks_per_slice]]].reshape(-1)
+            inside = np.all(geometry.tri_max[pair_triangles] >= low[pair_rows], axis=1)
+            inside &= np.all(geometry.tri_min[pair_triangles] <= high[pair_rows], axis=1)
+            if inside.any():
+                _keep_nearest(
+                    points,
+                    geometry,
+                    group[pair_rows[inside]],
+                    pair_triangles[inside],
+                    best_squared,
+                    best_triangle,
+                    best_point,
+                )
+    return best_squared, best_triangle, best_point
+
+
+def _keep_nearest(
+    points: np.ndarray,
+    geometry: MeshGeometry,
+    point_ids: np.ndarray,
+    candidate_ids: np.ndarray,
+    best_squared: np.ndarray,
+    best_triangle: np.ndarray,
+    best_point: np.ndarray,
+) -> None:
+    """Fold one slice of (point, triangle) pairs into the nearest triangle found so far for each point, in place.
+
+    The pairs of one point must be contiguous. When a point has many of them, the ones that cannot win are dropped
+    first by two cheap bounds: the distance to any corner of a candidate, or the nearest distance found so far, is an
+    upper bound on the nearest distance, and the distance to a triangle's bounds a lower bound on its own. That is what
+    a wide reach around a point far from the mesh would otherwise spend the exact closest point on. A triangle at
+    exactly the nearest distance is never dropped, and ties go to the lowest triangle index.
+    """
+    run_starts = np.flatnonzero(np.concatenate(([True], point_ids[1:] != point_ids[:-1])))
+    if point_ids.size > _PRUNE_PAIRS_PER_POINT * run_starts.size:
+        corners = geometry.vertices[geometry.triangles[candidate_ids, 0]] - points[point_ids]
+        nearest_corner = np.minimum.reduceat(_row_dot(corners, corners), run_starts)
+        upper = np.minimum(nearest_corner, best_squared[point_ids[run_starts]])
+        queries = points[point_ids]
+        gap = np.maximum(geometry.tri_min[candidate_ids] - queries, queries - geometry.tri_max[candidate_ids])
+        gap = np.maximum(gap, 0.0)
+        keep = _row_dot(gap, gap) <= np.repeat(upper, np.diff(np.append(run_starts, point_ids.size)))
+        point_ids = point_ids[keep]
+        candidate_ids = candidate_ids[keep]
+    corners = geometry.vertices[geometry.triangles[candidate_ids]]
+    queries = points[point_ids]
+    closest = _closest_points_on_triangle_pairs(queries, corners[:, 0], corners[:, 1], corners[:, 2])
+    offsets = closest - queries
+    squared = _row_dot(offsets, offsets)
+    # Sort by (point, distance, triangle) so the first row of every point run is its nearest, lowest-index candidate.
+    order = np.lexsort((candidate_ids, squared, point_ids))
+    sorted_points = point_ids[order]
+    run_start = np.ones(order.size, dtype=bool)
+    run_start[1:] = sorted_points[1:] != sorted_points[:-1]
+    first = order[run_start]
+    winners = point_ids[first]
+    winner_squared = squared[first]
+    winner_triangles = candidate_ids[first]
+    better = (winner_squared < best_squared[winners]) | (
+        (winner_squared == best_squared[winners]) & (winner_triangles < best_triangle[winners])
+    )
+    improved = winners[better]
+    best_squared[improved] = winner_squared[better]
+    best_triangle[improved] = winner_triangles[better]
+    best_point[improved] = closest[first[better]]
+
+
+def _build_triangle_blocks(tri_min: np.ndarray, tri_max: np.ndarray) -> _TriangleBlocks:
+    """Sort triangles along a Z-order curve by the centre of their bounds and pack them into blocks.
+
+    Args:
+        tri_min: (M, 3) lower bound of every triangle, M > 0.
+        tri_max: (M, 3) upper bound of every triangle.
+
+    Returns:
+        The block index.
+    """
+    triangle_count = tri_min.shape[0]
+    order = _morton_order((tri_min + tri_max) * 0.5)
+    block_count = -(-triangle_count // _SEARCH_BLOCK_SIZE)
+    padded = np.full(block_count * _SEARCH_BLOCK_SIZE, order[-1], dtype=np.int64)
+    padded[:triangle_count] = order
+    blocks = padded.reshape(block_count, _SEARCH_BLOCK_SIZE)
+    return _TriangleBlocks(
+        blocks=blocks,
+        block_min=tri_min[blocks].min(axis=1),
+        block_max=tri_max[blocks].max(axis=1),
+        typical_extent=float(np.median((tri_max - tri_min).max(axis=1))),
+    )
+
+
+def _ray_crosses_boxes(
+    origin: np.ndarray, unit_direction: np.ndarray, box_min: np.ndarray, box_max: np.ndarray
+) -> np.ndarray:
+    """Return which axis-aligned boxes a ray passes through in front of its origin (slab test).
+
+    Args:
+        origin: (3,) ray origin.
+        unit_direction: (3,) unit ray direction.
+        box_min: (B, 3) lower corner of every box.
+        box_max: (B, 3) upper corner of every box.
+
+    Returns:
+        (B,) boolean mask.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inverse = 1.0 / unit_direction
+        near = (box_min - origin) * inverse
+        far = (box_max - origin) * inverse
+    entry = np.minimum(near, far)
+    leave = np.maximum(near, far)
+    # A ray parallel to a slab never enters it unless it already runs inside it; 0 * inf gives NaN there.
+    parallel = unit_direction == 0.0
+    if parallel.any():
+        inside = (origin >= box_min) & (origin <= box_max)
+        entry = np.where(parallel, np.where(inside, -np.inf, np.inf), entry)
+        leave = np.where(parallel, np.where(inside, np.inf, -np.inf), leave)
+    t_entry = entry.max(axis=1)
+    t_leave = leave.min(axis=1)
+    # Padded so a hit exactly on a box face, the usual case for a flat mesh, is not lost to rounding.
+    return t_leave >= np.maximum(t_entry, 0.0) - _RAY_EPSILON
 
 
 def _morton_order(points: np.ndarray) -> np.ndarray:

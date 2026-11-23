@@ -29,20 +29,24 @@ __all__ = [
     "is_scatter_prim",
     "prototype_side_path",
     "resolve_target",
+    "selected_capture_meshes",
     "selected_prototypes",
     "validated_anchor_prototype",
 ]
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import carb
 import omni.usd
 from lightspeed.common import constants as common_constants
+from omni.flux.utils.common.interactive_usd_notices import register_objects_changed_listener
 from pxr import Gf, Sdf, Usd, UsdGeom
 
 from .constants import IS_REMIX_SCATTER_ATTR
+from .geometry import _stage_key
 from .settings import TargetMode
 
 if TYPE_CHECKING:
@@ -220,7 +224,9 @@ def resolve_target(
         prototype = hit_prototype
         parent_instance = hit_instance or canonical_instance(stage, prototype)
         geometry_root = parent_instance or prototype
-    mesh_path = find_capture_mesh(stage, geometry_root, hit.world_position)
+    mesh_path = _picked_capture_mesh(stage, hit.path, geometry_root) or find_capture_mesh(
+        stage, geometry_root, hit.world_position
+    )
     if mesh_path is None:
         return None
     return ScatterTarget(
@@ -288,6 +294,36 @@ def selected_prototypes(usd_context: omni.usd.UsdContext) -> set[Sdf.Path]:
     return prototypes
 
 
+def selected_capture_meshes(stage: Usd.Stage, selected_paths: Iterable[Sdf.Path | str]) -> list[Sdf.Path]:
+    """Return the capture meshes a selection names, as the instance-side paths the mesh cache works in.
+
+    A selected instance or prototype names its capture mesh, a selected mesh names itself and a selected placement
+    names the surface it was painted on. Prototype-side selections are read through the canonical instance, which is
+    where the geometry sits in the world.
+
+    Args:
+        stage: Stage the selection belongs to.
+        selected_paths: Selected prim paths; anything outside the capture topology is skipped.
+
+    Returns:
+        Each mesh once, in selection order.
+    """
+    meshes: list[Sdf.Path] = []
+    for selected in selected_paths:
+        prototype = get_prototype_root(selected)
+        if prototype is None:
+            continue
+        instance = get_instance_root(selected) or canonical_instance(stage, prototype)
+        root = instance or prototype
+        path = Sdf.Path(str(selected))
+        if instance is not None and get_instance_root(selected) is None:
+            path = path.ReplacePrefix(prototype, instance)
+        mesh = _picked_capture_mesh(stage, path, root) or find_capture_mesh(stage, root)
+        if mesh is not None and mesh not in meshes:
+            meshes.append(mesh)
+    return meshes
+
+
 def validated_anchor_prototype(stage: Usd.Stage, anchor_prototype: Sdf.Path | str | None) -> Sdf.Path | None:
     """Return the anchor as a prototype path when it is exactly a ``mesh_<HASH>`` root that exists on the stage.
 
@@ -319,22 +355,104 @@ def _padded_world_range(bbox_cache: UsdGeom.BBoxCache, prim: Usd.Prim) -> Gf.Ran
     return Gf.Range3d(world_range.GetMin() - padding, world_range.GetMax() + padding)
 
 
+def _picked_capture_mesh(stage: Usd.Stage, picked_path: Sdf.Path | str, root_path: Sdf.Path) -> Sdf.Path | None:
+    """Return the picked prim itself when it is a capture mesh under ``root_path``, which needs no search at all.
+
+    The picker reports the prim it hit, so a hit on the capture mesh names the surface exactly; guessing it from
+    bounding boxes instead can pick a neighbouring mesh whose box also contains the point. A hit on a placement, or on
+    anything that is not a mesh, still goes through :func:`find_capture_mesh`.
+    """
+    path = Sdf.Path(str(picked_path))
+    if not path.HasPrefix(root_path):
+        return None
+    prim = stage.GetPrimAtPath(path)
+    if not prim or not prim.IsA(UsdGeom.Mesh) or is_scatter_prim(prim) or has_scatter_ancestor(prim, root_path):
+        return None
+    return path
+
+
+class _InstanceIndex:
+    """The instances of every prototype hash on one stage, read once and kept current with change notices.
+
+    The brush resolves a target on every hover pick, and reading the instances means walking every child of
+    ``/RootNode/instances``: a capture with ten thousand instances spent a whole frame on it each time. Only a resync
+    that can add, remove or rename an instance drops what was read. Use from the main thread only.
+    """
+
+    def __init__(self):
+        self._stage_key: tuple[str, str] | None = None
+        self._subscription = None
+        self._by_hash: dict[str, list[Sdf.Path]] | None = None
+
+    def instances(self, stage: Usd.Stage, mesh_hash: str) -> list[Sdf.Path]:
+        """Return the instances of ``mesh_hash`` sorted by their ``_N`` index; the list must not be modified."""
+        key = _stage_key(stage)
+        if key is None:
+            return _read_instances(stage).get(mesh_hash, [])
+        if key != self._stage_key:
+            self.reset()
+            self._stage_key = key
+            self._subscription = register_objects_changed_listener(stage, self._on_objects_changed)
+        if self._by_hash is None:
+            self._by_hash = _read_instances(stage)
+        return self._by_hash.get(mesh_hash, [])
+
+    def reset(self) -> None:
+        """Forget the stage and what was read from it, and stop listening to it."""
+        if self._subscription is not None:
+            self._subscription.revoke()
+            self._subscription = None
+        self._stage_key = None
+        self._by_hash = None
+
+    def _on_objects_changed(self, notice, _stage: Usd.Stage) -> None:
+        """Drop what was read when a resync could have changed which instances exist."""
+        if self._by_hash is None:
+            return
+        instances_root = Sdf.Path(common_constants.ROOTNODE_INSTANCES)
+        for path in notice.GetResyncedPaths():
+            if path.IsPropertyPath():
+                continue
+            # An ancestor of the instances root (the pseudo-root included) recomposes all of them; a direct child of
+            # it is an instance coming, going or being renamed. Anything deeper changes no instance's existence.
+            if instances_root.HasPrefix(path) or path.GetParentPath() == instances_root:
+                self._by_hash = None
+                return
+
+
+_INSTANCE_INDEX = _InstanceIndex()
+
+
+def reset_instance_index() -> None:
+    """Forget the instances read from the current stage and release its change listener.
+
+    Called on extension shutdown; nothing needs it otherwise, because the index follows the stage on its own.
+    """
+    _INSTANCE_INDEX.reset()
+
+
 def _instances_of_prototype(stage: Usd.Stage, prototype_root: Sdf.Path | str) -> list[Sdf.Path]:
     """Instances of the prototype's hash sorted by their ``_N`` index."""
     match = _PROTOTYPE_HASH_REGEX.match(str(prototype_root))
     if match is None:
         return []
+    return list(_INSTANCE_INDEX.instances(stage, match.group(1)))
+
+
+def _read_instances(stage: Usd.Stage) -> dict[str, list[Sdf.Path]]:
+    """Read every instance under ``/RootNode/instances``, grouped by hash and sorted by their ``_N`` index."""
     instances_root = stage.GetPrimAtPath(common_constants.ROOTNODE_INSTANCES)
     if not instances_root:
-        return []
-    mesh_hash = match.group(1)
-    indexed: list[tuple[int, Sdf.Path]] = []
+        return {}
+    indexed: dict[str, list[tuple[int, Sdf.Path]]] = {}
     for child in instances_root.GetChildren():
         name_match = _INSTANCE_NAME_REGEX.match(child.GetName())
-        if name_match and name_match.group(1) == mesh_hash:
-            indexed.append((int(name_match.group(2)), child.GetPath()))
-    indexed.sort(key=lambda item: item[0])
-    return [path for _, path in indexed]
+        if name_match:
+            indexed.setdefault(name_match.group(1), []).append((int(name_match.group(2)), child.GetPath()))
+    return {
+        mesh_hash: [path for _, path in sorted(entries, key=lambda item: item[0])]
+        for mesh_hash, entries in indexed.items()
+    }
 
 
 def _local_to_world(stage: Usd.Stage, path: Sdf.Path | None) -> Gf.Matrix4d:

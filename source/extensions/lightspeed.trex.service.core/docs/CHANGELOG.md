@@ -1,6 +1,13 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.0]
+### Added
+- Added the `/stagecraft/scatter` routes: `get_scatter_surfaces`, `get_scatter_groups`, `create_scatter_group`, `update_scatter_group` and `remove_scatter_group`, which let an MCP agent find captured surfaces such as grass from texture previews and fill them with ingested assets in amounts it can retune
+
+### Changed
+- The ingested-asset listing test expects the `cube_textured` model and textures the example project now carries
+
 ## [2.0.2]
 ### Fixed
 - The `remove_layer` and `mute_layer` descriptions now say they act on the whole layer and every edit in it, not just the selected prims, so they are not a substitute for deleting prims

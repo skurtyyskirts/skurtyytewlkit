@@ -16,6 +16,7 @@
 """
 
 __all__ = [
+    "TestAssetUpAxisWidget",
     "TestChoicesComboModel",
     "TestDragValueModel",
     "TestFieldBounds",
@@ -45,6 +46,7 @@ from .unit.test_asset_list import (
     TestScatterAssetTextureSource,
     TestSizeTooltip,
 )
+from .unit.test_asset_up_axis import TestAssetUpAxisWidget
 from .unit.test_combo_model import TestChoicesComboModel
 from .unit.test_extension import TestTrexScatterWindowExtension
 from .unit.test_presets_ui import TestPresetsWidget

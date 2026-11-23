@@ -223,7 +223,7 @@ class HdRemixSettingsBridge:
         self._dlss_neural_rendering_support_task = asyncio.ensure_future(self._poll_dlss_neural_rendering_support())
         self._initial_integrator_push_pending = True
         self._capture_layer_imported_sub = _get_event_manager_instance().subscribe_global_custom_event(
-            constants.GlobalEventNames.CAPTURE_LAYER_IMPORTED.value, self._sync_dlss_settings_from_capture
+            constants.GlobalEventNames.CAPTURE_LAYER_IMPORTED.value, self._on_capture_layer_imported
         )
         self._integrate_indirect_sub = self._settings.subscribe_to_node_change_events(
             SETTINGS_INTEGRATE_INDIRECT_MODE, self._on_integrate_indirect_mode_changed
@@ -285,6 +285,13 @@ class HdRemixSettingsBridge:
         except asyncio.CancelledError:
             pass
 
+    def _on_capture_layer_imported(self, *_args, **_kwargs) -> None:
+        """Handle capture layer imported: sync DLSS settings and enforce integrator override if enabled."""
+        self._sync_dlss_settings_from_capture()
+        if self._settings.get(SETTINGS_OVERRIDE_CAPTURE_INTEGRATOR):
+            self._force_graphics_preset_custom()
+            self._push_integrate_indirect_mode()
+
     def _sync_dlss_settings_from_capture(self) -> None:
         """Seed Toolkit controls from captured runtime values without echoing them back."""
         captured_config = _read_captured_remix_config()
@@ -313,6 +320,14 @@ class HdRemixSettingsBridge:
                 if value is None:
                     carb.log_warn(f"[hdremix_renderer] ignored invalid captured {setting.identifier}={raw_value}.")
                     continue
+                if setting.identifier == "enableDlssNeuralRendering" and bool(value):
+                    support = get_dlss_neural_rendering_support()
+                    if support == RemixSupport.NOT_SUPPORTED:
+                        carb.log_info(
+                            "[hdremix_renderer] ignored captured enableDlssNeuralRendering=True because "
+                            "DLSS Neural Rendering is not supported."
+                        )
+                        continue
                 self._pending_dlss_settings.discard(setting)
                 self._settings.set(setting.setting_path, value)
         finally:
@@ -388,6 +403,14 @@ class HdRemixSettingsBridge:
     def _push_dlss_setting(self, setting: DlssSetting) -> None:
         """Push one persisted DLSS Neural Rendering setting."""
         value = coerce_dlss_value(setting, self._settings.get(setting.setting_path))
+        if setting.identifier == "enableDlssNeuralRendering" and bool(value):
+            support = get_dlss_neural_rendering_support()
+            if support != RemixSupport.SUPPORTED:
+                carb.log_warn(
+                    f"[hdremix_renderer] skipping push of enableDlssNeuralRendering=True because "
+                    f"DLSS Neural Rendering is not supported (support={support})."
+                )
+                return
         self._push_config_value(setting.runtime_key, format_dlss_value(value), setting.identifier)
 
     def _on_dlss_setting_changed(self, setting: DlssSetting, *_args, **_kwargs) -> None:

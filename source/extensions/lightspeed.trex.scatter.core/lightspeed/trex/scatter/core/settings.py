@@ -22,6 +22,7 @@ __all__ = [
     "LIVE_EDIT_SOFT_LIMIT",
     "RANGE_PAIRS",
     "REAPPLIABLE_FIELDS",
+    "SETTINGS_VERSION",
     "ApplyTo",
     "EraseScope",
     "Falloff",
@@ -36,6 +37,7 @@ __all__ = [
     "load_assets_from_carb",
     "prim_budget_status",
     "save_assets_to_carb",
+    "stroke_prim_limit",
 ]
 
 import json
@@ -180,7 +182,10 @@ class ScatterAssetEntry(BaseModel):
 
 
 ALERT_BUDGET_MULTIPLE = 5
-"""Multiple of the prim budget at which a stroke counter goes from a warning to an alert."""
+"""Multiple of the prim budget at which a stroke counter goes from a warning to an alert.
+
+The alert is also where a stroke or a flood stops adding placements: see :func:`stroke_prim_limit`.
+"""
 
 LIVE_EDIT_SOFT_LIMIT = 2000
 """Placements above which a live edit waits for the edit to finish instead of following every drag step.
@@ -242,10 +247,21 @@ land, which depends on the mouse path the stroke followed and is not recorded.
 """
 
 
+SETTINGS_VERSION = 2
+"""Version of the persisted brush settings.
+
+2 made the brush paint on the selected mesh with every asset standing straight up. Settings persist between sessions
+and in presets, so data saved before that would otherwise keep painting on whatever is under the cursor for good.
+"""
+
+
 class ScatterBrushSettings(BaseModel):
     """All brush parameters. Bounds are hard clamps; UIs use them for their drag fields."""
 
     model_config = ConfigDict(validate_assignment=True, extra="ignore")
+
+    settings_version: int = SETTINGS_VERSION
+    """``SETTINGS_VERSION`` the settings were saved at; data without one predates versioning and counts as 1."""
 
     preset_name: str = DEFAULT_PRESET_NAME
 
@@ -267,7 +283,12 @@ class ScatterBrushSettings(BaseModel):
 
     # Placement
     vertical_offset: float = Field(0.0, ge=-10000.0, le=10000.0)
-    conform_to_surface: bool = True
+    conform_to_surface: bool = False
+    """Whether the asset's up axis follows the surface normal instead of standing on the stage up axis.
+
+    Off by default: grass, plants and props grow straight up whatever the slope, and a captured mesh's normals cannot
+    be trusted to point out of the ground, because many games wind their triangles the other way round.
+    """
     align_to_stroke: bool = False
     base_rotation_x: float = Field(0.0, ge=-180.0, le=180.0)
     """Degrees every placement is turned about the stage X axis before its random rotation, about its own root.
@@ -308,7 +329,13 @@ class ScatterBrushSettings(BaseModel):
     randomize_seed: bool = True
 
     # Target
-    apply_to: ApplyTo = ApplyTo.ALL
+    apply_to: ApplyTo = ApplyTo.SELECTED
+    """Which meshes a stroke paints on.
+
+    ``SELECTED``, the default, paints only on the selected meshes and looks straight through anything in front of
+    them, so a ground mesh can be painted through the foliage cards and props standing on it. A selected mesh is then
+    where the next stroke goes rather than something a live edit changes. ``ALL`` paints whatever the cursor hits.
+    """
     target_mode: TargetMode = TargetMode.HIT_SURFACE
     anchor_prototype_path: str = ""
     erase_scope: EraseScope = EraseScope.ALL_SCATTERED
@@ -319,12 +346,24 @@ class ScatterBrushSettings(BaseModel):
     """Prims a single stroke is expected to render before the brush flags it as expensive.
 
     Counted in rendered prims rather than authored placements: a placement under a prototype renders once per
-    instance of that prototype's hash, so a stroke on a mesh with many instances costs far more than it authors. The
-    budget only colours the stroke counter; it never stops or trims a stroke.
+    instance of that prototype's hash, so a stroke on a mesh with many instances costs far more than it authors.
+    Reaching the budget only colours the stroke counter. ``ALERT_BUDGET_MULTIPLE`` times the budget is where a stroke
+    or a flood stops adding placements, so that no single action can author more than the scene can render; raising
+    the budget raises that limit with it.
     """
 
     # Materials
     assign_textures: bool = True
+
+    # Output
+    instance_strokes: bool = True
+    """Whether painted placements are merged into one UsdGeom.PointInstancer per patch.
+
+    The stroke just painted stays a set of prims, so it can be tuned and undone as one step. Painting the next stroke,
+    or flooding, merges every other loose placement of the layer into the instancer of its patch, which the runtime
+    draws from one copy of each asset's geometry instead of one replacement per placement. Off, every placement stays
+    a prim of its own, as it was before instancing existed.
+    """
 
     # Live editing
     edit_selection_live: bool = True
@@ -346,8 +385,17 @@ class ScatterBrushSettings(BaseModel):
 
     @classmethod
     def from_json_dict(cls, data: Mapping[str, Any]) -> ScatterBrushSettings:
-        """Build settings from a JSON-like mapping. Unknown keys are ignored, missing keys use defaults."""
-        return cls.model_validate(dict(data))
+        """Build settings from a JSON-like mapping. Unknown keys are ignored, missing keys use defaults.
+
+        Data saved before ``SETTINGS_VERSION`` 2 adopts the defaults that version introduced, painting on the
+        selection with assets standing straight up, once: everything else it holds is kept, and once saved again it
+        carries the current version, so a brush switched back to All afterwards stays on All.
+        """
+        values = dict(data)
+        if int(values.get("settings_version", 1)) < 2:
+            values.update(apply_to=ApplyTo.SELECTED, conform_to_surface=False)
+        values["settings_version"] = SETTINGS_VERSION
+        return cls.model_validate(values)
 
     def slug(self) -> str:
         """Prim-name-safe identifier for the preset, used to name the scatter container under a prototype."""
@@ -393,6 +441,23 @@ def prim_budget_status(rendered_prims: int, budget: int) -> PrimBudgetStatus:
     if rendered_prims >= budget:
         return PrimBudgetStatus.WARNING
     return PrimBudgetStatus.OK
+
+
+def stroke_prim_limit(budget: int) -> int:
+    """Return the rendered prims at which one stroke or one flood stops adding placements.
+
+    The budget itself is only a warning, because the artist decides what a surface deserves. Without any stop,
+    though, a stroke with no padding adds a full stamp at every step however much is already there, and a placement
+    on a mesh with hundreds of instances renders hundreds of times, so one drag could author more than the scene can
+    render. The limit is the count at which :func:`prim_budget_status` reports ``ALERT``.
+
+    Args:
+        budget: ``prim_budget`` of the brush settings.
+
+    Returns:
+        ``ALERT_BUDGET_MULTIPLE`` times the budget.
+    """
+    return budget * ALERT_BUDGET_MULTIPLE
 
 
 def save_assets_to_carb(assets: Sequence[ScatterAssetEntry], settings: carb.settings.ISettings | None = None) -> None:

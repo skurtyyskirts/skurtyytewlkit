@@ -26,10 +26,9 @@ import json
 from unittest import mock
 
 import omni.kit.test
-from pydantic import ValidationError
-
 from lightspeed.trex.scatter.core import constants as constants_module
 from lightspeed.trex.scatter.core import settings as settings_module
+from pydantic import ValidationError
 
 
 def _make_settings_interface(initial: dict[str, str] | None = None) -> tuple[mock.MagicMock, dict[str, str]]:
@@ -57,7 +56,7 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
             "stamp_spacing": 25.0,
             "padding": 10.0,
             "vertical_offset": 0.0,
-            "conform_to_surface": True,
+            "conform_to_surface": False,
             "align_to_stroke": False,
             "rotation_x_min": 0.0,
             "rotation_x_max": 0.0,
@@ -79,7 +78,7 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
             "scale_weight": 1.0,
             "seed": 0,
             "randomize_seed": True,
-            "apply_to": settings_module.ApplyTo.ALL,
+            "apply_to": settings_module.ApplyTo.SELECTED,
             "target_mode": settings_module.TargetMode.HIT_SURFACE,
             "anchor_prototype_path": "",
             "erase_scope": settings_module.EraseScope.ALL_SCATTERED,
@@ -154,6 +153,43 @@ class TestScatterBrushSettings(omni.kit.test.AsyncTestCase):
         self.assertEqual(settings.density, 8.0)
         self.assertEqual(settings.preset_name, "Default")
         self.assertFalse(hasattr(settings, "bogus_key"))
+
+    async def test_from_json_dict_saved_before_painting_on_the_selection_adopts_the_new_defaults_once(self):
+        # Settings persist between sessions, so without this a brush used before Apply To defaulted to Selected kept
+        # painting on whatever was under the cursor, ignoring the selected ground.
+        # Arrange
+        data = {"radius": 500.0, "apply_to": "ALL", "conform_to_surface": True}
+
+        # Act
+        settings = settings_module.ScatterBrushSettings.from_json_dict(data)
+
+        # Assert
+        self.assertEqual(
+            (settings.apply_to, settings.conform_to_surface, settings.radius),
+            (settings_module.ApplyTo.SELECTED, False, 500.0),
+        )
+
+    async def test_from_json_dict_saved_at_the_current_version_keeps_apply_to_all(self):
+        # Arrange - a brush switched to All after the new defaults arrived must stay on All
+        data = settings_module.ScatterBrushSettings(
+            apply_to=settings_module.ApplyTo.ALL, conform_to_surface=True
+        ).to_json_dict()
+
+        # Act
+        settings = settings_module.ScatterBrushSettings.from_json_dict(data)
+
+        # Assert
+        self.assertEqual((settings.apply_to, settings.conform_to_surface), (settings_module.ApplyTo.ALL, True))
+
+    async def test_init_with_apply_to_all_keeps_it_without_a_settings_version(self):
+        # Arrange - only data read back from disk is brought forward; settings built in code are taken as given
+        apply_to = settings_module.ApplyTo.ALL
+
+        # Act
+        settings = settings_module.ScatterBrushSettings(apply_to=apply_to)
+
+        # Assert
+        self.assertEqual(settings.apply_to, apply_to)
 
     async def test_slug_sanitizes_preset_name_for_each_input(self):
         cases = [

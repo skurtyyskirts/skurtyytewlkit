@@ -22,6 +22,7 @@ from omni.flux.service.factory import ServiceBase
 from .assets import AssetReplacementsService
 from .layers import LayerManagerService
 from .project import ProjectManagerService
+from .scatter import ScatterService
 from .textures import TextureReplacementsService
 
 
@@ -39,12 +40,14 @@ class StageCraftService(ServiceBase):
         layer_manager = LayerManagerService(context_name=context_name)
         asset_replacement = AssetReplacementsService(context_name=context_name)
         texture_replacement = TextureReplacementsService(context_name=context_name)
+        scatter = ScatterService(context_name=context_name)
 
         # Include the desired services in the app-level service
         self.router.include_router(project_manager.router, prefix=project_manager.prefix)
         self.router.include_router(layer_manager.router, prefix=layer_manager.prefix)
         self.router.include_router(asset_replacement.router, prefix=asset_replacement.prefix)
         self.router.include_router(texture_replacement.router, prefix=texture_replacement.prefix)
+        self.router.include_router(scatter.router, prefix=scatter.prefix)
 
     @classmethod
     @property

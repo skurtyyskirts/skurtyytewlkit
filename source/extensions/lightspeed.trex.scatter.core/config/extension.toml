@@ -20,6 +20,7 @@ icon = "data/icon.png"
 "omni.client" = {}
 "omni.flux.asset_importer.core" = {}
 "omni.flux.pip_archive" = {}
+"omni.flux.service.shared" = {}
 "omni.flux.utils.common" = {}
 "omni.flux.validator.factory" = {}
 "omni.kit.commands" = {}

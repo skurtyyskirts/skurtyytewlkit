@@ -29,7 +29,7 @@ from lightspeed.common.constants import IS_REMIX_REF_ATTR
 from lightspeed.hydra.remix.core import RemixSupport
 from lightspeed.trex.contexts.extension import get_instance as _get_context_manager
 from lightspeed.trex.contexts.setup import Contexts as _TrexContext
-from lightspeed.trex.scatter.core import ScatterBrushSettings, ScatterMode, get_scatter_brush_controller
+from lightspeed.trex.scatter.core import ApplyTo, ScatterBrushSettings, ScatterMode, get_scatter_brush_controller
 from lightspeed.trex.scatter.core.constants import IS_REMIX_SCATTER_ATTR
 from lightspeed.trex.viewports.manipulators import global_selection as _global_selection
 from lightspeed.trex.viewports.shared.widget import create_instance as _create_viewport_instance
@@ -56,8 +56,10 @@ _TOOL_LAYER_CATEGORY = "tools"
 _XFORM_OP_ORDER = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
 _DRAG_STEPS = 18
 # The brush is deterministic (fixed seed) and the cubes it places are scaled down so the CPU picker used in headless
-# tests keeps hitting the captured surface, not the cubes painted by the previous stroke of the same test.
+# tests keeps hitting the captured surface, not the cubes painted by the previous stroke of the same test. It paints on
+# whatever is under the cursor; the selected-mesh workflow switches to painting on the selection itself.
 _BRUSH_SETTINGS = {
+    "apply_to": ApplyTo.ALL,
     "radius": 60.0,
     "density": 6.0,
     "padding": 0.0,
@@ -260,6 +262,25 @@ class TestScatterBrushViewportE2E(OmniUiTest):
         # Each surface got its own container under its own prototype.
         self.assertGreaterEqual(len(self.__scatter_placements(_FLOOR_PROTOTYPE)), 1)
         self.assertGreaterEqual(len(self.__scatter_placements(_WALL_PROTOTYPE)), 1)
+
+    async def test_stroke_with_the_floor_selected_paints_only_the_floor(self):
+        # The user selects the captured floor and leaves the brush on its default: painting on the selection.
+        self._usd_context.get_selection().set_selected_prim_paths([_FLOOR_INSTANCE], False)
+        self.assertTrue(self._controller.update_settings(apply_to=ApplyTo.SELECTED))
+        self._controller.set_mode(ScatterMode.PAINT)
+        await ui_test.human_delay()
+
+        # The same drag that crosses both surfaces when the brush paints on every mesh.
+        await self.__aim_camera(_WIDE_CAMERA_POSITION, _WIDE_CAMERA_TARGET)
+        await self.__drag([self.__screen_point(point) for point in (*_FLOOR_STROKE, *_WALL_STROKE)])
+
+        # Only the selected floor received clumps, and they sit on its deck.
+        floor_placements = self.__scatter_placements(_FLOOR_PROTOTYPE)
+        self.assertGreaterEqual(len(floor_placements), 1)
+        self.assertEqual([], self.__scatter_placements(_WALL_PROTOTYPE))
+        for placement in floor_placements:
+            translate = placement.GetAttribute("xformOp:translate").Get()
+            self.assertAlmostEqual(_FLOOR_SURFACE_Z, translate[2], delta=_SURFACE_Z_TOLERANCE, msg=str(placement))
 
     async def test_b_hold_wheel_changes_radius_without_moving_camera(self):
         self._controller.set_mode(ScatterMode.PAINT)

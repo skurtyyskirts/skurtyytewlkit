@@ -22,10 +22,12 @@ icon = "data/icon.png"
 preview_image = "data/preview.png"
 
 category = "internal"
-version = "1.3.2"
+version = "1.3.3"
 repository = "https://gitlab-master.nvidia.com/lightspeedrtx/lightspeed-kit/-/tree/main/source/extensions/lightspeed.trex.viewports.stagecraft.bundle"
 
 [dependencies]
+# Provides the lookdev light rigs listed in the Lighting menu
+"lightspeed.trex.app.resources" = {}
 "omni.kit.viewport.registry" = {}
 # Load the stats HUD (resolution, fsp, etc..)
 "omni.hydra.engine.stats" = {}
@@ -47,6 +49,9 @@ persistent.exts."omni.kit.viewport.menubar.camera".expand = false
 exts."omni.kit.viewport.menubar.display".showByType.exclude_list = ["Lights"]
 # Set the default perspective camera focalLength
 persistent.app.primCreation.typedDefaults.camera.focalLength = 18.147562
+# The lookdev HDRI light rigs of the Lighting menu. The setting is shared by every viewport, so it matches the
+# IngestCraft viewport's value and loading IngestCraft on demand keeps the same list.
+exts."omni.kit.viewport.menubar.lighting".rigs = "${lightspeed.trex.app.resources}/deps/content/rtx-remix-lookdev-lighting/presets"
 
 [[test]]
 dependencies = [

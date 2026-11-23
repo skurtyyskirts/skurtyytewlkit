@@ -249,6 +249,38 @@ class TestGeometryFunctions(omni.kit.test.AsyncTestCase):
             atol=1e-12,
         )
 
+    async def test_build_mesh_geometry_with_authored_uniform_normals_past_a_skipped_face_aligns_per_face(self):
+        # Arrange - a two-vertex face that is skipped, then the two stacked quads, with one authored normal per face
+        stage = Usd.Stage.CreateInMemory()
+        upper = [(x, y, 5.0) for x, y, _ in _QUAD_POINTS]
+        mesh = _define_mesh(stage, _MESH_PATH, [*_QUAD_POINTS, *upper], [2, 4, 4], [0, 1, 0, 1, 2, 3, 4, 5, 6, 7])
+        mesh.GetNormalsAttr().Set(
+            Vt.Vec3fArray([Gf.Vec3f(0.0, 0.0, 1.0), Gf.Vec3f(0.0, 0.0, -1.0), Gf.Vec3f(0.0, 0.0, 1.0)])
+        )
+        mesh.SetNormalsInterpolation(UsdGeom.Tokens.uniform)
+
+        # Act
+        geometry = build_mesh_geometry(mesh.GetPrim())
+
+        # Assert - each quad takes the normal of its own face, not the one of the face skipped ahead of it
+        np.testing.assert_allclose(
+            geometry.face_normals,
+            [[0.0, 0.0, -1.0], [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+            atol=1e-12,
+        )
+
+    async def test_build_mesh_geometry_with_a_negative_face_count_builds_the_faces_ahead_of_it(self):
+        # Arrange - a corrupt count after one good quad
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _define_mesh(stage, _MESH_PATH, _QUAD_POINTS, [4, -7], [0, 1, 2, 3])
+
+        # Act
+        geometry = build_mesh_geometry(mesh.GetPrim())
+
+        # Assert
+        self.assertEqual(geometry.triangle_count, 2)
+        np.testing.assert_allclose(geometry.face_normals, [[0.0, 0.0, 1.0]] * 2, atol=1e-12)
+
     async def test_build_mesh_geometry_with_mirrored_transform_keeps_outward_normals(self):
         # Arrange
         stage = Usd.Stage.CreateInMemory()
@@ -441,6 +473,74 @@ class TestGeometryFunctions(omni.kit.test.AsyncTestCase):
         np.testing.assert_array_equal(valid, expected_valid)
         np.testing.assert_array_equal(positions[valid], [sample.position for sample in expected if sample is not None])
         np.testing.assert_array_equal(normals[valid], [sample.normal for sample in expected if sample is not None])
+
+    async def test_closest_points_with_reach_wider_than_the_mesh_matches_an_exhaustive_search(self):
+        # Arrange - points on, above, below and far beyond the edges of a bumpy grid, with a reach covering all of it
+        stage = Usd.Stage.CreateInMemory()
+        geometry = build_mesh_geometry(_define_bumpy_grid_mesh(stage, cells=16).GetPrim())
+        points = np.random.default_rng(5).uniform([-200.0, -200.0, -60.0], [360.0, 360.0, 60.0], size=(300, 3))
+        corners = geometry.vertices[geometry.triangles]
+        expected_positions = []
+        for point in points:
+            closest = geometry_module._closest_points_on_triangle_pairs(
+                np.repeat(point[None, :], len(corners), axis=0), corners[:, 0], corners[:, 1], corners[:, 2]
+            )
+            offsets = closest - point
+            expected_positions.append(closest[np.argmin(np.einsum("ij,ij->i", offsets, offsets))])
+
+        # Act
+        positions, _normals, valid = closest_points(points, geometry, max_distance=1000.0)
+
+        # Assert
+        self.assertTrue(np.all(valid))
+        np.testing.assert_allclose(positions, expected_positions, atol=1e-9)
+
+    async def test_closest_points_with_non_finite_point_marks_only_it_invalid(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        geometry = build_mesh_geometry(_define_quad_mesh(stage).GetPrim())
+        points = np.array([[3.0, 2.0, 1.0], [np.nan, 2.0, 1.0], [np.inf, 0.0, 0.0]])
+
+        # Act
+        positions, _normals, valid = closest_points(points, geometry, max_distance=50.0)
+
+        # Assert
+        np.testing.assert_array_equal(valid, [True, False, False])
+        np.testing.assert_allclose(positions[0], [3.0, 2.0, 0.0], atol=1e-9)
+
+    async def test_closest_point_on_triangles_equidistant_from_two_triangles_returns_the_lower_index(self):
+        # Arrange - the quad's two triangles share the diagonal the point stands over
+        stage = Usd.Stage.CreateInMemory()
+        geometry = build_mesh_geometry(_define_quad_mesh(stage).GetPrim())
+
+        # Act
+        sample = closest_point_on_triangles(np.array([5.0, 5.0, 1.0]), geometry, max_distance=10.0)
+
+        # Assert
+        self.assertEqual(sample.triangle_index, 0)
+        self.assertAlmostEqual(sample.distance, 1.0)
+
+    async def test_raycast_on_a_mesh_of_many_search_blocks_matches_a_single_block_search(self):
+        # Arrange - the grid's triangles span several blocks; one block holding all of them tests every triangle
+        stage = Usd.Stage.CreateInMemory()
+        mesh = _define_bumpy_grid_mesh(stage, cells=16)
+        geometry = build_mesh_geometry(mesh.GetPrim())
+        self.assertGreater(geometry.search_index.blocks.shape[0], 1)
+        with mock.patch.object(geometry_module, "_SEARCH_BLOCK_SIZE", geometry.triangle_count):
+            exhaustive = build_mesh_geometry(mesh.GetPrim())
+            # The index is built on first use, so it has to be built while the patch holds.
+            self.assertEqual(exhaustive.search_index.blocks.shape[0], 1)
+        origins = [np.array([x, y, 50.0]) for x in (5.0, 47.5, 85.0, 140.0) for y in (3.0, 80.0, 121.5)]
+        direction = np.array([0.1, -0.05, -1.0])
+
+        # Act
+        hits = [raycast(origin, direction, geometry) for origin in origins]
+
+        # Assert
+        expected = [raycast(origin, direction, exhaustive) for origin in origins]
+        self.assertTrue(all(hit is not None for hit in expected))
+        self.assertEqual([hit[1] for hit in hits], [hit[1] for hit in expected])
+        np.testing.assert_allclose([hit[0] for hit in hits], [hit[0] for hit in expected], rtol=1e-12)
 
     async def test_morton_order_returns_a_permutation_of_every_point_index(self):
         # Arrange
@@ -1029,6 +1129,38 @@ class TestMeshSurfaceCache(omni.kit.test.AsyncTestCase):
         self.assertEqual(normals.shape, (2, 3))
         np.testing.assert_array_equal(valid, [False, False])
 
+    async def test_closest_samples_returns_what_closest_point_returns_for_each_point(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        _define_quad_mesh(stage)
+        cache = MeshSurfaceCache(lambda: stage)
+        self.addCleanup(cache.destroy)
+        points = np.array([[3.0, 2.0, 1.0], [50.0, 50.0, 50.0], [9.0, 4.0, -2.0]])
+        expected = [cache.closest_point(_MESH_PATH, point, 5.0) for point in points]
+
+        # Act
+        samples = cache.closest_samples(_MESH_PATH, points, 5.0)
+
+        # Assert
+        self.assertIsNone(samples[1])
+        for sample, wanted in zip(samples[::2], expected[::2]):
+            np.testing.assert_array_equal(sample.position, wanted.position)
+            np.testing.assert_array_equal(sample.normal, wanted.normal)
+            self.assertEqual(sample.triangle_index, wanted.triangle_index)
+            self.assertEqual(sample.distance, wanted.distance)
+
+    async def test_closest_samples_with_missing_mesh_returns_none_for_every_point(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        cache = MeshSurfaceCache(lambda: stage)
+        self.addCleanup(cache.destroy)
+
+        # Act
+        samples = cache.closest_samples("/World/Missing", np.array([[1.0, 1.0, 2.0], [8.0, 9.0, -3.0]]), 5.0)
+
+        # Assert
+        self.assertEqual(samples, [None, None])
+
     async def test_raycast_returns_sample_at_hit(self):
         # Arrange
         stage = Usd.Stage.CreateInMemory()
@@ -1056,3 +1188,90 @@ class TestMeshSurfaceCache(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertIsNone(sample)
+
+    def _cache_with_an_evicted_mesh(self, stage: Usd.Stage) -> MeshSurfaceCache:
+        """A cache of one entry that read ``/World/A`` and then ``/World/B``, so A's geometry is gone again."""
+        _define_quad_mesh(stage, "/World/A")
+        _define_quad_mesh(stage, "/World/B", _translated_quad_points((100.0, 0.0, 0.0)))
+        cache = MeshSurfaceCache(lambda: stage, max_entries=1)
+        cache.get("/World/A")
+        cache.get("/World/B")
+        return cache
+
+    async def test_raycast_missing_the_bounds_of_an_evicted_mesh_returns_none_without_rebuilding_it(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        cache = self._cache_with_an_evicted_mesh(stage)
+
+        # Act
+        with mock.patch.object(geometry_module, "build_mesh_geometry") as build_mock:
+            sample = cache.raycast("/World/A", Gf.Vec3d(50.0, 50.0, 10.0), Gf.Vec3d(0.0, 0.0, -1.0))
+
+        # Assert
+        self.assertIsNone(sample)
+        build_mock.assert_not_called()
+
+    async def test_raycast_through_the_bounds_of_an_evicted_mesh_rebuilds_it_and_returns_the_hit(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        cache = self._cache_with_an_evicted_mesh(stage)
+
+        # Act
+        sample = cache.raycast("/World/A", Gf.Vec3d(2.0, 2.0, 10.0), Gf.Vec3d(0.0, 0.0, -1.0))
+
+        # Assert
+        np.testing.assert_allclose(sample.position, [2.0, 2.0, 0.0], atol=1e-9)
+
+    async def test_raycast_after_an_evicted_mesh_moved_reads_it_again_rather_than_trusting_its_old_bounds(self):
+        # Arrange - the mesh moves 50 along X after its geometry was evicted, and the stage says so
+        stage = Usd.Stage.CreateInMemory()
+        cache = self._cache_with_an_evicted_mesh(stage)
+        points = Vt.Vec3fArray([Gf.Vec3f(*point) for point in _translated_quad_points((50.0, 0.0, 0.0))])
+        UsdGeom.Mesh(stage.GetPrimAtPath("/World/A")).GetPointsAttr().Set(points)
+        self._notify(_FakeNotice(changed_info_only=["/World/A.points"]), stage)
+
+        # Act
+        sample = cache.raycast("/World/A", Gf.Vec3d(55.0, 5.0, 10.0), Gf.Vec3d(0.0, 0.0, -1.0))
+
+        # Assert
+        np.testing.assert_allclose(sample.position, [55.0, 5.0, 0.0], atol=1e-9)
+
+    async def test_invalidate_with_many_unrelated_paths_keeps_every_entry(self):
+        # Arrange - what a stroke reports: thousands of new placements, none of them a mesh the cache read
+        stage = Usd.Stage.CreateInMemory()
+        _define_quad_mesh(stage, "/World/Xform/A")
+        cache = MeshSurfaceCache(lambda: stage)
+        cache.get("/World/Xform/A")
+        placements = [f"/World/Xform/scatter_default/s_{index:012d}" for index in range(2000)]
+
+        # Act
+        cache.invalidate(placements)
+
+        # Assert
+        self.assertEqual(list(cache._entries.keys()), [Sdf.Path("/World/Xform/A")])
+
+    async def test_invalidate_with_the_root_path_drops_every_entry(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        _define_quad_mesh(stage, "/World/A")
+        cache = MeshSurfaceCache(lambda: stage)
+        cache.get("/World/A")
+
+        # Act
+        cache.invalidate([Sdf.Path.absoluteRootPath])
+
+        # Assert
+        self.assertEqual(len(cache._entries), 0)
+
+    async def test_invalidate_with_a_property_path_drops_the_entry_of_the_prim_owning_it(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        _define_quad_mesh(stage, "/World/A")
+        cache = MeshSurfaceCache(lambda: stage)
+        cache.get("/World/A")
+
+        # Act
+        cache.invalidate(["/World/A.points"])
+
+        # Assert
+        self.assertEqual(len(cache._entries), 0)

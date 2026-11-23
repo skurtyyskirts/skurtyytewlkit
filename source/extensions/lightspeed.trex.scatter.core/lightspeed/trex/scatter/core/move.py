@@ -37,8 +37,10 @@ from .settings import LIVE_EDIT_SOFT_LIMIT
 from .sampling import (
     ParentSpaceOrigin,
     rotation_to_xyz_degrees,
+    stage_up_axis,
     to_parent_space_origin,
     turn_to_degrees,
+    up_axis_vector,
 )
 from .targets import build_prototype_target
 
@@ -296,7 +298,7 @@ def prepare_move(stage: Usd.Stage, layer: Sdf.Layer, scope: ReapplyScope, cache:
             recovered = origin is None
             on_surface = True
             if origin is None:
-                origin, on_surface = _origin_under(current, target, cache, reach)
+                origin, on_surface = _origin_under(current, target, cache, reach, up_axis_vector(stage_up_axis(stage)))
             placements.append(
                 _PreparedPlacement(
                     current=current,
@@ -444,12 +446,19 @@ def _rotated_euler(rotate_xyz: Sequence[float], turn: Gf.Matrix4d) -> tuple[floa
 
 
 def _origin_under(
-    current: PlacementTransform, target: ScatterTarget, cache: MeshSurfaceCache, reach: float
+    current: PlacementTransform, target: ScatterTarget, cache: MeshSurfaceCache, reach: float, up_world: Gf.Vec3d
 ) -> tuple[ParentSpaceOrigin, bool]:
     """Build the surface a placement that recorded none is standing on, from where it sits now.
 
     Falling back to the stage up axis when the mesh cannot be reached keeps the drag rigid for that placement rather
     than dropping it, which is the same bargain ``move_scope`` makes for a placement that cannot settle.
+
+    Args:
+        current: Transform the placement authors now.
+        target: Target the placement was painted on.
+        cache: Mesh cache used to project the placement onto the capture mesh.
+        reach: How far from the placement the surface is looked for.
+        up_world: Up axis of the stage, as a world direction.
 
     Returns:
         ``(origin, on_surface)``, where ``on_surface`` is False for the fallback that is not on the mesh.
@@ -457,7 +466,9 @@ def _origin_under(
     position = Gf.Vec3d(*current.translate)
     settled = _surface_under(position, target, cache, reach)
     if settled is None:
-        return ParentSpaceOrigin(position=position, normal=Gf.Vec3d(0.0, 0.0, 1.0)), False
+        # A recorded normal is kept in the space of the parent instance, so world up is brought into it.
+        fallback = to_parent_space_origin(target.parent_world.Transform(position), up_world, target.parent_world)
+        return ParentSpaceOrigin(position=position, normal=fallback.normal), False
     return ParentSpaceOrigin(position=settled[0], normal=settled[1]), True
 
 

@@ -228,8 +228,10 @@ The Scatter window groups the brush parameters into collapsible sections:
   Surface authors under whatever mesh is under the cursor, Anchor always authors under one pinned prototype, set with
   the **Use Selection** button), **Erase Scope** (All Scattered or Brush Assets, controlling what Shift+drag or Erase
   mode removes), and **Flood Cap**, the placement limit for the **Flood** button, which fills the anchor or the
-  selected captured meshes with placements in a single undoable step; requesting more than the default cap asks for
-  confirmation first. **Prim Budget** sets when the brush's live stroke counter reports a stroke as expensive.
+  selected captured meshes with placements in a single undoable step; requesting more than the default cap, or a
+  flood that would render more than the Prim Budget, asks for confirmation first. **Prim Budget** sets when the
+  brush's live stroke counter reports a stroke as expensive, and five times its value is where one stroke or one
+  flood stops.
 
 ### Tuning What You Already Painted
 
@@ -312,17 +314,28 @@ front of the player. That multiplier, not the number of strokes, is what decides
 While a paint stroke is running, the brush prints a running total next to the cursor. It reads `1,200 prims` on a
 prototype with a single instance, and `1,200 placed  ->  60,000 prims` on one that replicates, so the multiplier is
 visible while there is still time to undo. The text turns amber once the stroke passes **Prim Budget** and red at
-five times it. It only reports: no stroke is ever cut short, and the counter is not shown while erasing.
+five times it, which is where the stroke stops: the counter reads `(limit reached)`, the cursor turns grey, and the
+status line of the Scatter window says so when you release the mouse. Everything painted up to that point is kept as
+one undo step, and the next stroke starts a new count. The counter is not shown while erasing.
 
-Three settings decide how much a stroke can author:
+```{note}
+The limit is there so that one drag cannot fill a level with more than the game can draw. If you do want more in one
+stroke, raise **TARGET ▸ Prim Budget**; if you only want the same look for less, raise **Padding**. A mesh with more
+instances than the stroke has room left for is skipped, because a single placement on it already renders more than
+the stroke may still add: the cursor turns grey over it, the counter reads `(too many instances here)`, and the
+stroke carries on over the meshes it can still paint.
+```
 
-* **Padding** is the real limit. It is the minimum distance between placements and it holds for the whole stroke, so
-  it caps the total no matter how high **Density** goes. At the default of 10, a 1000-unit drag with a 50-unit radius
-  cannot exceed about 1,250 placements. **Setting Padding to 0 removes the limit entirely** and lets one long drag
-  author an unbounded number of placements.
+Three settings decide how much a stroke authors before it gets there:
+
+* **Padding** is what spaces a stroke out. It is the minimum distance between placements and it holds for the whole
+  stroke, on every instance of the mesh the stroke crosses, so it caps the total no matter how high **Density** goes.
+  At the default of 10, a 1000-unit drag with a 50-unit radius cannot exceed about 1,250 placements. With Padding at
+  0 nothing spaces the placements, and only the stroke limit stops a long drag.
 * **Density** and **Stamp Spacing** decide how quickly the stroke approaches that cap. The defaults (density 8,
   spacing 25, Smooth falloff) author about 96 placements over a 1000-unit drag, which stays inside a 10,000-prim
-  budget until the target has more than about 100 instances.
+  budget until the target has more than about 100 instances. A density below 1 places a candidate on only some of
+  the stamps, so 0.5 is one every other stamp.
 * **Falloff** thins every stamp: Smooth and Linear keep roughly 30% of the candidates drawn, Sphere about 67%, and
   Constant all of them. Switching from Smooth to Constant roughly triples a stroke.
 

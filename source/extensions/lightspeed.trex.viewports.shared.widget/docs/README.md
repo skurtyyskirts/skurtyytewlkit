@@ -16,7 +16,10 @@ camera-mutating action is canceled and a warning explains that the capture game 
 - Coordinate viewport layers, tools, statistics, activation, and renderer startup behavior.
 - Host the viewport toolbar tools: Teleport and the Scatter Brush (toolbar toggle, `Ctrl+B`, `B`+wheel radius
   sizing, paint/erase strokes with a surface-following cursor, and a live counter of the prims the stroke is adding
-  to the rendered stage).
+  to the rendered stage). The tool resumes a stroke that fell behind its frame budget on every frame, so a stroke
+  heavier than a frame trails the cursor and catches up, and the counter reads "(catching up)" while it does. When a
+  stroke reaches its prim limit the counter reads "(limit reached)" and the cursor turns grey, and every stroke ends
+  with a status line saying what it painted or erased, or why it painted less than the path that was drawn.
 - Let viewport tools claim the mouse wheel before the camera zooms through the mouse-wheel interceptor hook on
   `ViewportEventDelegate`.
 - Retry supported viewport initialization once and report terminal startup failures through an Exit-only dialog.
@@ -42,6 +45,30 @@ camera-mutating action is canceled and a warning explains that the capture game 
 - `events.ViewportEventDelegate` routes wheel, key, and drop events of a scene view;
   `events.register_mouse_wheel_interceptor` lets a tool consume wheel events before flight-speed and zoom
   handling.
+
+## Scatter brush picking
+
+The brush asks the renderer what is under the cursor, which on a captured ground is as often a foliage card, a prop or
+earlier scatter as the ground itself. While the brush's Apply To is Selected, its default, `tools/scatter_brush.py`
+casts the camera ray at the selected capture meshes on the CPU instead (`selected_capture_meshes` and
+`MeshSurfaceCache.raycast` from the scatter core), cancels any renderer pick still in flight so it cannot move the
+cursor back onto what stands in front, and falls back to the renderer pick only to show a grey cursor off the
+selection. A stroke started with nothing selected is refused with a status message. The cursor's normal is turned
+toward the camera, and every stroke is handed the camera position so the core paints the side of the surface the user
+is looking at, whichever way the capture wound its triangles.
+
+## Scatter brush stroke feedback
+
+The core stops a stroke at five times the brush's Prim Budget in rendered prims, skips a mesh with more instances
+than the stroke has room left for, and stops catching up a second after the mouse is released. Each leaves part of
+the drawn path unpainted, which would read as a fault of the brush if nothing said so, so `tools/scatter_brush.py`
+reports them: the status line of the Scatter window says what the stroke did paint, then names the reason and the
+setting that changes it, and a notification says it the first time for each reason while the brush stays on. The
+cursor is grey and the counter says why wherever a stamp would place nothing. A stroke that ends normally posts what
+it painted (placements and the prims they render) or erased, which also takes an earlier stroke's message off the
+status line, and one stopped by an error says so and keeps what it painted. The summary goes through
+`ScatterBrushController.post_stroke_summary`, which keeps an up-axis warning the stroke started with in front of it. The cursor follows Shift as it is pressed
+and released with the mouse at rest, so it shows red before an erase stroke starts rather than after the first move.
 
 ## Scatter move gizmo
 

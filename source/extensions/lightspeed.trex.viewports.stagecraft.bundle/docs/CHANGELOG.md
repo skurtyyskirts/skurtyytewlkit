@@ -5,6 +5,10 @@ This document records all notable changes to ``omni.kit.viewport.bundle`` extens
 This project adheres to `Semantic Versioning <https://semver.org/>`_.
 
 
+## [1.3.3]
+### Fixed
+- Listed the lookdev HDRI light rigs in the StageCraft viewport's Lighting menu again without IngestCraft being loaded.
+
 ## [1.3.2]
 ### Changed
 - Updated extension metadata for Kit SDK 110 compatibility.

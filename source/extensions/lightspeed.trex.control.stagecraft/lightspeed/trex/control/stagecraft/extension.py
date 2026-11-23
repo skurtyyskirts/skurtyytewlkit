@@ -22,6 +22,7 @@ from lightspeed.trex.contexts import get_instance as trex_contexts_instance
 from lightspeed.trex.contexts.setup import Contexts as _TrexContexts
 
 from . import commands
+from .light_rigs import LightRigMenu as _LightRigMenu
 from .setup import Setup as _StageCraftSetup
 from .unsaved_stage import EventUnsavedStageOnShutdown
 
@@ -34,6 +35,7 @@ class TrexStageCraftControlExtension(omni.ext.IExt):
         super().__init__(*args, **kwargs)
         self._setup = None
         self._unsaved_event = None
+        self._light_rig_menu = None
 
     def on_startup(self, ext_id):
         """Create and register StageCraft resources."""
@@ -48,10 +50,14 @@ class TrexStageCraftControlExtension(omni.ext.IExt):
         self._unsaved_event.register_interrupter(self._setup)
         _get_event_manager_instance().register_event(self._unsaved_event)
         self._setup.register_sidebar_items()
+        self._light_rig_menu = _LightRigMenu()
 
     def on_shutdown(self):
         """Unregister and release StageCraft resources."""
         carb.log_info("[lightspeed.trex.control.stagecraft] Shutdown")
+        if self._light_rig_menu:
+            self._light_rig_menu.destroy()
+        self._light_rig_menu = None
         if self._unsaved_event:
             _get_event_manager_instance().unregister_event(self._unsaved_event)
         self._unsaved_event = None

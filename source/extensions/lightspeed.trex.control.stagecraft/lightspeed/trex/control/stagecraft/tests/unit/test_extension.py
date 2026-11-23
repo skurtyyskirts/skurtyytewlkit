@@ -26,11 +26,12 @@ from lightspeed.trex.control.stagecraft.extension import TrexStageCraftControlEx
 class TestExtensionLifecycle(omni.kit.test.AsyncTestCase):
     """Test StageCraft extension resource ownership."""
 
-    async def test_startup_owns_stagecraft_setup(self):
-        """Retain the StageCraft setup on the extension instance."""
+    async def test_startup_owns_stagecraft_setup_and_light_rig_menu(self):
+        """Retain the StageCraft setup and the Lighting menu rigs on the extension instance."""
         # Arrange
         extension = TrexStageCraftControlExtension()
         setup = MagicMock()
+        light_rig_menu = MagicMock()
         contexts = MagicMock()
         event_manager = MagicMock()
 
@@ -39,21 +40,25 @@ class TestExtensionLifecycle(omni.kit.test.AsyncTestCase):
             patch.object(_extension_module.commands, "register_commands"),
             patch.object(_extension_module, "_get_event_manager_instance", return_value=event_manager),
             patch.object(_extension_module, "_StageCraftSetup", return_value=setup),
+            patch.object(_extension_module, "_LightRigMenu", return_value=light_rig_menu),
         ):
             # Act
             extension.on_startup("lightspeed.trex.control.stagecraft")
 
         # Assert
         self.assertIs(setup, extension._setup)
+        self.assertIs(light_rig_menu, extension._light_rig_menu)
 
-    async def test_shutdown_unregisters_event_and_releases_stagecraft_setup(self):
-        """Unregister the shutdown event and release StageCraft during extension shutdown."""
+    async def test_shutdown_unregisters_event_and_releases_stagecraft_setup_and_light_rig_menu(self):
+        """Unregister the shutdown event and release StageCraft and the Lighting menu rigs during shutdown."""
         # Arrange
         extension = TrexStageCraftControlExtension()
         setup = MagicMock()
+        light_rig_menu = MagicMock()
         unsaved_event = MagicMock()
         event_manager = MagicMock()
         extension._setup = setup
+        extension._light_rig_menu = light_rig_menu
         extension._unsaved_event = unsaved_event
 
         with (
@@ -66,5 +71,7 @@ class TestExtensionLifecycle(omni.kit.test.AsyncTestCase):
         # Assert
         event_manager.unregister_event.assert_called_once_with(unsaved_event)
         setup.destroy.assert_called_once_with()
+        light_rig_menu.destroy.assert_called_once_with()
         self.assertIsNone(extension._unsaved_event)
         self.assertIsNone(extension._setup)
+        self.assertIsNone(extension._light_rig_menu)

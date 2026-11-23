@@ -18,11 +18,13 @@
 from .e2e.test_capture_repair_on_open import TestCaptureRepairOnOpen
 from .e2e.test_capture_swap_undo import TestCaptureSwapUndo
 from .e2e.test_hotkeys import TestHotkeys
-from .e2e.test_lighting import TestLightingRigSwap
+from .e2e.test_lighting import TestLightingRigSwap, TestModSkyLightRigs
 from .e2e.test_stage_manager import TestStageManagerPropertiesInteraction
 from .e2e.test_startup_chain import TestStartupChain
 from .unit.test_commands import TestCommands
 from .unit.test_extension import TestExtensionLifecycle
+from .unit.test_light_rigs import TestLightRigMenu
+from .unit.test_mod_skies import TestModSky, TestModSkyRigs, TestReadModSkies, TestWriteModSkyRig
 from .unit.test_setup import TestSetup as TestSetupUnit
 from .unit.test_stage_manager_schema import TestStageManagerSchema
 
@@ -32,9 +34,15 @@ __all__ = [
     "TestCommands",
     "TestExtensionLifecycle",
     "TestHotkeys",
+    "TestLightRigMenu",
     "TestLightingRigSwap",
+    "TestModSky",
+    "TestModSkyLightRigs",
+    "TestModSkyRigs",
+    "TestReadModSkies",
     "TestSetupUnit",
     "TestStageManagerPropertiesInteraction",
     "TestStageManagerSchema",
     "TestStartupChain",
+    "TestWriteModSkyRig",
 ]

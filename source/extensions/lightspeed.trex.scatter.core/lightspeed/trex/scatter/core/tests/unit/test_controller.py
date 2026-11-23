@@ -73,7 +73,7 @@ def _make_record(name: str) -> mock.Mock:
     return record
 
 
-def _make_target(prototype_name: str) -> SimpleNamespace:
+def _make_target(prototype_name: str, instance_count: int = 1) -> SimpleNamespace:
     """Build a ScatterTarget-like value for a prototype hash name."""
     hash_name = prototype_name.removeprefix("mesh_")
     return SimpleNamespace(
@@ -81,7 +81,7 @@ def _make_target(prototype_name: str) -> SimpleNamespace:
         parent_instance_root=Sdf.Path(f"/RootNode/instances/inst_{hash_name}_0"),
         mesh_path=Sdf.Path(f"/RootNode/instances/inst_{hash_name}_0/mesh"),
         parent_world=Gf.Matrix4d(1.0),
-        instance_count=1,
+        instance_count=instance_count,
     )
 
 
@@ -149,11 +149,14 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
             "group": (controller_module.omni.kit.undo, "group", {"return_value": contextlib.nullcontext()}),
             "execute": (controller_module.omni.kit.commands, "execute", {"return_value": (True, None)}),
             "generate_flood": (controller_module, "generate_flood", {"return_value": []}),
+            # A surface that takes more than any cap under test, so the caps are what bound a flood by default.
+            "flood_sample_count": (controller_module, "flood_sample_count", {"return_value": 10**6}),
             "existing_placement_points": (
                 controller_module,
                 "existing_placement_points",
                 {"return_value": np.empty((0, 3))},
             ),
+            "instanced_points": (controller_module, "instanced_points", {"return_value": np.empty((0, 3))}),
             "stage_up_axis": (controller_module, "stage_up_axis", {"return_value": UpAxis.Z}),
             "PaddingIndex": (controller_module, "PaddingIndex", {}),
         }
@@ -287,6 +290,50 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual(self._persisted_settings()["preset_name"], "Replaced")
         callback.assert_called_once_with(self.controller.settings)
 
+    async def test_reset_settings_restores_every_default_and_fires_settings_changed(self):
+        # Arrange
+        self.controller.replace_settings(ScatterBrushSettings(radius=500.0, conform_to_surface=True))
+        callback = self._subscribe(self.controller.subscribe_settings_changed)
+
+        # Act
+        self.controller.reset_settings()
+
+        # Assert
+        self.assertEqual(self.controller.settings, ScatterBrushSettings())
+        self.assertEqual(self._persisted_settings()["radius"], ScatterBrushSettings().radius)
+        callback.assert_called_once_with(self.controller.settings)
+
+    async def test_reset_settings_keeps_the_preset_being_edited(self):
+        # Arrange - the preset name names the container the next stroke goes into
+        self.controller.replace_settings(ScatterBrushSettings(radius=500.0, preset_name="Grass"))
+
+        # Act
+        self.controller.reset_settings()
+
+        # Assert
+        self.assertEqual(self.controller.settings, ScatterBrushSettings(preset_name="Grass"))
+
+    async def test_reset_settings_with_live_editing_off_leaves_it_off(self):
+        # Arrange - turning it back on would rewrite the selected scatter with the defaults being restored
+        self.controller.update_settings(edit_selection_live=False, radius=500.0)
+
+        # Act
+        self.controller.reset_settings()
+
+        # Assert
+        self.assertEqual(self.controller.settings, ScatterBrushSettings(edit_selection_live=False))
+
+    async def test_reset_settings_keeps_the_asset_palette(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Y)
+        palette = self.controller.assets
+
+        # Act
+        self.controller.reset_settings()
+
+        # Assert
+        self.assertEqual(self.controller.assets, palette)
+
     async def test_add_asset_reads_up_axis_and_appends_entry(self):
         # Arrange
         callback = self._subscribe(self.controller.subscribe_assets_changed)
@@ -385,6 +432,18 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual(callback.call_count, 1)
         self.assertIn("Y-up", callback.call_args.args[0])
 
+    async def test_report_mismatched_asset_up_axes_says_where_to_fix_it(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Y)
+        callback = self._subscribe(self.controller.subscribe_status_message)
+
+        with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Z):
+            # Act
+            self.controller.report_mismatched_asset_up_axes()
+
+        # Assert
+        self.assertIn("Placement > Asset Up Axis", callback.call_args.args[0])
+
     async def test_report_mismatched_asset_up_axes_with_matching_or_unauthored_axis_says_nothing(self):
         cases = [("matches the file", UpAxis.Z), ("file authors nothing", None)]
         for title, authored in cases:
@@ -415,6 +474,50 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
 
         # Assert
         self.assertEqual(reported, [_ROCK])
+
+    async def test_post_stroke_summary_after_an_up_axis_mismatch_keeps_the_mismatch_in_front_of_it(self):
+        # Arrange - the mismatch is reported as the stroke starts, and the summary arrives when it ends
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Y):
+            self.controller.next_stroke()
+        callback = self._subscribe(self.controller.subscribe_status_message)
+
+        # Act
+        self.controller.post_stroke_summary("Painted 3 placements, rendering 3 prims")
+
+        # Assert
+        text, is_error = callback.call_args.args
+        self.assertIn("is authored Y-up but the brush is set to Z-up", text)
+        self.assertTrue(text.endswith(". Painted 3 placements, rendering 3 prims"))
+        self.assertFalse(is_error)
+
+    async def test_post_stroke_summary_repeats_an_up_axis_mismatch_for_one_stroke_only(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Y):
+            self.controller.next_stroke()
+        self.controller.post_stroke_summary("Painted 3 placements, rendering 3 prims")
+        callback = self._subscribe(self.controller.subscribe_status_message)
+
+        # Act
+        self.controller.post_stroke_summary("Painted 5 placements, rendering 5 prims")
+
+        # Assert
+        callback.assert_called_once_with("Painted 5 placements, rendering 5 prims", False)
+
+    async def test_post_stroke_summary_after_the_up_axis_was_corrected_drops_the_mismatch(self):
+        # Arrange
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        with mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Y):
+            self.controller.next_stroke()
+        self.controller.set_asset_up_axis(_ROCK, UpAxis.Y)
+        callback = self._subscribe(self.controller.subscribe_status_message)
+
+        # Act
+        self.controller.post_stroke_summary("Erased 2 placements")
+
+        # Assert
+        callback.assert_called_once_with("Erased 2 placements", False)
 
     async def test_next_stroke_reports_a_mismatched_up_axis(self):
         # Arrange
@@ -611,6 +714,18 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual((self.controller.settings.preset_name, self.controller.settings.radius), ("Grass", 123.0))
         callback.assert_called_once_with(self.controller.settings)
 
+    async def test_apply_preset_saved_with_live_editing_on_leaves_it_off_when_it_is_off(self):
+        # Arrange - a preset describes a brush; turning live editing on would rewrite the selection as it loads
+        self.controller.update_settings(edit_selection_live=False)
+        self.preset_store.load.return_value = ScatterBrushSettings(preset_name="Grass", edit_selection_live=True)
+
+        # Act
+        self.controller.apply_preset("Grass")
+
+        # Assert
+        self.assertFalse(self.controller.settings.edit_selection_live)
+        self.assertEqual(self.controller.settings.preset_name, "Grass")
+
     async def test_apply_preset_when_store_raises_returns_false_and_posts_status(self):
         # Arrange
         self.preset_store.load.side_effect = ValueError("corrupt")
@@ -770,6 +885,81 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertFalse(result)
         self.assertEqual(self.controller.settings.anchor_prototype_path, "")
         status_callback.assert_called_once()
+
+    async def test_instance_all_executes_the_instance_command_on_the_edit_layer(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        status_callback = self._subscribe(self.controller.subscribe_status_message)
+        with (
+            mock.patch.object(controller_module.omni.usd, "get_context", return_value=_make_usd_context(stage)),
+            mock.patch.object(controller_module.omni.kit.commands, "execute", return_value=(True, 7)) as execute,
+        ):
+            # Act
+            count = self.controller.instance_all("scatter_context")
+
+        # Assert
+        self.assertEqual(count, 7)
+        execute.assert_called_once_with(
+            "ScatterInstanceCommand",
+            context_name="scatter_context",
+            layer_identifier=stage.GetEditTarget().GetLayer().identifier,
+        )
+        self.assertEqual(status_callback.call_args.args, ("Instanced 7 placements", False))
+
+    async def test_instance_all_without_a_stage_reports_an_error(self):
+        # Arrange
+        status_callback = self._subscribe(self.controller.subscribe_status_message)
+        with (
+            mock.patch.object(controller_module.omni.usd, "get_context", return_value=_make_usd_context(None)),
+            mock.patch.object(controller_module.omni.kit.commands, "execute") as execute,
+        ):
+            # Act
+            count = self.controller.instance_all("")
+
+        # Assert
+        self.assertEqual(count, 0)
+        execute.assert_not_called()
+        self.assertTrue(status_callback.call_args.args[1])
+
+    async def test_split_selection_splits_the_named_instancers_and_selects_their_containers(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        usd_context = _make_usd_context(stage)
+        instancer = Sdf.Path("/RootNode/meshes/mesh_A/instanced_default")
+        split = ["/RootNode/meshes/mesh_A/scatter_default/s_000000000001"]
+        with (
+            mock.patch.object(controller_module.omni.usd, "get_context", return_value=usd_context),
+            mock.patch.object(controller_module, "instancers_of_selection", return_value=[instancer]),
+            mock.patch.object(controller_module.omni.kit.commands, "execute", return_value=(True, split)) as execute,
+        ):
+            # Act
+            count = self.controller.split_selection("scatter_context")
+
+        # Assert
+        self.assertEqual(count, 1)
+        self.assertEqual(execute.call_args.args, ("ScatterSplitCommand",))
+        self.assertEqual(execute.call_args.kwargs["instancer_paths"], [str(instancer)])
+        usd_context.get_selection.return_value.set_selected_prim_paths.assert_called_once_with(
+            ["/RootNode/meshes/mesh_A/scatter_default"], True
+        )
+
+    async def test_split_selection_without_instanced_scatter_reports_an_error(self):
+        # Arrange
+        status_callback = self._subscribe(self.controller.subscribe_status_message)
+        with (
+            mock.patch.object(
+                controller_module.omni.usd, "get_context", return_value=_make_usd_context(Usd.Stage.CreateInMemory())
+            ),
+            mock.patch.object(controller_module, "instancers_of_selection", return_value=[]),
+            mock.patch.object(controller_module.omni.kit.commands, "execute") as execute,
+        ):
+            # Act
+            count = self.controller.split_selection("")
+
+        # Assert
+        self.assertEqual(count, 0)
+        execute.assert_not_called()
+        self.assertTrue(status_callback.call_args.args[1])
 
     async def test_next_stroke_with_randomize_seed_disabled_uses_settings_seed_and_increments_index(self):
         # Arrange
@@ -1071,6 +1261,7 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
             layer_identifier=stage.GetEditTarget().GetLayer().identifier,
             records=records,
             materials={},
+            instance=True,
         )
         patched["generate_flood"].assert_called_once()
         flood_args = patched["generate_flood"].call_args.args
@@ -1152,6 +1343,210 @@ class TestScatterBrushController(omni.kit.test.AsyncTestCase):
         self.assertEqual(count, 2)
         patched["generate_flood"].assert_called_once()
         patched["execute"].assert_called_once()
+
+    async def test_flood_seeds_padding_index_with_instanced_placements_too(self):
+        # Arrange - an earlier flood was merged into its instancer, so its placements are entries, not prims
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(padding=0.5)
+        target = _make_target("mesh_A")
+        instanced = np.array([[4.0, 5.0, 6.0]])
+
+        with contextlib.ExitStack() as stack:
+            patched = self._patch_flood_dependencies(stack, stage, instanced_points={"return_value": instanced})
+
+            # Act
+            self.controller.flood("", mock.Mock(), targets=[target])
+
+        # Assert
+        patched["instanced_points"].assert_called_once_with(stage, target)
+        patched["PaddingIndex"].return_value.add_many.assert_called_once_with(instanced)
+
+    async def test_flood_without_padding_reads_no_existing_placements(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(padding=0.0)
+
+        with contextlib.ExitStack() as stack:
+            patched = self._patch_flood_dependencies(stack, stage)
+
+            # Act
+            self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A")])
+
+        # Assert
+        patched["existing_placement_points"].assert_not_called()
+        patched["instanced_points"].assert_not_called()
+
+    async def test_flood_asks_for_no_more_placements_than_the_surface_takes(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(flood_max_instances=100)
+
+        with contextlib.ExitStack() as stack:
+            patched = self._patch_flood_dependencies(stack, stage, flood_sample_count={"return_value": 7})
+
+            # Act
+            self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A")])
+
+        # Assert
+        self.assertEqual(patched["generate_flood"].call_args.args[9], 7)
+
+    async def test_flood_on_a_replicated_target_stops_at_the_prim_limit_and_says_so(self):
+        # Arrange - a budget of 2 limits the flood to 10 rendered prims, which is 2 placements on 4 instances
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(flood_max_instances=100, prim_budget=2)
+        status = self._subscribe(self.controller.subscribe_status_message)
+
+        with contextlib.ExitStack() as stack:
+            patched = self._patch_flood_dependencies(
+                stack, stage, generate_flood={"return_value": [_make_record("s_1"), _make_record("s_2")]}
+            )
+
+            # Act
+            count = self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A", instance_count=4)])
+
+        # Assert - samples for four times the room, since padding and the surface angle reject some
+        self.assertEqual(count, 2)
+        self.assertEqual(patched["generate_flood"].call_args.args[9], 8)
+        text, is_error = status.call_args.args
+        self.assertIn("rendering 8 prims, and was held back by its limit of 10 rendered prims", text)
+        self.assertTrue(is_error)
+
+    async def test_flood_that_generates_more_than_the_prim_limit_has_room_for_keeps_only_what_fits(self):
+        # Arrange - room for 2 placements on 4 instances, and 5 samples survive padding and the surface angle
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(flood_max_instances=100, prim_budget=2)
+        records = [_make_record(f"s_{index}") for index in range(5)]
+
+        with contextlib.ExitStack() as stack:
+            patched = self._patch_flood_dependencies(stack, stage, generate_flood={"return_value": records})
+
+            # Act
+            count = self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A", instance_count=4)])
+
+        # Assert
+        self.assertEqual(count, 2)
+        self.assertEqual(patched["execute"].call_args.kwargs["records"], records[:2])
+
+    async def test_flood_that_stays_short_of_the_prim_limit_after_rejections_is_not_reported_as_limited(self):
+        # Arrange - room for 2 placements on 4 instances, but only 1 sample survives
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(flood_max_instances=100, prim_budget=2)
+        status = self._subscribe(self.controller.subscribe_status_message)
+
+        with contextlib.ExitStack() as stack:
+            self._patch_flood_dependencies(stack, stage, generate_flood={"return_value": [_make_record("s_1")]})
+
+            # Act
+            self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A", instance_count=4)])
+
+        # Assert
+        status.assert_called_with("Flood placed 1 placement, rendering 4 prims", False)
+
+    async def test_flood_on_a_target_with_more_instances_than_the_prim_limit_says_why_nothing_was_placed(self):
+        # Arrange - one placement on eleven instances already renders more than the limit of 10
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(flood_max_instances=100, prim_budget=2)
+        status = self._subscribe(self.controller.subscribe_status_message)
+
+        with contextlib.ExitStack() as stack:
+            patched = self._patch_flood_dependencies(stack, stage)
+
+            # Act
+            count = self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A", instance_count=11)])
+
+        # Assert
+        self.assertEqual(count, 0)
+        patched["generate_flood"].assert_not_called()
+        text, is_error = status.call_args.args
+        self.assertIn("more instances than the flood's limit of 10 rendered prims allows", text)
+        self.assertTrue(is_error)
+
+    async def test_flood_skips_a_target_with_more_instances_than_the_prim_limit_and_fills_the_next(self):
+        # Arrange - one placement on eleven instances already renders more than the limit of 10
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        self.controller.update_settings(flood_max_instances=100, prim_budget=2)
+        replicated = _make_target("mesh_A", instance_count=11)
+        single = _make_target("mesh_B")
+
+        with contextlib.ExitStack() as stack:
+            patched = self._patch_flood_dependencies(
+                stack, stage, generate_flood={"return_value": [_make_record("s_1")]}
+            )
+
+            # Act
+            count = self.controller.flood("", mock.Mock(), targets=[replicated, single])
+
+        # Assert
+        self.assertEqual(count, 1)
+        patched["generate_flood"].assert_called_once()
+        self.assertIs(patched["generate_flood"].call_args.args[1], single)
+        self.assertEqual(patched["generate_flood"].call_args.args[9], 40)
+
+    async def test_flood_within_the_prim_limit_posts_what_it_placed(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        status = self._subscribe(self.controller.subscribe_status_message)
+
+        with contextlib.ExitStack() as stack:
+            self._patch_flood_dependencies(
+                stack, stage, generate_flood={"return_value": [_make_record("s_1"), _make_record("s_2")]}
+            )
+
+            # Act
+            self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A", instance_count=3)])
+
+        # Assert
+        status.assert_called_with("Flood placed 2 placements, rendering 6 prims", False)
+
+    async def test_flood_keeps_the_up_axis_warning_it_started_with_in_front_of_what_it_placed(self):
+        # Arrange - the file says Y-up while the palette says Z-up, which a flood reports before it places anything
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        status = self._subscribe(self.controller.subscribe_status_message)
+
+        with contextlib.ExitStack() as stack:
+            self._patch_flood_dependencies(
+                stack, stage, generate_flood={"return_value": [_make_record("s_1"), _make_record("s_2")]}
+            )
+            stack.enter_context(
+                mock.patch.object(controller_module, "read_authored_asset_up_axis", return_value=UpAxis.Y)
+            )
+
+            # Act
+            self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A")])
+
+        # Assert
+        text, is_error = status.call_args.args
+        self.assertIn("is authored Y-up but the brush is set to Z-up", text)
+        self.assertTrue(text.endswith(". Flood placed 2 placements, rendering 2 prims"))
+        self.assertFalse(is_error)
+
+    async def test_flood_that_places_nothing_says_so(self):
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        self.controller.add_asset(_ROCK, up_axis=UpAxis.Z)
+        status = self._subscribe(self.controller.subscribe_status_message)
+
+        with contextlib.ExitStack() as stack:
+            self._patch_flood_dependencies(stack, stage)
+
+            # Act
+            count = self.controller.flood("", mock.Mock(), targets=[_make_target("mesh_A")])
+
+        # Assert
+        self.assertEqual(count, 0)
+        text, is_error = status.call_args.args
+        self.assertTrue(text.startswith("Flood placed nothing"))
+        self.assertTrue(is_error)
 
     async def test_flood_without_targets_in_anchor_mode_builds_target_from_anchor(self):
         # Arrange
@@ -1791,6 +2186,41 @@ class TestControllerSelectionTurn(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(seen, [])
         del subscription
+
+    async def test_an_undo_starts_the_turn_count_again(self):
+        # Arrange - an undo takes a turn away from the patch without telling the record of it
+        scope = self._scope("grass")
+        self.controller.set_selection_turn(scope, (0.0, 0.0, 45.0))
+
+        # Act
+        omni.kit.undo.undo()
+
+        # Assert
+        self.assertEqual(self.controller.selection_turn(scope), (0.0, 0.0, 0.0))
+
+    async def test_a_redo_tells_subscribers_the_history_stepped(self):
+        # Arrange
+        seen = []
+        subscription = self.controller.subscribe_history_stepped(lambda: seen.append("stepped"))
+
+        # Act
+        omni.kit.undo.redo()
+
+        # Assert
+        self.assertEqual(seen, ["stepped"])
+        del subscription
+
+    async def test_destroy_stops_following_undo_and_redo(self):
+        # Arrange - a turn recorded after the controller let go of the history is one no undo should touch
+        scope = self._scope("grass")
+        self.controller.destroy()
+        self.controller.set_selection_turn(scope, (0.0, 0.0, 45.0))
+
+        # Act
+        omni.kit.undo.undo()
+
+        # Assert
+        self.assertEqual(self.controller.selection_turn(scope), (0.0, 0.0, 45.0))
 
 
 class TestReapplyDriverRegistry(omni.kit.test.AsyncTestCase):

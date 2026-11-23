@@ -19,6 +19,7 @@ from .e2e.ingestcraft.test_ingestion import TestIngestionService
 from .e2e.stagecraft.test_assets import TestAssetReplacementsService
 from .e2e.stagecraft.test_layers import TestLayerManagerService
 from .e2e.stagecraft.test_project import TestProjectManagerService
+from .e2e.stagecraft.test_scatter import TestScatterService
 from .e2e.stagecraft.test_textures import TestTextureReplacementsService
 from .unit.test_service import TestInstantiateServices, TestRoutesPackage
 
@@ -29,5 +30,6 @@ __all__ = [
     "TestLayerManagerService",
     "TestProjectManagerService",
     "TestRoutesPackage",
+    "TestScatterService",
     "TestTextureReplacementsService",
 ]

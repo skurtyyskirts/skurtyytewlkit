@@ -1,6 +1,14 @@
 # Changelog
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.10.0]
+### Added
+- Listed Kit's studio light rigs in the viewport Lighting menu after its lookdev HDRI rigs.
+- Added a Mod Sky light rig for each sky of the open project's skydome folder, showing the level's in-game Remix API dome and its sun while keeping the level's own lights lit.
+
+### Changed
+- Made the per-stage lighting-mode setting key public as `get_lighting_mode_setting_key`.
+
 ## [1.9.0]
 ### Added
 - Loaded the Scatter window (lightspeed.trex.scatter.widget) in StageCraft.

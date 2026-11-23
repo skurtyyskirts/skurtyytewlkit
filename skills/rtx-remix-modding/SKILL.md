@@ -34,7 +34,7 @@ Wait for matching `SERVICE_READY service=mcp`. Client URLs need manual updating.
 
 ## Instructions
 
-Before using the MCP tools to replace models or add an asset reference, read
+Before using the MCP tools to replace models, add an asset reference or scatter assets, read
 `references/tool-mode.md` and follow the relevant recipe.
 
 Your tool list already carries every tool and its schema. What it does not carry is the order:
@@ -70,10 +70,14 @@ There is no undo tool in this release. Never simulate one by hand either — any
 What you can and cannot do, by thing. Nothing outside this exists — no tool and no workaround.
 Say so, and offer the nearest thing you can do:
 
-- **Layers** — the only thing you can create or delete.
+- **Layers** — create or delete.
+- **Scatter groups** — create, retune or remove a named scatter of ingested assets over captured
+  surfaces (`remix_*_scatter_group*`). A group's placements are the only new objects you can add,
+  and removing a group takes out only its own placements.
 - **Projects** — open and close an existing one. You cannot create one.
 - **Prims** — read them and set the selection. You cannot create, delete, rename, duplicate or
-  move one. That covers geometry of every kind: no meshes, no new objects, by any route.
+  move one. That covers geometry of every kind: no meshes and no new objects outside a scatter
+  group, by any route.
 - **Asset references** — add one to a prim, or replace one already there. There is no removal.
 - **Textures** — read what a material binds, and replace it.
 

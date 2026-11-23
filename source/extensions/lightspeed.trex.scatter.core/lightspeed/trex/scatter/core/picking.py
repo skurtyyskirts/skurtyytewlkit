@@ -45,7 +45,12 @@ from lightspeed.hydra.remix.core import (
 )
 from pxr import Gf, Sdf, Usd, UsdGeom
 
-from .constants import DEFAULT_MAX_PICK_DISTANCE, FORCE_CPU_PICKER_SETTING, MAX_PICK_DISTANCE_SETTING
+from .constants import (
+    DEFAULT_MAX_PICK_DISTANCE,
+    FORCE_CPU_PICKER_SETTING,
+    IS_REMIX_SCATTER_ATTR,
+    MAX_PICK_DISTANCE_SETTING,
+)
 
 if TYPE_CHECKING:
     from omni.kit.widget.viewport.api import ViewportAPI
@@ -60,6 +65,8 @@ _BBOX_CULL_EPSILON = 1.0e-4
 # consumer picking at the same time can overwrite ours and the answer never arrives; a request older than this is
 # treated as lost so the brush does not stay blocked forever.
 _STALE_PICK_TIMEOUT = 2.0
+# Every purpose, so the bounds that cull a mesh never come out empty for one the ray could still hit.
+_ALL_PURPOSES = [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy, UsdGeom.Tokens.guide]
 
 
 @dataclass
@@ -321,17 +328,23 @@ class CpuRaySurfacePicker:
         """Nothing to cancel: picks complete synchronously."""
 
     def _nearest_hit(self, stage: Usd.Stage, origin: Gf.Vec3d, direction: Gf.Vec3d) -> SurfaceHit | None:
-        """Return the closest ray hit over the visible meshes, culling by cached bounds first; None on a miss."""
+        """Return the closest ray hit over the visible meshes, culling by their world bounds first; None on a miss.
+
+        The bounds come from the stage rather than from the mesh cache: reading them from the cache would build the
+        triangles of every visible mesh on every pick, and a capture holds far more meshes than the cache keeps.
+        """
         origin_array = np.array(origin, dtype=np.float64)
         direction_array = np.array(direction, dtype=np.float64)
+        bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), _ALL_PURPOSES)
         best_distance = math.inf
         best_hit: SurfaceHit | None = None
-        for mesh_path in self._iter_visible_mesh_paths(stage):
-            geometry = self._cache.get(mesh_path)
-            if geometry is None:
+        for prim in self._iter_visible_meshes(stage):
+            bounds = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            if bounds.IsEmpty() or not _ray_intersects_aabb(
+                origin_array, direction_array, np.array(bounds.GetMin()), np.array(bounds.GetMax())
+            ):
                 continue
-            if not _ray_intersects_aabb(origin_array, direction_array, geometry.bbox_min, geometry.bbox_max):
-                continue
+            mesh_path = prim.GetPath()
             sample = self._cache.raycast(mesh_path, origin, direction)
             if sample is None:
                 continue
@@ -342,20 +355,28 @@ class CpuRaySurfacePicker:
                 best_hit = SurfaceHit(mesh_path, Gf.Vec3d(float(position[0]), float(position[1]), float(position[2])))
         return best_hit
 
-    def _iter_visible_mesh_paths(self, stage: Usd.Stage) -> Iterator[Sdf.Path]:
-        """Yield the visible mesh prim paths under the configured roots, or under the whole stage when none exist."""
+    def _iter_visible_meshes(self, stage: Usd.Stage) -> Iterator[Usd.Prim]:
+        """Yield the visible mesh prims under the configured roots, or under the whole stage when none exist.
+
+        Scattered placements are skipped with everything beneath them: the brush paints on the capture surface, and a
+        painted field holds thousands of meshes that would otherwise be walked on every pick.
+        """
         roots = [stage.GetPrimAtPath(path) for path in self._root_paths]
         roots = [root for root in roots if root.IsValid()]
         if not roots:
             roots = [stage.GetPseudoRoot()]
         predicate = Usd.TraverseInstanceProxies(Usd.PrimDefaultPredicate)
         for root in roots:
-            for prim in Usd.PrimRange(root, predicate):
+            iterator = iter(Usd.PrimRange(root, predicate))
+            for prim in iterator:
+                if prim.HasAttribute(IS_REMIX_SCATTER_ATTR):
+                    iterator.PruneChildren()
+                    continue
                 if not prim.IsA(UsdGeom.Mesh):
                     continue
                 if UsdGeom.Imageable(prim).ComputeVisibility() == UsdGeom.Tokens.invisible:
                     continue
-                yield prim.GetPath()
+                yield prim
 
 
 def create_surface_picker(

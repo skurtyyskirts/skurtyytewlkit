@@ -92,6 +92,56 @@ class TestPresetStore(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertFalse(result)
 
+    async def test_stored_name_of_a_saved_preset_returns_its_name(self):
+        # Arrange
+        self.store.save("Grass", ScatterBrushSettings())
+
+        # Act
+        stored = self.store.stored_name("  Grass ")
+
+        # Assert
+        self.assertEqual(stored, "Grass")
+
+    async def test_stored_name_without_a_preset_of_that_name_returns_none(self):
+        # Arrange
+        self.store.save("Grass", ScatterBrushSettings())
+
+        # Act
+        stored = self.store.stored_name("Rocks")
+
+        # Assert
+        self.assertIsNone(stored)
+
+    async def test_stored_name_on_a_file_system_that_ignores_case_returns_the_spelling_of_the_file(self):
+        # Arrange - "Grass" would write to the file of "grass" there, so the two are one preset
+        self.store.save("grass", ScatterBrushSettings())
+
+        with mock.patch.object(presets_module.os.path, "normcase", side_effect=str.lower):
+            # Act
+            stored = self.store.stored_name("Grass")
+
+        # Assert
+        self.assertEqual(stored, "grass")
+
+    async def test_stored_name_on_a_file_system_that_keeps_case_tells_two_spellings_apart(self):
+        # Arrange
+        self.store.save("grass", ScatterBrushSettings())
+
+        with mock.patch.object(presets_module.os.path, "normcase", side_effect=str):
+            # Act
+            stored = self.store.stored_name("Grass")
+
+        # Assert
+        self.assertIsNone(stored)
+
+    async def test_stored_name_with_an_invalid_name_raises_value_error(self):
+        # Arrange
+        name = "bad/name"
+
+        # Act / Assert
+        with self.assertRaises(ValueError):
+            self.store.stored_name(name)
+
     async def test_load_after_save_returns_saved_values(self):
         # Arrange
         self.store.save("Grass", ScatterBrushSettings(radius=77.0, density=2.5))

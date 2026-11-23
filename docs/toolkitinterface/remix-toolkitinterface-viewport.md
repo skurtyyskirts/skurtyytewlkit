@@ -517,5 +517,14 @@ Since the Remix Toolkit is built on Omniverse. More information on camera settin
 | 13  | Use Auto Light Rig on Startup Checkbox | Enables the automatic application of a default lighting setup when the Stage Light Viewport is initiated.                                                              |
 | 14  | Add Current Light Rig to Stage         | Allows users to save and incorporate the current lighting setup into the Stage, providing flexibility in managing and reusing custom lighting configurations.          |
 
+After these rigs, the menu lists the Colored Lights, Default and Grey Studio studio rigs. When the open project's mod
+has an `assets/skydomes` folder, the menu also lists one **Mod Sky** rig for each level of its `skydomes.ini` manifest,
+and one for each other `.dds` dome texture in that folder. A Mod Sky rig shows the level's sky the way the game's
+Remix API dome shows it: the same texture, radiance, tint and rotation, and the dome's own sun. Unlike the other rigs,
+it keeps the level's own lights lit and hides only the capture's sky dome, as the game does. The game turns a dome
+toward its own sun while it shows one; the viewport uses the manifest's `Rotation`, which the game uses when it shows
+no sun. Manifest edits are picked up the next time the project opens or a light rig is applied. Nothing is written to
+the mod.
+
 ***
 <sub> Need to leave feedback about the RTX Remix Documentation?  [Click here](https://github.com/NVIDIAGameWorks/rtx-remix/issues/new?assignees=nvdamien&labels=documentation%2Cfeedback%2Ctriage&projects=&template=documentation_feedback.yml&title=%5BDocumentation+feedback%5D%3A+) </sub>

@@ -26,6 +26,7 @@ from .unit.test_controller import (
     TestScatterBrushControllerSingleton,
 )
 from .unit.test_geometry import TestGeometryFunctions, TestMeshGeometry, TestMeshSurfaceCache
+from .unit.test_instancing import TestInstancingCommands, TestInstancingConversions, TestMergeAndSplit
 from .unit.test_move import (
     TestATurnThatSurvivesASettingsChange,
     TestMoveAndReapplyTogether,
@@ -46,6 +47,7 @@ from .unit.test_picking import (
 )
 from .unit.test_placement import TestPlacementFunctions, TestPlacementPool, TestPlacementRecord
 from .unit.test_presets import TestGetDefaultPresetsDirectory, TestPresetStore
+from .unit.test_preview import TestInstancerViewportPreview, TestSyncInstancerPreview
 from .unit.test_reapply import (
     TestPreparedReapply,
     TestReapplyDriver,
@@ -76,6 +78,10 @@ __all__ = (
     "TestGeometryFunctions",
     "TestGetDefaultPresetsDirectory",
     "TestHdRemixSurfacePicker",
+    "TestInstancerViewportPreview",
+    "TestInstancingCommands",
+    "TestInstancingConversions",
+    "TestMergeAndSplit",
     "TestMeshGeometry",
     "TestMeshSurfaceCache",
     "TestMoveAndReapplyTogether",
@@ -107,6 +113,7 @@ __all__ = (
     "TestScopeDragSession",
     "TestScopePivot",
     "TestStrokeSession",
+    "TestSyncInstancerPreview",
     "TestTargets",
     "TestTurnHelpers",
     "TestTurningUnderARotatedInstance",

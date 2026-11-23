@@ -52,6 +52,8 @@ from .settings import Falloff, ScaleMode, ScatterAssetEntry, ScatterBrushSetting
 
 _MIN_CELL_SIZE = 1e-6
 _EPSILON = 1e-9
+# Below this, world up as a parent sees it is the parent's own up axis, and nothing is rotated onto it.
+_SAME_UP_TOLERANCE = 1e-6
 _GAUSSIAN_SIGMA = 0.4
 
 # Radial acceptance curves over the normalized distance t in [0, 1]
@@ -332,6 +334,18 @@ def _normal_to_parent_space(normal_world: Gf.Vec3d, parent_world: Gf.Matrix4d) -
     return normal.GetNormalized()
 
 
+def _world_up_in_parent_space(up: Gf.Vec3d, parent_world: Gf.Matrix4d) -> Gf.Vec3d:
+    """Return the parent-space direction that points along the stage up axis in the world.
+
+    A direction goes parent -> world through parent_world, so world -> parent is its inverse. Normalized, because a
+    scaled parent would otherwise stretch the vertical offset measured along it.
+    """
+    direction = parent_world.GetInverse().TransformDir(up)
+    if direction.GetLength() < _EPSILON:
+        return Gf.Vec3d(up)
+    return direction.GetNormalized()
+
+
 def _heading_yaw_degrees(heading: Gf.Vec3d, effective_up: Gf.Vec3d, conform: Gf.Matrix4d) -> float:
     """Yaw about the stage up axis that turns the asset's +X toward the heading after the conform rotation.
 
@@ -439,8 +453,9 @@ def compose_parent_space_transform(
     """Compute the translate / rotateXYZ / scale ops of one placement in the space of its parent instance.
 
     The rotation applied to the asset is, first to last: the asset up-axis correction, the base rotation, tilt about
-    X, tilt about Y, yaw about the stage up axis (random spin plus stroke heading), then the rotation taking the stage
-    up axis onto the surface normal when conform_to_surface is set.
+    X, tilt about the other horizontal axis (Y on a Z-up stage, Z on a Y-up one, from the ``rotation_y`` range), yaw
+    about the stage up axis (random spin plus stroke heading), then the rotation taking the stage up axis onto the
+    surface normal when conform_to_surface is set, or onto world up when the parent is rotated.
 
     The parent's own scale is divided out of both the authored scale and the vertical offset, so a placement comes
     out the same size wherever it is painted; this makes them world-space quantities like radius, padding and
@@ -474,9 +489,10 @@ def compose_parent_space_transform(
     parent_scale = parent_uniform_scale(parent_world)
     normal = origin.normal
     up = up_axis_vector(stage_up)
-    # The axis both the offset and the yaw are measured about. Without conform this stays the plain axis: it is the
-    # one the asset ends up standing on, and it is also the axis the yaw below is applied about before conform.
-    effective_up = normal if settings.conform_to_surface else up
+    # The axis both the offset and the yaw are measured about, and the one the asset ends up standing on. Without
+    # conform it is the stage up axis as the parent sees it, which is the parent's own axis only when the parent is
+    # not rotated: a captured instance can carry any rotation, and the asset still has to stand straight up.
+    effective_up = normal if settings.conform_to_surface else _world_up_in_parent_space(up, parent_world)
     # Only the magnitude needs the parent out of it; vertical_offset is a world distance like radius and padding.
     position = origin.position + effective_up * (settings.vertical_offset / parent_scale)
 
@@ -489,9 +505,10 @@ def compose_parent_space_transform(
         factor = asset_scale_factor / parent_scale
         scale = (sampled_scale[0] * factor, sampled_scale[1] * factor, sampled_scale[2] * factor)
 
+    # Takes the stage up axis onto the surface normal with conform, and onto world up under a rotated parent without.
     conform = Gf.Matrix4d(1.0)
-    if settings.conform_to_surface:
-        conform = Gf.Matrix4d().SetRotate(Gf.Rotation(up, normal))
+    if settings.conform_to_surface or not Gf.IsClose(effective_up, up, _SAME_UP_TOLERANCE):
+        conform = Gf.Matrix4d().SetRotate(Gf.Rotation(up, effective_up))
     yaw = rotate_z + yaw_offset
     if settings.align_to_stroke and origin.heading is not None:
         yaw += _heading_yaw_degrees(origin.heading, effective_up, conform)
@@ -504,10 +521,13 @@ def compose_parent_space_transform(
         rotation = rotation * turn_matrix(
             (settings.base_rotation_x, settings.base_rotation_y, settings.base_rotation_z)
         )
+    # The two tilts lean the asset over, so they turn about the two horizontal axes. On a Y-up stage those are X and
+    # Z: turning about Y there would spin the asset about its own up axis, which is what the yaw already does.
+    second_tilt_axis = Gf.Vec3d.ZAxis() if UpAxis(stage_up) == UpAxis.Y else Gf.Vec3d.YAxis()
     rotation = (
         rotation
         * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.XAxis(), rotate_x))
-        * Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d.YAxis(), rotate_y))
+        * Gf.Matrix4d().SetRotate(Gf.Rotation(second_tilt_axis, rotate_y))
         * Gf.Matrix4d().SetRotate(Gf.Rotation(up, yaw))
         * conform
     )
@@ -568,12 +588,14 @@ class PaddingIndex:
     """Uniform hash grid answering "is any stored point closer than a distance" for padding checks.
 
     Points are bucketed by floor(point / cell_size); queries walk the neighbouring cells, or every bucket when the
-    neighbourhood would be larger than the number of occupied cells.
+    neighbourhood would be larger than the number of occupied cells. Points are stored as plain float tuples: a query
+    visits up to 27 buckets of a few points each, and at that size Python arithmetic costs a fraction of what a numpy
+    call per bucket would, which is what every candidate of a stamp pays.
     """
 
     def __init__(self, cell_size: float):
         self._cell_size = max(float(cell_size), _MIN_CELL_SIZE)
-        self._cells: dict[tuple[int, int, int], list[np.ndarray]] = {}
+        self._cells: dict[tuple[int, int, int], list[tuple[float, float, float]]] = {}
         self._count = 0
 
     def __len__(self) -> int:
@@ -581,7 +603,7 @@ class PaddingIndex:
 
     def add(self, point) -> None:
         """Store one point (any 3-component indexable)."""
-        stored = _as_array3(point)
+        stored = (float(point[0]), float(point[1]), float(point[2]))
         self._cells.setdefault(self._cell_of(stored), []).append(stored)
         self._count += 1
 
@@ -593,29 +615,36 @@ class PaddingIndex:
         # One vectorised floor for every point instead of one per point: a stroke seeds the index with every
         # placement already on the prototype, which can be tens of thousands.
         cells = np.floor(array / self._cell_size).astype(np.int64).tolist()
-        for cell, point in zip(cells, array):
-            self._cells.setdefault((cell[0], cell[1], cell[2]), []).append(point)
+        for cell, point in zip(cells, array.tolist()):
+            self._cells.setdefault((cell[0], cell[1], cell[2]), []).append((point[0], point[1], point[2]))
         self._count += len(array)
 
     def is_free(self, point, min_distance: float) -> bool:
         """Whether no stored point lies strictly closer than min_distance to the point."""
         if min_distance <= 0.0 or not self._cells:
             return True
-        query = _as_array3(point)
+        query = (float(point[0]), float(point[1]), float(point[2]))
+        x, y, z = query
         reach = math.ceil(min_distance / self._cell_size)
         limit = min_distance * min_distance
         for bucket in self._candidate_buckets(self._cell_of(query), reach):
-            deltas = np.asarray(bucket) - query
-            if bool(np.any(np.einsum("ij,ij->i", deltas, deltas) < limit)):
-                return False
+            for other_x, other_y, other_z in bucket:
+                delta_x = other_x - x
+                delta_y = other_y - y
+                delta_z = other_z - z
+                if delta_x * delta_x + delta_y * delta_y + delta_z * delta_z < limit:
+                    return False
         return True
 
-    def _cell_of(self, point: np.ndarray) -> tuple[int, int, int]:
-        """Integer grid coordinates of the cell containing the point."""
-        cell = np.floor(point / self._cell_size)
-        return (int(cell[0]), int(cell[1]), int(cell[2]))
+    def _cell_of(self, point: tuple[float, float, float]) -> tuple[int, int, int]:
+        """Integer grid coordinates of the cell containing the point.
 
-    def _candidate_buckets(self, cell: tuple[int, int, int], reach: int) -> Iterable[list[np.ndarray]]:
+        Divided and floored exactly as ``add_many`` does with numpy, so a point always lands in the same cell.
+        """
+        size = self._cell_size
+        return (math.floor(point[0] / size), math.floor(point[1] / size), math.floor(point[2] / size))
+
+    def _candidate_buckets(self, cell: tuple[int, int, int], reach: int) -> Iterable[list[tuple[float, float, float]]]:
         """Buckets that can hold a point within reach cells of the given cell.
 
         Falls back to every bucket when the neighbourhood would be larger than the number of occupied cells, which

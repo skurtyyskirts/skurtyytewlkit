@@ -246,7 +246,27 @@ class PresetsWidget:
         )
 
     def _save_as_named(self, name: str) -> None:
-        """Store the current settings under a new name."""
+        """Store the current settings under a new name, asking first when another preset already has that name.
+
+        A name that only differs in case from a stored preset is that preset wherever the file system ignores case,
+        so it is saved under the spelling the file has; the list would otherwise show both spellings of one file.
+        """
+        stored = self._controller.stored_preset_name(name)
+        if stored is None:
+            self._save_named(name)
+            return
+        if stored == self._controller.settings.preset_name:
+            self._save_named(stored)
+            return
+        TrexMessageDialog(
+            title="Replace Preset",
+            message=f"A preset named '{stored}' already exists. Replace it? This cannot be undone.",
+            ok_label="Replace",
+            ok_handler=lambda: self._save_named(stored),
+        )
+
+    def _save_named(self, name: str) -> None:
+        """Store the current settings under ``name`` and show it as the current preset."""
         self._controller.save_preset(name)
         self.refresh()
 
@@ -277,14 +297,19 @@ class PresetsWidget:
         self._name_prompt = None
 
     def _on_preset_selected(self, model: ui.AbstractValueModel) -> None:
-        """Apply the preset the user picked; a failed load falls back to the current selection."""
+        """Apply the preset the user picked; a failed load falls back to the current selection.
+
+        The list is refreshed either way. The box already shows the picked name, so the settings change that follows
+        looks like no change to it, and without a refresh the actions would stay as they were for the preset before:
+        disabled after leaving one that had no file yet, with its name still offered in the list.
+        """
         if self._refreshing:
             return
         name = self._names_model.choices[model.as_int]
         if name == self._controller.settings.preset_name:
             return
-        if not self._controller.apply_preset(name):
-            self.refresh()
+        self._controller.apply_preset(name)
+        self.refresh()
 
     def _on_settings_changed(self, settings: ScatterBrushSettings) -> None:
         """Follow the preset name of the new settings."""

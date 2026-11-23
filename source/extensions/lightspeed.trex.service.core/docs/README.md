@@ -21,7 +21,7 @@ defines no route of its own.
   request and response models: [lightspeed.layer_manager.core](../../lightspeed.layer_manager.core/docs/README.md)
   for projects and layers, `lightspeed.trex.asset_replacements.core.shared` for assets and
   [lightspeed.trex.texture_replacements.core.shared](../../lightspeed.trex.texture_replacements.core.shared/docs/README.md)
-  for textures.
+  for textures and [lightspeed.trex.scatter.core](../../lightspeed.trex.scatter.core/docs/README.md) for scatter groups.
 - **Anything MCP.** `lightspeed.trex.mcp.core` owns the `FastMCP` instance, the transport, and which
   routes become tools. This extension never imports it.
 - **Flux services.** `MassValidatorService` registers itself from `omni.flux.validator.mass.service`; the ingestcraft
@@ -43,11 +43,12 @@ routers and removes the OpenAPI tags it added.
 
 | Package | Service | Serves |
 |---|---|---|
-| `stagecraft/` | `StageCraftService` | `/stagecraft`, including the routers of the four areas below |
+| `stagecraft/` | `StageCraftService` | `/stagecraft`, including the routers of the five areas below |
 | `stagecraft/project/` | `ProjectManagerService` | `/stagecraft/project` — open, close and read the loaded project |
 | `stagecraft/layers/` | `LayerManagerService` | `/stagecraft/layers` — the layer stack and edit target |
 | `stagecraft/assets/` | `AssetReplacementsService` | `/stagecraft/assets` — prim paths, asset references, default asset directories, selection |
 | `stagecraft/textures/` | `TextureReplacementsService` | `/stagecraft/textures` — texture discovery and overrides |
+| `stagecraft/scatter/` | `ScatterService` | `/stagecraft/scatter` — captured surfaces with texture previews, and scatter groups |
 | `ingestcraft/` | `IngestCraftService` | `/ingestcraft`, mounting `MassValidatorService` with the ingestion schemas |
 
 Each stagecraft area also has a `data_models/` package for models a route owns. The areas above take their models from
@@ -63,6 +64,12 @@ their core extensions, so those packages are empty.
 - Forced texture replacement requests must include `expected_current_textures` with one unique entry for every
   replacement target. The request succeeds only when those values exactly match the current edit-layer opinions; stale
   requests return HTTP 422 without modifying the layer.
+- Scatter routes (`remix_get_scatter_surfaces`, `remix_get_scatter_groups`, `remix_create_scatter_group`,
+  `remix_update_scatter_group`, `remix_remove_scatter_group`) let an agent fill captured surfaces with ingested
+  assets. The surface listing writes PNG previews and numbered contact sheets to the system temporary directory,
+  because capture textures are named by hash. Create, update and remove are each one undo step; a refused request
+  (an unknown material or group name, an asset that is not ingested, contradictory tuning) returns 400 or 404
+  without editing the layer, and an unknown tuning field returns 422.
 
 ## Settings
 

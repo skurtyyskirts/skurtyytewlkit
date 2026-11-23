@@ -20,6 +20,7 @@ from __future__ import annotations
 __all__ = ["PresetStore", "get_default_presets_directory"]
 
 import json
+import os
 from pathlib import Path
 
 import carb
@@ -93,6 +94,24 @@ class PresetStore:
             ValueError: If the name is not a valid preset name.
         """
         return self._path_for(name).is_file()
+
+    def stored_name(self, name: str) -> str | None:
+        """Return the name of the stored preset whose file a save under ``name`` would overwrite.
+
+        Preset files are named after their preset, so on a file system that ignores case "Rocks" writes to the file
+        of "rocks": the two are one preset there, and it is listed under the spelling its file has.
+
+        Args:
+            name: Name a preset would be saved under.
+
+        Returns:
+            The stored preset's own spelling of the name, or None when no stored preset would be overwritten.
+
+        Raises:
+            ValueError: If the name is not a valid preset name.
+        """
+        wanted = os.path.normcase(_validate_preset_name(name))
+        return next((stored for stored in self.list_names() if os.path.normcase(stored) == wanted), None)
 
     def load(self, name: str) -> ScatterBrushSettings:
         """Read a preset file and build validated settings whose ``preset_name`` is the file name.

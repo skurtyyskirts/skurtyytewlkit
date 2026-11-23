@@ -19,8 +19,6 @@ import math
 
 import numpy as np
 import omni.kit.test
-from pxr import Gf, Usd, UsdGeom
-
 from lightspeed.trex.scatter.core import sampling
 from lightspeed.trex.scatter.core.settings import (
     Falloff,
@@ -29,6 +27,7 @@ from lightspeed.trex.scatter.core.settings import (
     ScatterBrushSettings,
     UpAxis,
 )
+from pxr import Gf, Usd, UsdGeom
 
 _SQRT_HALF = math.sqrt(0.5)
 
@@ -732,6 +731,33 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
         authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
         self._assert_vec_close(authored.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0)), normal, 1e-4)
 
+    async def test_compose_parent_space_transform_on_y_up_stage_leans_the_asset_with_the_second_tilt_range(self):
+        # Arrange - on a Y-up stage a turn about Y only spins the asset where it stands; leaning it takes one about Z
+        settings = _settings(conform_to_surface=False, rotation_y_min=90.0, rotation_y_max=90.0)
+
+        # Act
+        _, rotate_xyz, _ = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d.YAxis(), _identity_parent(), None),
+            _identity_parent(),
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Y,
+            UpAxis.Y,
+        )
+
+        # Assert - the axis the asset stands on is laid flat
+        self._assert_vec_close(_rotate_xyz_matrix(rotate_xyz).TransformDir(Gf.Vec3d.YAxis()), Gf.Vec3d(-1.0, 0.0, 0.0))
+
+    async def test_compose_parent_space_transform_on_z_up_stage_leans_the_asset_with_the_second_tilt_range(self):
+        # Arrange
+        settings = _settings(conform_to_surface=False, rotation_y_min=90.0, rotation_y_max=90.0)
+
+        # Act
+        _, rotate_xyz, _ = _compose_upright(settings, 0)
+
+        # Assert - a turn about Y lays the Z axis the asset stands on flat
+        self._assert_vec_close(_rotate_xyz_matrix(rotate_xyz).TransformDir(Gf.Vec3d.ZAxis()), Gf.Vec3d.XAxis())
+
     async def test_compose_parent_space_transform_without_conform_keeps_stage_up_axis(self):
         # Arrange
         stage = Usd.Stage.CreateInMemory()
@@ -751,6 +777,47 @@ class TestSamplingFunctions(omni.kit.test.AsyncTestCase):
         # Assert
         authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
         self._assert_matrix_close(authored, Gf.Matrix4d(1.0), 1e-5)
+
+    async def test_compose_parent_space_transform_without_conform_under_a_tilted_parent_stands_on_world_up(self):
+        # A captured instance can carry any rotation; its own Z axis is not up, the stage's is.
+        # Arrange
+        stage = Usd.Stage.CreateInMemory()
+        settings = _settings(conform_to_surface=False)
+        parent_world = _rotation_matrix(Gf.Vec3d.XAxis(), 70.0) * _rotation_matrix(Gf.Vec3d.ZAxis(), 25.0)
+
+        # Act
+        translate, rotate_xyz, scale = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(Gf.Vec3d(0.0, 0.0, 0.0), Gf.Vec3d(0.0, 0.0, 1.0), parent_world, None),
+            parent_world,
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+        )
+
+        # Assert
+        authored = _author_local_transform(stage, "/Placement", translate, rotate_xyz, scale)
+        world_up = Gf.Vec3d(0.0, 0.0, 1.0)
+        self._assert_vec_close((authored * parent_world).TransformDir(world_up), world_up, 1e-4)
+
+    async def test_compose_parent_space_transform_without_conform_under_a_tilted_parent_offsets_along_world_up(self):
+        # Arrange
+        settings = _settings(conform_to_surface=False, vertical_offset=5.0)
+        parent_world = _rotation_matrix(Gf.Vec3d.XAxis(), 70.0) * Gf.Matrix4d().SetTranslate(Gf.Vec3d(3.0, 4.0, 5.0))
+        surface_world = Gf.Vec3d(10.0, 20.0, 30.0)
+
+        # Act
+        translate, _rotate_xyz, _scale = sampling.compose_parent_space_transform(
+            sampling.to_parent_space_origin(surface_world, Gf.Vec3d(0.0, 0.0, 1.0), parent_world, None),
+            parent_world,
+            settings,
+            np.random.default_rng(0),
+            UpAxis.Z,
+            UpAxis.Z,
+        )
+
+        # Assert
+        self._assert_vec_close(parent_world.Transform(translate), surface_world + Gf.Vec3d(0.0, 0.0, 5.0), 1e-6)
 
     async def test_compose_parent_space_transform_with_align_to_stroke_yaws_x_axis_onto_heading(self):
         cases = [
@@ -1304,6 +1371,19 @@ class TestPaddingIndex(omni.kit.test.AsyncTestCase):
         # Assert
         self.assertEqual(len(index), 1)
         self.assertFalse(index.is_free(Gf.Vec3d(1.0, 2.0, 3.5), min_distance=1.0))
+
+    async def test_is_free_with_cells_as_small_as_a_fine_padding_finds_only_points_within_it(self):
+        # Arrange - a dense patch on a 0.1 grid, indexed with cells the size of the 0.05 padding
+        index = sampling.PaddingIndex(cell_size=0.05)
+        grid = np.arange(20) * 0.1
+        index.add_many(np.array([[x, y, 0.0] for x in grid for y in grid]))
+        queries = [np.array([0.53, 0.5, 0.0]), np.array([0.55, 0.55, 0.0])]
+
+        # Act
+        free = [index.is_free(query, min_distance=0.05) for query in queries]
+
+        # Assert
+        self.assertEqual(free, [False, True])
 
     async def test_init_with_non_positive_cell_size_clamps_to_minimum_and_still_indexes(self):
         # Arrange

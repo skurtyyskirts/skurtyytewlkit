@@ -271,6 +271,40 @@ class TestHdRemixSettingsBridge(AsyncTestCase):
                     finally:
                         bridge.destroy()
 
+    async def test_capture_layer_imported_enforces_integrator_when_override_on(self):
+        with (
+            _override_setting(SETTINGS_INTEGRATE_INDIRECT_MODE, 1),
+            _override_setting(SETTINGS_OVERRIDE_CAPTURE_INTEGRATOR, True),
+        ):
+            with patch(_WAIT_PATCH_TARGET, new=AsyncMock(return_value=True)):
+                with patch(_HDREMIX_PATCH_TARGET) as mock_set:
+                    bridge = HdRemixSettingsBridge()
+                    try:
+                        bridge._on_capture_layer_imported()
+                        self.assertEqual(
+                            mock_set.call_args_list,
+                            [
+                                call("rtx.graphicsPreset", "4"),
+                                call("rtx.integrateIndirectMode", "1"),
+                            ],
+                        )
+                    finally:
+                        bridge.destroy()
+
+    async def test_capture_layer_imported_skips_integrator_when_override_off(self):
+        with (
+            _override_setting(SETTINGS_INTEGRATE_INDIRECT_MODE, 1),
+            _override_setting(SETTINGS_OVERRIDE_CAPTURE_INTEGRATOR, False),
+        ):
+            with patch(_WAIT_PATCH_TARGET, new=AsyncMock(return_value=True)):
+                with patch(_HDREMIX_PATCH_TARGET) as mock_set:
+                    bridge = HdRemixSettingsBridge()
+                    try:
+                        bridge._on_capture_layer_imported()
+                        self.assertEqual(mock_set.call_args_list, [])
+                    finally:
+                        bridge.destroy()
+
     def test_labels_match_dxvk_remix_enum_order(self):
         # Pins the exact ordering of INTEGRATE_INDIRECT_MODE_LABELS against dxvk-remix's
         # IntegrateIndirectMode enum (src/dxvk/rtx_render/rtx_options.h). If upstream
