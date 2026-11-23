@@ -2,6 +2,11 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.0.6]
+### Fixed
+- Re-applied the integrator override after a capture layer is imported when Override Capture Integrator is on.
+- Stopped captured or persisted DLSS Neural Rendering from being enabled on hardware that does not support it.
+
 ## [1.0.5]
 ### Changed
 - Renamed the shared DLSS controls to DLSS 3D-Guided Neural Rendering.
